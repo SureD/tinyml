@@ -3,16 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from ref.tiny_llama import TinyLLaMA
-
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from ref.tiny_llama import TinyLlama, TinyLlamaConfig
+
+
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "golden"
 SEED = 0
 PROMPT_TOKENS = [1, 2, 3, 4]
@@ -36,7 +39,7 @@ def export_demo_case(output_dir: Path) -> None:
     output_dir.mkdir(parents=True)
 
     torch.manual_seed(SEED)
-    model = TinyLLaMA().eval()
+    model = TinyLlama(TinyLlamaConfig.demo()).eval()
     prompt = torch.tensor([PROMPT_TOKENS], dtype=torch.long)
 
     with torch.no_grad():

@@ -1,35 +1,53 @@
 ### **Model definition**
 
-Use a **tiny LLaMA-style decoder-only Transformer** with:
+Use the architecture from `TinyLlama/TinyLlama-1.1B-Chat-v1.0`.
 
-- 2 layers
-- hidden size 128
-- 4 attention heads
-- head dimension 32
-- FFN dimension 256
-- vocab size 256
-- max sequence length 128
-- batch size 1
+Source: https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+Core config:
+
+- architecture: `LlamaForCausalLM`
+- model type: `llama`
+- hidden size: 2048
+- layers: 22
+- attention heads: 32
+- key/value heads: 4
+- head dimension: 64
+- FFN intermediate size: 5632
+- vocab size: 32000
+- max position embeddings: 2048
+- activation: SiLU / SwiGLU
+- RMSNorm epsilon: 1e-5
+- RoPE theta: 10000.0
+- attention bias: false
+- tied word embeddings: false
+- checkpoint dtype: bfloat16
 
 Include:
 
 - token embedding
 - RMSNorm
-- QKV projection
+- separate q/k/v/o projections
+- grouped-query attention
 - RoPE
 - causal self-attention
-- output projection
-- FFN
+- SwiGLU FFN
 - residual connections
 - final RMSNorm
-- LM head
+- untied LM head
 - KV cache
+
+Reference implementation notes:
+
+- The PyTorch reference should support the real TinyLlama config.
+- The demo may instantiate a much smaller config so it runs quickly in the local env.
+- Batch size remains 1 for the C bring-up path.
 
 Do not include yet:
 
 - training
-- tokenizer ecosystem
-- real checkpoint compatibility
+- tokenizer implementation
+- real checkpoint loading
 - quantization
 - flash attention
 - multi-batch serving

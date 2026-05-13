@@ -12,8 +12,9 @@ Phase 2 focuses on GPU acceleration:
 - profiling
 - decode-path optimization
 
-Minimal parity harness:
-- Export the golden case with `uv run --project ref python tools/export_demo_case.py`
-- Compare a future C result with `uv run --project ref python tools/compare_demo_result.py path/to/result.json`
+Reference workflow:
+- Download TinyLlama and run the reference smoke test with `./scripts/test_ref.sh`
+- Downloaded weights live under `models/` and are ignored by git
+- Export a temporary demo golden case with `./ref/.venv/bin/python tools/export_demo_case.py`
+- Compare a future C result with `./ref/.venv/bin/python tools/compare_demo_result.py path/to/result.json`
 - `result.json` must contain `generated_tokens` and `logits_path`
-- Run the self-checks with `python3 -m unittest discover -s tests`
