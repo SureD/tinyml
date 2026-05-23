@@ -7,6 +7,7 @@
 namespace tinyinfer {
 
 class Backend;
+struct TensorView;
 
 enum class DType {
     f32,
@@ -19,6 +20,13 @@ enum class DType {
 enum class DeviceType {
     cpu,
     metal,
+};
+
+enum class MemoryKind {
+    weights,
+    kv_cache,
+    workspace,
+    host,
 };
 
 struct Status {
@@ -90,17 +98,28 @@ struct Device {
     int index = 0;
 };
 
-class Storage {
+class MemoryArena {
 public:
-    Storage() = default;
-    Storage(Storage&& other) noexcept;
-    Storage& operator=(Storage&& other) noexcept;
-    Storage(const Storage&) = delete;
-    Storage& operator=(const Storage&) = delete;
-    ~Storage();
+    MemoryArena() = default;
+    MemoryArena(MemoryArena&& other) noexcept;
+    MemoryArena& operator=(MemoryArena&& other) noexcept;
+    MemoryArena(const MemoryArena&) = delete;
+    MemoryArena& operator=(const MemoryArena&) = delete;
+    ~MemoryArena();
 
+    Result<TensorView> alloc(
+        const Shape& shape,
+        DType dtype,
+        size_t alignment = 64);
+
+    void reset();
+
+    bool defined() const;
+    MemoryKind kind() const;
+    Device device() const;
     void* native_handle() const;
-    size_t nbytes() const;
+    size_t used() const;
+    size_t capacity() const;
 
 private:
     friend class Backend;
@@ -109,37 +128,30 @@ private:
 
     Backend* backend_ = nullptr;
     void* handle_ = nullptr;
-    size_t nbytes_ = 0;
+    size_t capacity_ = 0;
+    size_t offset_ = 0;
+    MemoryKind kind_ = MemoryKind::workspace;
+    Device device_;
 };
 
-struct Tensor {
+struct TensorView {
+    MemoryArena* arena = nullptr;
+    size_t byte_offset = 0;
+
     DType dtype = DType::f32;
     Shape shape;
     Strides strides;
-    Device device;
-    Storage storage;
-
-    Tensor() = default;
-    Tensor(Tensor&&) noexcept = default;
-    Tensor& operator=(Tensor&&) noexcept = default;
-    Tensor(const Tensor&) = delete;
-    Tensor& operator=(const Tensor&) = delete;
 
     int64_t dim(uint32_t i) const;
-    size_t nbytes() const;
-    bool contiguous() const;
-};
+    int64_t numel() const;
+    size_t item_size() const;
+    size_t logical_nbytes() const;
+    size_t storage_span_nbytes() const;
 
-class Stream {
-public:
+    bool defined() const;
+    bool contiguous() const;
     Device device() const;
     void* native_handle() const;
-
-private:
-    friend class Backend;
-
-    Device device_;
-    void* native_handle_ = nullptr;
 };
 
 }  // namespace tinyinfer

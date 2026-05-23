@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <span>
-#include <string>
 #include <vector>
 
 #include "tinyinfer/backend.h"
@@ -30,68 +29,83 @@ struct LlamaConfig {
     static LlamaConfig demo();
 };
 
-struct NamedTensor {
-    std::string name;
-    Tensor* tensor = nullptr;
-};
-
-struct LlamaLayerWeights {
-    Tensor attn_norm;
-    Tensor q_proj;
-    Tensor k_proj;
-    Tensor v_proj;
-    Tensor o_proj;
-    Tensor ffn_norm;
-    Tensor gate_proj;
-    Tensor up_proj;
-    Tensor down_proj;
-};
-
-struct LlamaModel {
-    LlamaConfig config;
-    Tensor token_embedding;
-    Tensor final_norm;
-    Tensor lm_head;
-    std::vector<LlamaLayerWeights> layers;
-
-    std::vector<NamedTensor> parameters();
-};
-
-struct KVCache {
-    Tensor keys;
-    Tensor values;
-    uint32_t seq_len = 0;
-    uint32_t max_seq_len = 0;
-};
-
 struct GenerateConfig {
     uint32_t max_new_tokens = 0;
     TokenId eos_token_id = 2;
     bool stop_on_eos = true;
 };
 
-class LlamaRunner {
+class LlamaInferEngine {
 public:
-    LlamaRunner(Backend& backend, LlamaModel& model);
+    LlamaInferEngine(LlamaInferEngine&&) noexcept = default;
+    LlamaInferEngine& operator=(LlamaInferEngine&&) noexcept = default;
+    LlamaInferEngine(const LlamaInferEngine&) = delete;
+    LlamaInferEngine& operator=(const LlamaInferEngine&) = delete;
 
-    Status init_kv_cache(KVCache& cache, uint32_t max_seq_len);
+    static Result<LlamaInferEngine> create(
+        Backend& backend,
+        const LlamaConfig& config,
+        uint32_t max_seq_len);
 
-    Status prefill(std::span<const TokenId> prompt, KVCache& cache, Tensor& logits);
-    Status decode_one(TokenId token, KVCache& cache, Tensor& logits, TokenId& next_token);
+    Status reset();
+    Status prefill(std::span<const TokenId> prompt, TokenId& next_token);
+    Status decode_one(TokenId token, TokenId& next_token);
     Status generate(
         std::span<const TokenId> prompt,
         std::span<TokenId> output,
         const GenerateConfig& config,
         uint32_t& output_count);
 
-private:
-    Status check_ready() const;
-    Status run_layers(uint32_t start_pos, uint32_t seq_len, KVCache& cache, Tensor& logits);
+    const LlamaConfig& config() const;
+    uint32_t seq_len() const;
+    uint32_t max_seq_len() const;
 
-    Backend& backend_;
-    LlamaModel& model_;
-    Stream stream_;
-    Status stream_status_;
+private:
+    struct LayerWeights {
+        TensorView attn_norm;
+        TensorView q_proj;
+        TensorView k_proj;
+        TensorView v_proj;
+        TensorView o_proj;
+        TensorView ffn_norm;
+        TensorView gate_proj;
+        TensorView up_proj;
+        TensorView down_proj;
+    };
+
+    struct Model {
+        TensorView token_embedding;
+        TensorView final_norm;
+        TensorView lm_head;
+        std::vector<LayerWeights> layers;
+    };
+
+    struct KVCache {
+        TensorView keys;
+        TensorView values;
+        uint32_t seq_len = 0;
+        uint32_t max_seq_len = 0;
+    };
+
+    LlamaInferEngine() = default;
+    LlamaInferEngine(Backend& backend, const LlamaConfig& config, uint32_t max_seq_len);
+
+    Status init();
+    Status bind_model();
+    Status init_kv_cache();
+    Status check_ready() const;
+    Result<TensorView> workspace_tensor(const Shape& shape);
+    Status run_layers(uint32_t start_pos, uint32_t seq_len, TensorView& logits);
+
+    Backend* backend_ = nullptr;
+    LlamaConfig config_;
+    uint32_t max_seq_len_ = 0;
+    MemoryArena weights_;
+    MemoryArena kv_cache_arena_;
+    MemoryArena workspace_;
+    Model model_;
+    KVCache cache_;
+    TensorView logits_;
 };
 
 }  // namespace tinyinfer

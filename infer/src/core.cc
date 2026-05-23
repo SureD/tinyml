@@ -1,11 +1,23 @@
 #include "tinyinfer/core.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 
 #include "tinyinfer/backend.h"
 
 namespace tinyinfer {
+namespace {
+
+size_t align_up(size_t value, size_t alignment) {
+    if (alignment == 0) {
+        return value;
+    }
+    const size_t rem = value % alignment;
+    return rem == 0 ? value : value + (alignment - rem);
+}
+
+}  // namespace
 
 size_t dtype_size(DType dtype) {
     switch (dtype) {
@@ -83,17 +95,21 @@ Strides contiguous_strides(const Shape& shape) {
     return strides;
 }
 
-Storage::Storage(Storage&& other) noexcept {
+MemoryArena::MemoryArena(MemoryArena&& other) noexcept {
     backend_ = other.backend_;
     handle_ = other.handle_;
-    nbytes_ = other.nbytes_;
+    capacity_ = other.capacity_;
+    offset_ = other.offset_;
+    kind_ = other.kind_;
+    device_ = other.device_;
 
     other.backend_ = nullptr;
     other.handle_ = nullptr;
-    other.nbytes_ = 0;
+    other.capacity_ = 0;
+    other.offset_ = 0;
 }
 
-Storage& Storage::operator=(Storage&& other) noexcept {
+MemoryArena& MemoryArena::operator=(MemoryArena&& other) noexcept {
     if (this == &other) {
         return *this;
     }
@@ -102,54 +118,134 @@ Storage& Storage::operator=(Storage&& other) noexcept {
 
     backend_ = other.backend_;
     handle_ = other.handle_;
-    nbytes_ = other.nbytes_;
+    capacity_ = other.capacity_;
+    offset_ = other.offset_;
+    kind_ = other.kind_;
+    device_ = other.device_;
 
     other.backend_ = nullptr;
     other.handle_ = nullptr;
-    other.nbytes_ = 0;
+    other.capacity_ = 0;
+    other.offset_ = 0;
 
     return *this;
 }
 
-Storage::~Storage() {
+MemoryArena::~MemoryArena() {
     release();
 }
 
-void* Storage::native_handle() const {
+Result<TensorView> MemoryArena::alloc(
+    const Shape& shape,
+    DType dtype,
+    size_t alignment) {
+    if (!defined()) {
+        return {Status::invalid_argument_status("arena is not allocated"), {}};
+    }
+    if (!shape.valid()) {
+        return {Status::invalid_argument_status("invalid tensor shape"), {}};
+    }
+    const size_t item_bytes = dtype_size(dtype);
+    if (item_bytes == 0) {
+        return {Status::invalid_argument_status("invalid dtype"), {}};
+    }
+
+    const size_t start = align_up(offset_, alignment);
+    const size_t bytes = static_cast<size_t>(shape.numel()) * item_bytes;
+    if (bytes > capacity_ || start > capacity_ - bytes) {
+        return {Status::invalid_argument_status("arena capacity exceeded"), {}};
+    }
+
+    TensorView view;
+    view.arena = this;
+    view.byte_offset = start;
+    view.dtype = dtype;
+    view.shape = shape;
+    view.strides = contiguous_strides(shape);
+
+    offset_ = start + bytes;
+    return {Status::success(), view};
+}
+
+void MemoryArena::reset() {
+    offset_ = 0;
+}
+
+bool MemoryArena::defined() const {
+    return backend_ != nullptr && capacity_ != 0;
+}
+
+MemoryKind MemoryArena::kind() const {
+    return kind_;
+}
+
+Device MemoryArena::device() const {
+    return device_;
+}
+
+void* MemoryArena::native_handle() const {
     return handle_;
 }
 
-size_t Storage::nbytes() const {
-    return nbytes_;
+size_t MemoryArena::used() const {
+    return offset_;
 }
 
-void Storage::release() noexcept {
+size_t MemoryArena::capacity() const {
+    return capacity_;
+}
+
+void MemoryArena::release() noexcept {
     if (backend_ != nullptr) {
-        (void)backend_->release_storage(*this);
+        (void)backend_->release_arena(*this);
     }
 
     backend_ = nullptr;
     handle_ = nullptr;
-    nbytes_ = 0;
+    capacity_ = 0;
+    offset_ = 0;
 }
 
-int64_t Tensor::dim(uint32_t i) const {
+int64_t TensorView::dim(uint32_t i) const {
     return shape.dim(i);
 }
 
-size_t Tensor::nbytes() const {
-    if (storage.nbytes() != 0) {
-        return storage.nbytes();
-    }
+int64_t TensorView::numel() const {
+    return shape.numel();
+}
 
+size_t TensorView::item_size() const {
+    return dtype_size(dtype);
+}
+
+size_t TensorView::logical_nbytes() const {
     const int64_t elements = shape.numel();
     if (elements <= 0) {
         return 0;
     }
-    return static_cast<size_t>(elements) * dtype_size(dtype);
+    return static_cast<size_t>(elements) * item_size();
 }
 
-bool Tensor::contiguous() const {
+size_t TensorView::storage_span_nbytes() const {
+    if (!shape.valid() || shape.ndim != strides.ndim) {
+        return 0;
+    }
+
+    int64_t max_elem_offset = 0;
+    for (uint32_t i = 0; i < shape.ndim; ++i) {
+        if (strides.values[i] < 0) {
+            return 0;
+        }
+        max_elem_offset += (shape.dims[i] - 1) * strides.values[i];
+    }
+    return static_cast<size_t>(max_elem_offset + 1) * item_size();
+}
+
+bool TensorView::defined() const {
+    return arena != nullptr && arena->defined();
+}
+
+bool TensorView::contiguous() const {
     if (shape.ndim != strides.ndim || !shape.valid()) {
         return false;
     }
@@ -163,35 +259,26 @@ bool Tensor::contiguous() const {
     return true;
 }
 
-Device Stream::device() const {
-    return device_;
+Device TensorView::device() const {
+    return arena == nullptr ? Device{} : arena->device();
 }
 
-void* Stream::native_handle() const {
-    return native_handle_;
+void* TensorView::native_handle() const {
+    return arena == nullptr ? nullptr : arena->native_handle();
 }
 
-Stream Backend::make_stream(void* native_handle) const {
-    Stream stream;
-    stream.device_ = device();
-    stream.native_handle_ = native_handle;
-    return stream;
-}
-
-Tensor Backend::make_tensor(
-    const Shape& shape,
-    DType dtype,
+void Backend::bind_arena(
+    MemoryArena& arena,
     void* native_handle,
-    size_t nbytes) {
-    Tensor tensor;
-    tensor.dtype = dtype;
-    tensor.shape = shape;
-    tensor.strides = contiguous_strides(shape);
-    tensor.device = device();
-    tensor.storage.backend_ = this;
-    tensor.storage.handle_ = native_handle;
-    tensor.storage.nbytes_ = nbytes;
-    return tensor;
+    size_t bytes,
+    MemoryKind kind) {
+    arena.release();
+    arena.backend_ = this;
+    arena.handle_ = native_handle;
+    arena.capacity_ = bytes;
+    arena.offset_ = 0;
+    arena.kind_ = kind;
+    arena.device_ = device();
 }
 
 }  // namespace tinyinfer

@@ -39,111 +39,99 @@ public:
         return {DeviceType::cpu, 0};
     }
 
-    Result<Stream> new_stream() override {
-        calls.push_back("new_stream");
-        return {Status::success(), make_stream()};
+    Status alloc_arena(MemoryArena& arena, size_t bytes, MemoryKind kind) override {
+        calls.push_back("alloc_arena");
+        bind_arena(arena, reinterpret_cast<void*>(0x1000), bytes, kind);
+        return Status::success();
     }
 
-    Result<Tensor> empty(const Shape& shape, DType dtype) override {
-        calls.push_back("empty");
-        return {Status::success(), make_tensor(shape, dtype, nullptr, shape.numel() * dtype_size(dtype))};
-    }
-
-    Status copy_from_host(Tensor& dst, const void* src, size_t bytes, Stream& stream) override {
+    Status copy_from_host(const TensorView& dst, const void* src, size_t bytes) override {
         (void)dst;
         (void)src;
         (void)bytes;
-        (void)stream;
         calls.push_back("copy_from_host");
         return Status::success();
     }
 
-    Status copy_to_host(void* dst, const Tensor& src, size_t bytes, Stream& stream) override {
+    Status copy_to_host(void* dst, const TensorView& src, size_t bytes) override {
         (void)dst;
         (void)src;
         (void)bytes;
-        (void)stream;
         calls.push_back("copy_to_host");
         return Status::success();
     }
 
-    Status matmul_out(Tensor& out, const Tensor& x, const Tensor& w, Stream& stream) override {
+    Status matmul_out(const TensorView& out, const TensorView& x, const TensorView& w) override {
+        (void)out;
         (void)x;
         (void)w;
-        (void)stream;
         calls.push_back("matmul");
-        out = make_tensor(make_shape({1, 1}), DType::f32, nullptr, 4);
         return Status::success();
     }
 
     Status rms_norm_out(
-        Tensor& out,
-        const Tensor& x,
-        const Tensor& weight,
-        float eps,
-        Stream& stream) override {
+        const TensorView& out,
+        const TensorView& x,
+        const TensorView& weight,
+        float eps) override {
+        (void)out;
         (void)x;
         (void)weight;
         (void)eps;
-        (void)stream;
         calls.push_back("rms_norm");
-        out = make_tensor(make_shape({1, 1}), DType::f32, nullptr, 4);
         return Status::success();
     }
 
-    Status rope_inplace(Tensor& q, Tensor& k, uint32_t start_pos, Stream& stream) override {
+    Status rope_inplace(const TensorView& q, const TensorView& k, uint32_t start_pos) override {
         (void)q;
         (void)k;
         (void)start_pos;
-        (void)stream;
         calls.push_back("rope");
         return Status::success();
     }
 
     Status attention_out(
-        Tensor& out,
-        const Tensor& q,
-        const Tensor& k_cache,
-        const Tensor& v_cache,
-        uint32_t kv_len,
-        Stream& stream) override {
+        const TensorView& out,
+        const TensorView& q,
+        const TensorView& k_cache,
+        const TensorView& v_cache,
+        uint32_t kv_len) override {
+        (void)out;
         (void)q;
         (void)k_cache;
         (void)v_cache;
         (void)kv_len;
-        (void)stream;
         calls.push_back("attention");
-        out = make_tensor(make_shape({1, 1}), DType::f32, nullptr, 4);
         return Status::success();
     }
 
-    Status swiglu_out(Tensor& out, const Tensor& gate, const Tensor& up, Stream& stream) override {
+    Status swiglu_out(
+        const TensorView& out,
+        const TensorView& gate,
+        const TensorView& up) override {
+        (void)out;
         (void)gate;
         (void)up;
-        (void)stream;
         calls.push_back("swiglu");
-        out = make_tensor(make_shape({1, 1}), DType::f32, nullptr, 4);
         return Status::success();
     }
 
-    Status argmax(uint32_t& out_token, const Tensor& logits, Stream& stream) override {
+    Status argmax(uint32_t& out_token, const TensorView& logits) override {
         (void)logits;
-        (void)stream;
         calls.push_back("argmax");
         out_token = 42;
         return Status::success();
     }
 
-    Status synchronize(Stream& stream) override {
-        (void)stream;
+    Status synchronize() override {
         calls.push_back("synchronize");
         return Status::success();
     }
 
 protected:
-    Status release_storage(Storage& storage) override {
-        (void)storage;
-        calls.push_back("release_storage");
+    Status release_arena(MemoryArena& arena) override {
+        (void)arena;
+        calls.push_back("release_arena");
         return Status::success();
     }
 };
@@ -158,7 +146,11 @@ void test_config_validation() {
     EXPECT_EQ(config.validate().code, Status::invalid_config);
 }
 
-void test_shape_stride_tensor_helpers() {
+void test_shape_stride_tensor_view_helpers() {
+    FakeBackend backend;
+    MemoryArena arena;
+    EXPECT_TRUE(backend.alloc_arena(arena, 4096, MemoryKind::workspace));
+
     Shape shape = make_shape({2, 3, 4});
     EXPECT_TRUE(shape.valid());
     EXPECT_EQ(shape.ndim, 3u);
@@ -170,55 +162,70 @@ void test_shape_stride_tensor_helpers() {
     EXPECT_EQ(strides.stride(1), 4);
     EXPECT_EQ(strides.stride(2), 1);
 
-    Tensor tensor;
-    tensor.dtype = DType::f32;
-    tensor.shape = shape;
-    tensor.strides = strides;
-    EXPECT_EQ(tensor.nbytes(), 96u);
-    EXPECT_TRUE(tensor.contiguous());
+    Result<TensorView> tensor = arena.alloc(shape, DType::f32);
+    EXPECT_TRUE(tensor.status);
+    EXPECT_TRUE(tensor.value.defined());
+    EXPECT_EQ(tensor.value.logical_nbytes(), 96u);
+    EXPECT_EQ(tensor.value.storage_span_nbytes(), 96u);
+    EXPECT_TRUE(tensor.value.contiguous());
+    EXPECT_EQ(arena.used(), 96u);
 }
 
-void test_parameter_enumeration() {
-    LlamaModel model;
-    model.config = LlamaConfig::demo();
-    model.layers.resize(model.config.n_layers);
-
-    std::vector<NamedTensor> params = model.parameters();
-    EXPECT_EQ(params.size(), 21u);
-    EXPECT_EQ(params[0].name, std::string("token_embedding"));
-    EXPECT_EQ(params[3].name, std::string("layers.0.attn_norm"));
-    EXPECT_EQ(params.back().name, std::string("layers.1.down_proj"));
-}
-
-void test_runner_flow_with_fake_backend() {
+void test_arena_reset_reuses_memory() {
     FakeBackend backend;
-    LlamaModel model;
-    model.config = LlamaConfig::demo();
-    model.layers.resize(model.config.n_layers);
+    MemoryArena arena;
+    EXPECT_TRUE(backend.alloc_arena(arena, 1024, MemoryKind::workspace));
 
-    LlamaRunner runner(backend, model);
+    Result<TensorView> a = arena.alloc(make_shape({4, 4}), DType::f32);
+    EXPECT_TRUE(a.status);
+    EXPECT_EQ(a.value.byte_offset, 0u);
+    EXPECT_EQ(arena.used(), 64u);
 
-    KVCache cache;
-    EXPECT_TRUE(runner.init_kv_cache(cache, 16));
-    EXPECT_EQ(cache.max_seq_len, 16u);
-    EXPECT_EQ(cache.seq_len, 0u);
+    arena.reset();
+    Result<TensorView> b = arena.alloc(make_shape({4, 4}), DType::f32);
+    EXPECT_TRUE(b.status);
+    EXPECT_EQ(b.value.byte_offset, 0u);
+    EXPECT_EQ(arena.used(), 64u);
+}
 
-    Tensor logits;
+void test_engine_flow_with_fake_backend() {
+    FakeBackend backend;
+    LlamaConfig config = LlamaConfig::demo();
+
+    Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 16);
+    EXPECT_TRUE(engine.status);
+    EXPECT_EQ(engine.value.max_seq_len(), 16u);
+    EXPECT_EQ(engine.value.seq_len(), 0u);
+
     const TokenId prompt[] = {1, 2, 3};
-    EXPECT_TRUE(runner.prefill(prompt, cache, logits));
-    EXPECT_EQ(cache.seq_len, 3u);
-
     TokenId next = 0;
-    EXPECT_TRUE(runner.decode_one(4, cache, logits, next));
-    EXPECT_EQ(cache.seq_len, 4u);
+    EXPECT_TRUE(engine.value.prefill(prompt, next));
+    EXPECT_EQ(engine.value.seq_len(), 3u);
     EXPECT_EQ(next, 42u);
+
+    EXPECT_TRUE(engine.value.decode_one(4, next));
+    EXPECT_EQ(engine.value.seq_len(), 4u);
+    EXPECT_EQ(next, 42u);
+
+    TokenId output[5] = {};
+    uint32_t output_count = 0;
+    EXPECT_TRUE(engine.value.generate(prompt, output, GenerateConfig{2, 2, true}, output_count));
+    EXPECT_EQ(output_count, 5u);
+    EXPECT_EQ(output[0], 1u);
+    EXPECT_EQ(output[1], 2u);
+    EXPECT_EQ(output[2], 3u);
+    EXPECT_EQ(output[3], 42u);
+    EXPECT_EQ(output[4], 42u);
 
     bool saw_attention = false;
     bool saw_argmax = false;
+    uint32_t arena_allocs = 0;
     for (const std::string& call : backend.calls) {
         saw_attention = saw_attention || call == "attention";
         saw_argmax = saw_argmax || call == "argmax";
+        arena_allocs += call == "alloc_arena" ? 1u : 0u;
     }
+    EXPECT_EQ(arena_allocs, 3u);
     EXPECT_TRUE(saw_attention);
     EXPECT_TRUE(saw_argmax);
 }
@@ -227,9 +234,9 @@ void test_runner_flow_with_fake_backend() {
 
 int main() {
     test_config_validation();
-    test_shape_stride_tensor_helpers();
-    test_parameter_enumeration();
-    test_runner_flow_with_fake_backend();
+    test_shape_stride_tensor_view_helpers();
+    test_arena_reset_reuses_memory();
+    test_engine_flow_with_fake_backend();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " test failure(s)\n";

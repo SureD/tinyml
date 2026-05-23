@@ -13,67 +13,60 @@ public:
     virtual ~Backend() = default;
 
     virtual Device device() const = 0;
-    virtual Result<Stream> new_stream() = 0;
 
-    virtual Result<Tensor> empty(const Shape& shape, DType dtype) = 0;
+    virtual Status alloc_arena(
+        MemoryArena& arena,
+        size_t bytes,
+        MemoryKind kind) = 0;
 
     virtual Status copy_from_host(
-        Tensor& dst,
+        const TensorView& dst,
         const void* src,
-        size_t bytes,
-        Stream& stream) = 0;
+        size_t bytes) = 0;
     virtual Status copy_to_host(
         void* dst,
-        const Tensor& src,
-        size_t bytes,
-        Stream& stream) = 0;
+        const TensorView& src,
+        size_t bytes) = 0;
 
     virtual Status matmul_out(
-        Tensor& out,
-        const Tensor& x,
-        const Tensor& w,
-        Stream& stream) = 0;
+        const TensorView& out,
+        const TensorView& x,
+        const TensorView& w) = 0;
     virtual Status rms_norm_out(
-        Tensor& out,
-        const Tensor& x,
-        const Tensor& weight,
-        float eps,
-        Stream& stream) = 0;
+        const TensorView& out,
+        const TensorView& x,
+        const TensorView& weight,
+        float eps) = 0;
     virtual Status rope_inplace(
-        Tensor& q,
-        Tensor& k,
-        uint32_t start_pos,
-        Stream& stream) = 0;
+        const TensorView& q,
+        const TensorView& k,
+        uint32_t start_pos) = 0;
     virtual Status attention_out(
-        Tensor& out,
-        const Tensor& q,
-        const Tensor& k_cache,
-        const Tensor& v_cache,
-        uint32_t kv_len,
-        Stream& stream) = 0;
+        const TensorView& out,
+        const TensorView& q,
+        const TensorView& k_cache,
+        const TensorView& v_cache,
+        uint32_t kv_len) = 0;
     virtual Status swiglu_out(
-        Tensor& out,
-        const Tensor& gate,
-        const Tensor& up,
-        Stream& stream) = 0;
+        const TensorView& out,
+        const TensorView& gate,
+        const TensorView& up) = 0;
     virtual Status argmax(
         uint32_t& out_token,
-        const Tensor& logits,
-        Stream& stream) = 0;
+        const TensorView& logits) = 0;
 
-    virtual Status synchronize(Stream& stream) = 0;
+    virtual Status synchronize() = 0;
 
 protected:
-    friend class Storage;
+    friend class MemoryArena;
 
-    Stream make_stream(void* native_handle = nullptr) const;
-    Tensor make_tensor(
-        const Shape& shape,
-        DType dtype,
+    void bind_arena(
+        MemoryArena& arena,
         void* native_handle,
-        size_t nbytes);
+        size_t bytes,
+        MemoryKind kind);
 
-    virtual Status release_storage(Storage& storage) = 0;
+    virtual Status release_arena(MemoryArena& arena) = 0;
 };
 
 Result<std::unique_ptr<Backend>> create_metal_backend();
