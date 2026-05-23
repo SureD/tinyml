@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer TensorView Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer TensorView Design</h1>
+      <p class="muted">
+        Design doc for the first TinyInfer tensor metadata object. This document defines the scope, invariants, memory semantics, and implementation plan for <code>TensorView</code>.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Draft for Step 1 implementation review.</span></div>
+        <div><strong>Parent design</strong><span><a href="./design.html">TinyInfer Core Runtime Design</a></span></div>
+        <div><strong>Owner</strong><span>Core runtime metadata layer.</span></div>
+        <div><strong>Main decision</strong><span><code>TensorView</code> is a view, not storage.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Context And Scope</h2>
+      <p>
+        TinyInfer uses static arena allocation for weights, KV cache, and workspace. A tensor object that owns memory would hide allocation and lifetime in the wrong place. <code>TensorView</code> exists to describe a logical tensor inside a <code>MemoryArena</code> without owning or releasing memory.
+      </p>
+      <pre>MemoryArena
+  backend native handle: private, backend-only
+  capacity: bytes
+  used: bump offset
+
+TensorView
+  arena: MemoryArena*
+  byte_offset: offset inside arena
+  dtype: element type
+  shape: logical dimensions
+  strides: element strides</pre>
+      <p>
+        This design covers only the metadata layer: shape, stride, dtype, byte size, byte offset, and validity checks. It does not cover Backend memory allocation, native object access, or operator math.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Goals</h2>
+      <ul>
+        <li>Keep <code>TensorView</code> small, trivially movable, and cheap to pass by value or const reference.</li>
+        <li>Make memory ownership explicit: only <code>MemoryArena</code> owns memory.</li>
+        <li>Represent contiguous tensors and simple non-contiguous views through shape and strides.</li>
+        <li>Allow byte-size and storage-span checks without touching backend memory.</li>
+        <li>Prevent metadata bugs such as out-of-rank access, invalid shape, and byte-size overflow.</li>
+        <li>Keep v1 behavior simple enough to test without Metal or a real model.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Non-Goals</h2>
+      <ul>
+        <li>No memory ownership in <code>TensorView</code>.</li>
+        <li>No implicit allocation, free, copy, transpose, or materialization.</li>
+        <li>No public view algebra API in v1, including <code>transpose</code>, <code>slice</code>, <code>reshape</code>, <code>permute</code>, or <code>contiguous</code>.</li>
+        <li>No negative-stride view support in v1.</li>
+        <li>No requirement that every Backend operator accepts non-contiguous tensors.</li>
+        <li>No broadcasting contract in v1, even though stride metadata can technically describe overlapping views.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Requirements And Constraints</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Requirement</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Ownership</td>
+              <td>Destroying <code>TensorView</code> must not release memory.</td>
+              <td>Arena lifetime must remain visible and easy to reason about.</td>
+            </tr>
+            <tr>
+              <td>Addressing</td>
+              <td><code>TensorView</code> stores <code>byte_offset</code> only. Native object access is backend-only.</td>
+              <td>CPU pointers and Metal buffers have different semantics, so the core view must not interpret backend handles.</td>
+            </tr>
+            <tr>
+              <td>Shape</td>
+              <td>Rank must be at most 8. Normal dimensions must be positive.</td>
+              <td>Fixed-size arrays keep the object simple and allocation-free.</td>
+            </tr>
+            <tr>
+              <td>Scalar</td>
+              <td>Rank-0 shape is valid and has one element.</td>
+              <td>This matches normal tensor metadata semantics and keeps helper functions total.</td>
+            </tr>
+            <tr>
+              <td>Strides</td>
+              <td>Contiguous strides are row-major. Negative strides are invalid in v1.</td>
+              <td>Negative strides complicate address range checks and are not needed for LLaMA v1.</td>
+            </tr>
+            <tr>
+              <td>Overflow</td>
+              <td>Element count, byte count, and storage span must fail closed on overflow.</td>
+              <td>Overflow in memory metadata is a correctness and security bug.</td>
+            </tr>
+            <tr>
+              <td>Backend ops</td>
+              <td>Operators may require <code>contiguous()</code> unless their contract says otherwise.</td>
+              <td>v1 kernels should be simple, explicit, and benchmarkable.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Proposed Design</h2>
+
+      <h3>5.1 Data Model</h3>
+      <pre>struct Shape {
+    uint32_t ndim;
+    int64_t dims[8];
+};
+
+struct Strides {
+    uint32_t ndim;
+    int64_t values[8];
+};
+
+struct TensorView {
+    MemoryArena* arena;
+    size_t byte_offset;
+    DType dtype;
+    Shape shape;
+    Strides strides;
+};</pre>
+      <p>
+        Shape dimensions are logical element counts. Stride values are measured in elements, not bytes. <code>byte_offset</code> is measured in bytes from the arena base.
+      </p>
+
+      <h3>5.2 Shape Semantics</h3>
+      <ul>
+        <li><code>ndim == 0</code> is a scalar shape and has <code>numel() == 1</code>.</li>
+        <li><code>ndim &gt; 8</code> is invalid.</li>
+        <li>For <code>ndim &gt; 0</code>, every dimension must be positive.</li>
+        <li><code>Shape::dim(i)</code> returns zero when <code>i</code> is outside the representable range.</li>
+        <li><code>Shape::numel()</code> returns zero for invalid shapes or overflow.</li>
+      </ul>
+
+      <h3>5.3 Stride Semantics</h3>
+      <ul>
+        <li><code>contiguous_strides(shape)</code> returns row-major strides.</li>
+        <li><code>Strides::stride(i)</code> returns zero when <code>i</code> is outside the representable range.</li>
+        <li><code>TensorView::contiguous()</code> compares stored strides to row-major contiguous strides.</li>
+        <li><code>storage_span_nbytes()</code> computes the byte range touched by the view.</li>
+        <li>Negative strides return an invalid storage span in v1.</li>
+      </ul>
+
+      <h3>5.4 Transpose And View Operations</h3>
+      <p>
+        Transpose is not a memory operation at the <code>TensorView</code> layer. If a transpose view is added later, it should create a new <code>TensorView</code> with swapped shape and stride metadata:
+      </p>
+      <pre>// Logical transpose of a 2D contiguous [M, N] tensor.
+// Original shape:  [M, N]
+// Original stride: [N, 1]
+// Transposed shape:  [N, M]
+// Transposed stride: [1, N]
+// Memory copied: no</pre>
+      <p>
+        v1 does not expose a public <code>transpose()</code> helper because the dedicated LLaMA inference path should not need runtime transposes. Weights should be loaded or stored in the layout expected by kernels. If an operator needs a different physical layout, that conversion must be an explicit Backend operation or loader decision, not hidden inside <code>TensorView</code>.
+      </p>
+      <p>
+        Backend operators are allowed to reject non-contiguous views until an op-specific contract says otherwise. A future <code>contiguous</code> or layout-conversion op would allocate from workspace and copy/materialize data explicitly.
+      </p>
+
+      <h3>5.5 Defined View</h3>
+      <p>
+        <code>TensorView::defined()</code> should mean the view can safely describe a byte range inside its arena. It requires:
+      </p>
+      <ul>
+        <li>the arena pointer is non-null;</li>
+        <li>the arena has a backend-bound native handle;</li>
+        <li>the tensor metadata has a non-zero valid storage span;</li>
+        <li><code>byte_offset + storage_span_nbytes()</code> fits inside arena capacity.</li>
+      </ul>
+
+      <h3>5.6 Backend Native Access</h3>
+      <p>
+        <code>TensorView</code> and <code>MemoryArena</code> do not expose public native handles. Backend implementations are the only layer that may interpret the arena's backend-native object. The view contributes only <code>byte_offset</code>.
+      </p>
+      <pre>CPU backend:
+  data = static_cast&lt;uint8_t*&gt;(arena_handle(*view.arena)) + view.byte_offset
+
+Metal backend:
+  buffer = static_cast&lt;MTLBuffer*&gt;(arena_handle(*view.arena))
+  encoder.setBuffer(buffer, offset: view.byte_offset)</pre>
+      <p>
+        This keeps CPU pointer arithmetic out of the common tensor metadata layer and avoids treating opaque Metal objects as byte-addressable pointers.
+      </p>
+    </section>
+
+    <section>
+      <h2>6. Implementation Plan</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Scope</th>
+              <th>Implementation</th>
+              <th>Acceptance Criteria</th>
+              <th>Depends On</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>DType and Shape</td>
+              <td>Implement <code>dtype_size</code>, <code>Shape::valid</code>, <code>Shape::dim</code>, <code>Shape::numel</code>, and <code>make_shape</code>.</td>
+              <td>Tests cover scalar shape, normal shape, zero dimension, too many dimensions, and element-count overflow.</td>
+              <td>None</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Strides</td>
+              <td>Implement <code>Strides::stride</code> and <code>contiguous_strides</code>.</td>
+              <td>Tests cover row-major strides, invalid shape behavior, and out-of-range stride access.</td>
+              <td>Step 1</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>TensorView byte helpers</td>
+              <td>Implement <code>dim</code>, <code>numel</code>, <code>item_size</code>, <code>logical_nbytes</code>, <code>storage_span_nbytes</code>, and <code>contiguous</code>.</td>
+              <td>Tests cover contiguous views, gapped views, scalar views, negative strides, and byte-size overflow.</td>
+              <td>Step 1, Step 2</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Arena connection</td>
+              <td>Implement <code>defined</code> and <code>device</code> against <code>MemoryArena</code>.</td>
+              <td>Tests verify undefined views, arena capacity checks, and that native handles are not exposed on <code>TensorView</code> or <code>MemoryArena</code>.</td>
+              <td>MemoryArena minimal fields</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Operator contract follow-up</td>
+              <td>Each Backend op later states whether it accepts only contiguous views or specific non-contiguous views.</td>
+              <td>Op tests reject unsupported layouts explicitly instead of silently producing wrong results.</td>
+              <td>Backend op implementation</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Dependency Graph</h2>
+      <pre>DType
+  └─ dtype_size
+
+Shape
+  ├─ make_shape
+  ├─ valid
+  ├─ dim
+  └─ numel
+       └─ logical_nbytes
+
+Shape
+  └─ contiguous_strides
+       └─ TensorView::contiguous
+
+TensorView + MemoryArena
+  ├─ defined
+  └─ device</pre>
+    </section>
+
+    <section>
+      <h2>8. Test Plan</h2>
+      <ul>
+        <li>Compile smoke test for <code>tinyinfer/core.h</code>.</li>
+        <li>Unit tests for dtype byte sizes.</li>
+        <li>Unit tests for scalar, valid, invalid, and overflow shapes.</li>
+        <li>Unit tests for row-major contiguous stride generation.</li>
+        <li>Unit tests for <code>logical_nbytes</code> and <code>storage_span_nbytes</code>.</li>
+        <li>Unit tests for non-contiguous gapped stride span.</li>
+        <li>Unit tests for negative stride rejection.</li>
+        <li>Compile-time tests that <code>TensorView</code> and <code>MemoryArena</code> do not expose public <code>native_handle()</code>.</li>
+        <li>Later backend op tests must explicitly validate layout expectations.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>9. Alternatives Considered</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Alternative</th>
+              <th>Decision</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Owning Tensor</td>
+              <td>Rejected.</td>
+              <td>It hides allocation and release inside the tensor object, which conflicts with arena-based memory ownership.</td>
+            </tr>
+            <tr>
+              <td>Contiguous-only TensorView</td>
+              <td>Rejected.</td>
+              <td>Shape and strides are still useful for precise layout description and future metadata-only views.</td>
+            </tr>
+            <tr>
+              <td>Full view algebra now</td>
+              <td>Rejected for v1.</td>
+              <td>Transpose, slice, permute, and reshape helpers are not required for the first dedicated LLaMA path.</td>
+            </tr>
+            <tr>
+              <td>Implicit materialization for transpose</td>
+              <td>Rejected.</td>
+              <td>Hidden copies would make hot-path memory behavior hard to reason about and hard to profile.</td>
+            </tr>
+            <tr>
+              <td>Negative strides</td>
+              <td>Rejected for v1.</td>
+              <td>They complicate address-span validation and are unnecessary for model inference layout.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>10. Risks</h2>
+      <ul>
+        <li><code>TensorView</code> can outlive its arena. Mitigation: keep long-lived views inside <code>LlamaInferEngine</code> and avoid exposing internal views publicly.</li>
+        <li>Non-contiguous metadata may be passed to an op that assumes contiguous memory. Mitigation: each op must validate layout until non-contiguous support is intentionally added.</li>
+        <li>Stride metadata can describe overlapping views. Mitigation: v1 does not define broadcasting or aliasing semantics for backend ops.</li>
+        <li>Backend code can still misuse native handles. Mitigation: keep native access protected on <code>Backend</code>, and keep CPU pointer arithmetic inside CPU-only code.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>11. Open Questions</h2>
+      <ul>
+        <li>Should rank-0 scalar allocation be allowed from <code>MemoryArena::alloc</code>, or only represented as metadata? The current design allows scalar metadata; arena allocation can be stricter if unused.</li>
+        <li>Should future <code>reshape</code> be allowed only for contiguous views? Recommended answer: yes, unless there is a concrete non-contiguous use case.</li>
+        <li>Should future <code>transpose</code> exist as a free helper or remain an internal utility? Recommended answer: keep it internal until a real model path needs it.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

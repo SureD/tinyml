@@ -293,11 +293,14 @@ LlamaInferEngine: prefill / decode_one / generate</pre>
       <p>
         <code>TensorView</code> is a descriptor for a logical tensor stored inside a <code>MemoryArena</code>. It contains arena pointer, byte offset, dtype, shape, and strides.
       </p>
+      <p>
+        Detailed design: <a href="./tensor_view_design.html">TinyInfer TensorView Design</a>.
+      </p>
       <ul>
         <li><code>defined()</code> is true only when the arena exists and has a native allocation.</li>
         <li><code>logical_nbytes()</code> is <code>numel * dtype_size</code>.</li>
         <li><code>storage_span_nbytes()</code> computes the byte range touched by the view according to shape and strides.</li>
-        <li><code>native_handle()</code> returns the arena native handle plus byte offset.</li>
+        <li>Backend code interprets the arena native handle; <code>TensorView</code> only exposes <code>byte_offset</code>.</li>
         <li>Destroying a <code>TensorView</code> has no side effects.</li>
       </ul>
 
@@ -312,10 +315,11 @@ public:
 
 protected:
     void bind_arena(MemoryArena&amp; arena, void* native_handle, size_t bytes, MemoryKind kind);
+    void* arena_handle(const MemoryArena&amp; arena) const;
     virtual Status release_arena(MemoryArena&amp; arena) = 0;
 };</pre>
       <p>
-        Only Backend can bind and release a native arena handle. This keeps native memory ownership out of <code>TensorView</code> and out of model code.
+        Only Backend can bind, release, and interpret a native arena handle. This keeps native memory ownership out of <code>TensorView</code> and out of model code.
       </p>
 
       <h3>5.4 MemoryArena</h3>

@@ -65,6 +65,7 @@ protected:
         void* native_handle,
         size_t bytes,
         MemoryKind kind);
+    void* arena_handle(const MemoryArena& arena) const;
 
     virtual Status release_arena(MemoryArena& arena) = 0;
 };

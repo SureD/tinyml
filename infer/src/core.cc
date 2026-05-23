@@ -1,6 +1,6 @@
 #include "tinyinfer/core.h"
 
-#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -9,12 +9,33 @@
 namespace tinyinfer {
 namespace {
 
-size_t align_up(size_t value, size_t alignment) {
+bool checked_add(size_t a, size_t b, size_t& out) {
+    if (a > std::numeric_limits<size_t>::max() - b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
+bool checked_mul(size_t a, size_t b, size_t& out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+bool checked_align_up(size_t value, size_t alignment, size_t& out) {
     if (alignment == 0) {
-        return value;
+        out = value;
+        return true;
     }
     const size_t rem = value % alignment;
-    return rem == 0 ? value : value + (alignment - rem);
+    if (rem == 0) {
+        out = value;
+        return true;
+    }
+    return checked_add(value, alignment - rem, out);
 }
 
 }  // namespace
@@ -33,7 +54,7 @@ size_t dtype_size(DType dtype) {
 }
 
 int64_t Shape::dim(uint32_t i) const {
-    return i < ndim ? dims[i] : 0;
+    return (i < ndim && i < kMaxDims) ? dims[i] : 0;
 }
 
 int64_t Shape::numel() const {
@@ -52,13 +73,18 @@ int64_t Shape::numel() const {
 }
 
 bool Shape::valid() const {
-    if (ndim == 0 || ndim > kMaxDims) {
+    if (ndim > kMaxDims) {
         return false;
     }
+    int64_t total = 1;
     for (uint32_t i = 0; i < ndim; ++i) {
         if (dims[i] <= 0) {
             return false;
         }
+        if (dims[i] > std::numeric_limits<int64_t>::max() / total) {
+            return false;
+        }
+        total *= dims[i];
     }
     return true;
 }
@@ -78,19 +104,22 @@ Shape make_shape(std::initializer_list<int64_t> dims) {
 }
 
 int64_t Strides::stride(uint32_t i) const {
-    return i < ndim ? values[i] : 0;
+    return (i < ndim && i < kMaxDims) ? values[i] : 0;
 }
 
 Strides contiguous_strides(const Shape& shape) {
     Strides strides;
+    if (!shape.valid()) {
+        return strides;
+    }
+
     strides.ndim = shape.ndim;
 
     int64_t stride = 1;
-    const uint32_t ndim = std::min<uint32_t>(shape.ndim, Shape::kMaxDims);
-    for (uint32_t i = ndim; i > 0; --i) {
+    for (uint32_t i = shape.ndim; i > 0; --i) {
         const uint32_t idx = i - 1;
         strides.values[idx] = stride;
-        stride *= std::max<int64_t>(shape.dims[idx], 1);
+        stride *= shape.dims[idx];
     }
     return strides;
 }
@@ -150,8 +179,20 @@ Result<TensorView> MemoryArena::alloc(
         return {Status::invalid_argument_status("invalid dtype"), {}};
     }
 
-    const size_t start = align_up(offset_, alignment);
-    const size_t bytes = static_cast<size_t>(shape.numel()) * item_bytes;
+    const int64_t elements = shape.numel();
+    if (elements <= 0) {
+        return {Status::invalid_argument_status("invalid tensor size"), {}};
+    }
+
+    size_t start = 0;
+    if (!checked_align_up(offset_, alignment, start)) {
+        return {Status::invalid_argument_status("arena offset overflow"), {}};
+    }
+
+    size_t bytes = 0;
+    if (!checked_mul(static_cast<size_t>(elements), item_bytes, bytes)) {
+        return {Status::invalid_argument_status("tensor byte size overflow"), {}};
+    }
     if (bytes > capacity_ || start > capacity_ - bytes) {
         return {Status::invalid_argument_status("arena capacity exceeded"), {}};
     }
@@ -172,7 +213,7 @@ void MemoryArena::reset() {
 }
 
 bool MemoryArena::defined() const {
-    return backend_ != nullptr && capacity_ != 0;
+    return backend_ != nullptr && handle_ != nullptr && capacity_ != 0;
 }
 
 MemoryKind MemoryArena::kind() const {
@@ -181,10 +222,6 @@ MemoryKind MemoryArena::kind() const {
 
 Device MemoryArena::device() const {
     return device_;
-}
-
-void* MemoryArena::native_handle() const {
-    return handle_;
 }
 
 size_t MemoryArena::used() const {
@@ -223,7 +260,8 @@ size_t TensorView::logical_nbytes() const {
     if (elements <= 0) {
         return 0;
     }
-    return static_cast<size_t>(elements) * item_size();
+    size_t bytes = 0;
+    return checked_mul(static_cast<size_t>(elements), item_size(), bytes) ? bytes : 0;
 }
 
 size_t TensorView::storage_span_nbytes() const {
@@ -231,18 +269,40 @@ size_t TensorView::storage_span_nbytes() const {
         return 0;
     }
 
-    int64_t max_elem_offset = 0;
+    size_t max_elem_offset = 0;
     for (uint32_t i = 0; i < shape.ndim; ++i) {
         if (strides.values[i] < 0) {
             return 0;
         }
-        max_elem_offset += (shape.dims[i] - 1) * strides.values[i];
+        size_t dim_offset = 0;
+        if (!checked_mul(
+                static_cast<size_t>(shape.dims[i] - 1),
+                static_cast<size_t>(strides.values[i]),
+                dim_offset)) {
+            return 0;
+        }
+        if (!checked_add(max_elem_offset, dim_offset, max_elem_offset)) {
+            return 0;
+        }
     }
-    return static_cast<size_t>(max_elem_offset + 1) * item_size();
+
+    size_t element_count = 0;
+    if (!checked_add(max_elem_offset, 1, element_count)) {
+        return 0;
+    }
+
+    size_t bytes = 0;
+    return checked_mul(element_count, item_size(), bytes) ? bytes : 0;
 }
 
 bool TensorView::defined() const {
-    return arena != nullptr && arena->defined();
+    if (arena == nullptr || !arena->defined()) {
+        return false;
+    }
+
+    const size_t span = storage_span_nbytes();
+    return span != 0 && byte_offset <= arena->capacity() &&
+           span <= arena->capacity() - byte_offset;
 }
 
 bool TensorView::contiguous() const {
@@ -263,10 +323,6 @@ Device TensorView::device() const {
     return arena == nullptr ? Device{} : arena->device();
 }
 
-void* TensorView::native_handle() const {
-    return arena == nullptr ? nullptr : arena->native_handle();
-}
-
 void Backend::bind_arena(
     MemoryArena& arena,
     void* native_handle,
@@ -279,6 +335,10 @@ void Backend::bind_arena(
     arena.offset_ = 0;
     arena.kind_ = kind;
     arena.device_ = device();
+}
+
+void* Backend::arena_handle(const MemoryArena& arena) const {
+    return arena.handle_;
 }
 
 }  // namespace tinyinfer

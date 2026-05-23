@@ -1,7 +1,9 @@
 #include "tinyinfer/llama.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -10,6 +12,14 @@ using namespace tinyinfer;
 namespace {
 
 int g_failures = 0;
+
+template <class T>
+concept HasNativeHandle = requires(const T& value) {
+    value.native_handle();
+};
+
+static_assert(!HasNativeHandle<TensorView>);
+static_assert(!HasNativeHandle<MemoryArena>);
 
 #define EXPECT_TRUE(expr)                                                        \
     do {                                                                         \
@@ -169,6 +179,61 @@ void test_shape_stride_tensor_view_helpers() {
     EXPECT_EQ(tensor.value.storage_span_nbytes(), 96u);
     EXPECT_TRUE(tensor.value.contiguous());
     EXPECT_EQ(arena.used(), 96u);
+
+    Result<TensorView> second = arena.alloc(make_shape({2, 3}), DType::f16);
+    EXPECT_TRUE(second.status);
+    EXPECT_EQ(second.value.byte_offset, 128u);
+    EXPECT_EQ(second.value.logical_nbytes(), 12u);
+    EXPECT_EQ(arena.used(), 140u);
+}
+
+void test_tensor_view_edge_cases() {
+    Shape scalar = make_shape({});
+    EXPECT_TRUE(scalar.valid());
+    EXPECT_EQ(scalar.ndim, 0u);
+    EXPECT_EQ(scalar.numel(), 1);
+
+    TensorView scalar_view;
+    scalar_view.dtype = DType::f16;
+    scalar_view.shape = scalar;
+    scalar_view.strides = contiguous_strides(scalar);
+    EXPECT_EQ(scalar_view.logical_nbytes(), 2u);
+    EXPECT_EQ(scalar_view.storage_span_nbytes(), 2u);
+    EXPECT_TRUE(scalar_view.contiguous());
+    EXPECT_TRUE(!scalar_view.defined());
+
+    Shape zero_dim = make_shape({2, 0});
+    EXPECT_TRUE(!zero_dim.valid());
+    EXPECT_EQ(zero_dim.numel(), 0);
+    EXPECT_EQ(contiguous_strides(zero_dim).ndim, 0u);
+
+    Shape too_many_dims = make_shape({1, 2, 3, 4, 5, 6, 7, 8, 9});
+    EXPECT_TRUE(!too_many_dims.valid());
+    EXPECT_EQ(too_many_dims.dim(8), 0);
+
+    Strides too_many_strides;
+    too_many_strides.ndim = 9;
+    EXPECT_EQ(too_many_strides.stride(8), 0);
+
+    Shape huge;
+    huge.ndim = 2;
+    huge.dims[0] = std::numeric_limits<int64_t>::max();
+    huge.dims[1] = 2;
+    EXPECT_TRUE(!huge.valid());
+    EXPECT_EQ(huge.numel(), 0);
+
+    TensorView gapped;
+    gapped.dtype = DType::f16;
+    gapped.shape = make_shape({2, 3});
+    gapped.strides.ndim = 2;
+    gapped.strides.values[0] = 4;
+    gapped.strides.values[1] = 1;
+    EXPECT_EQ(gapped.logical_nbytes(), 12u);
+    EXPECT_EQ(gapped.storage_span_nbytes(), 14u);
+    EXPECT_TRUE(!gapped.contiguous());
+
+    gapped.strides.values[0] = -1;
+    EXPECT_EQ(gapped.storage_span_nbytes(), 0u);
 }
 
 void test_arena_reset_reuses_memory() {
@@ -235,6 +300,7 @@ void test_engine_flow_with_fake_backend() {
 int main() {
     test_config_validation();
     test_shape_stride_tensor_view_helpers();
+    test_tensor_view_edge_cases();
     test_arena_reset_reuses_memory();
     test_engine_flow_with_fake_backend();
 

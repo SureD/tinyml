@@ -117,7 +117,6 @@ public:
     bool defined() const;
     MemoryKind kind() const;
     Device device() const;
-    void* native_handle() const;
     size_t used() const;
     size_t capacity() const;
 
@@ -151,7 +150,6 @@ struct TensorView {
     bool defined() const;
     bool contiguous() const;
     Device device() const;
-    void* native_handle() const;
 };
 
 }  // namespace tinyinfer
