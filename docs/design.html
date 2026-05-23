@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer Core Runtime Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer Core Runtime Design</h1>
+      <p class="muted">
+        Design doc for the first implementation of TinyInfer's core runtime: tensor memory, backend boundary, operator boundary, model layout, and inference engine flow.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Draft, implementation-ready sections are listed below.</span></div>
+        <div><strong>Target</strong><span>Dedicated LLaMA/TinyLlama inference runtime.</span></div>
+        <div><strong>Language</strong><span>C++20 public API with explicit ownership.</span></div>
+        <div><strong>Primary constraint</strong><span>No hidden allocation in the decode hot path.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Context And Scope</h2>
+      <p>
+        TinyInfer is a dedicated LLaMA-style inference program. It is not a general tensor framework and not a graph execution engine. The first implementation should make the inference path readable, testable, and suitable for later CPU and Metal optimization.
+      </p>
+      <p>
+        The main design problem is memory ownership. A normal owning tensor abstraction makes ownership and allocation too implicit for this project. The selected design separates tensor metadata from storage ownership:
+      </p>
+      <pre>DType / Shape / Strides / Device / Status
+        ↓
+TensorView: non-owning tensor metadata
+        ↓
+Backend: minimal memory allocation contract
+        ↓
+MemoryArena: one backend allocation, many TensorView slices
+        ↓
+Backend ops: explicit coarse operator boundary
+        ↓
+Model layout: LLaMA-specific weight and KV-cache views
+        ↓
+LlamaInferEngine: prefill / decode_one / generate</pre>
+    </section>
+
+    <section>
+      <h2>2. Goals</h2>
+      <ul>
+        <li>Use <code>TensorView</code> as the common data object for model weights, KV cache, workspace, and operator inputs/outputs.</li>
+        <li>Use <code>MemoryArena</code> as the only runtime memory owner in v1.</li>
+        <li>Allocate weights, KV cache, and workspace during <code>LlamaInferEngine::create</code>.</li>
+        <li>Keep public API small: <code>Backend</code>, <code>LlamaConfig</code>, <code>GenerateConfig</code>, <code>LlamaInferEngine</code>.</li>
+        <li>Make backend extension possible at coarse operator boundaries without adding a graph abstraction.</li>
+        <li>Make every stage independently testable before optimized Metal kernels exist.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Non-Goals</h2>
+      <ul>
+        <li>No generic computation graph.</li>
+        <li>No lazy evaluation.</li>
+        <li>No public <code>Stream</code> API in v1.</li>
+        <li>No per-tensor owning allocation/free API.</li>
+        <li>No tokenizer or checkpoint loader in this design.</li>
+        <li>No batching, continuous batching, paged attention, or speculative decoding in v1.</li>
+        <li>No quantization in this design.</li>
+        <li>No hidden hot-path heap allocation.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Requirements And Constraints</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Requirement</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Memory</td>
+              <td>Arena allocation must be explicit, move-only, and released by RAII.</td>
+              <td>Prevents unclear ownership and double-free risk.</td>
+            </tr>
+            <tr>
+              <td>Tensor</td>
+              <td><code>TensorView</code> must never own memory.</td>
+              <td>Allows model layout to be simple slices into preallocated arenas.</td>
+            </tr>
+            <tr>
+              <td>Backend</td>
+              <td>Backend owns allocation, copy, op execution, and synchronization.</td>
+              <td>Keeps CPU/Metal extension behind one boundary.</td>
+            </tr>
+            <tr>
+              <td>Engine</td>
+              <td>Engine owns weights, KV cache, workspace, and inference state.</td>
+              <td>The public API should be the inference program, not a set of loose utilities.</td>
+            </tr>
+            <tr>
+              <td>Hot path</td>
+              <td>Decode must reuse workspace and append to KV cache without heap allocation.</td>
+              <td>Decode is memory-bandwidth and latency sensitive.</td>
+            </tr>
+            <tr>
+              <td>Testing</td>
+              <td>Core metadata, arena behavior, backend call order, and CPU reference math must be testable without Metal.</td>
+              <td>Correctness comes before optimized kernels.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Proposed Design</h2>
+
+      <h3>5.1 Core Metadata</h3>
+      <p>
+        <code>DType</code>, <code>Shape</code>, <code>Strides</code>, <code>Device</code>, <code>Status</code>, and <code>Result&lt;T&gt;</code> are plain core types. They must not depend on model code.
+      </p>
+      <ul>
+        <li><code>Shape</code> supports up to 8 dimensions.</li>
+        <li>All dimensions must be positive for normal tensor allocation.</li>
+        <li><code>numel</code> returns the product of dimensions.</li>
+        <li><code>contiguous_strides</code> returns row-major contiguous strides.</li>
+        <li><code>dtype_size</code> maps dtype to byte size.</li>
+      </ul>
+
+      <h3>5.2 TensorView</h3>
+      <p>
+        <code>TensorView</code> is a descriptor for a logical tensor stored inside a <code>MemoryArena</code>. It contains arena pointer, byte offset, dtype, shape, and strides.
+      </p>
+      <ul>
+        <li><code>defined()</code> is true only when the arena exists and has a native allocation.</li>
+        <li><code>logical_nbytes()</code> is <code>numel * dtype_size</code>.</li>
+        <li><code>storage_span_nbytes()</code> computes the byte range touched by the view according to shape and strides.</li>
+        <li><code>native_handle()</code> returns the arena native handle plus byte offset.</li>
+        <li>Destroying a <code>TensorView</code> has no side effects.</li>
+      </ul>
+
+      <h3>5.3 Backend Memory Contract</h3>
+      <p>
+        Backend allocation is required before <code>MemoryArena</code> can be fully implemented. The minimal contract is:
+      </p>
+      <pre>class Backend {
+public:
+    virtual Device device() const = 0;
+    virtual Status alloc_arena(MemoryArena&amp; arena, size_t bytes, MemoryKind kind) = 0;
+
+protected:
+    void bind_arena(MemoryArena&amp; arena, void* native_handle, size_t bytes, MemoryKind kind);
+    virtual Status release_arena(MemoryArena&amp; arena) = 0;
+};</pre>
+      <p>
+        Only Backend can bind and release a native arena handle. This keeps native memory ownership out of <code>TensorView</code> and out of model code.
+      </p>
+
+      <h3>5.4 MemoryArena</h3>
+      <p>
+        <code>MemoryArena</code> owns one backend allocation. It exposes bump allocation to carve the arena into tensor views.
+      </p>
+      <ul>
+        <li>Move-only. Copy is disabled.</li>
+        <li>Destructor calls the owning backend's <code>release_arena</code>.</li>
+        <li><code>alloc(shape, dtype, alignment)</code> returns a <code>TensorView</code> with aligned byte offset.</li>
+        <li><code>reset()</code> sets used bytes to zero and keeps the native allocation.</li>
+        <li><code>capacity()</code> and <code>used()</code> expose memory accounting for tests and profiling.</li>
+      </ul>
+
+      <h3>5.5 Backend Operators</h3>
+      <p>
+        Operators are explicit Backend methods, not an <code>Op</code> class hierarchy. Virtual dispatch is acceptable at this coarse boundary because real backends will spend most time in kernel execution or CPU loops.
+      </p>
+      <pre>copy_from_host(dst, src, bytes)
+copy_to_host(dst, src, bytes)
+matmul_out(out, x, w)
+rms_norm_out(out, x, weight, eps)
+rope_inplace(q, k, start_pos)
+attention_out(out, q, k_cache, v_cache, kv_len)
+swiglu_out(out, gate, up)
+argmax(out_token, logits)
+synchronize()</pre>
+      <p>
+        CPU reference implementations should be written before Metal kernels. Metal can then be validated op by op against CPU behavior.
+      </p>
+
+      <h3>5.6 Model Layout</h3>
+      <p>
+        Model storage is internal to <code>LlamaInferEngine</code>. Public API should not expose <code>NamedTensor</code>, graph nodes, or memory planning objects.
+      </p>
+      <ul>
+        <li><code>weights_</code>: token embedding, layer weights, final norm, lm head.</li>
+        <li><code>kv_cache_arena_</code>: persistent keys and values.</li>
+        <li><code>workspace_</code>: temporary activations reused by prefill and decode.</li>
+      </ul>
+      <p>
+        KV cache layout is fixed as <code>[layer, kv_head, position, head_dim]</code> for both keys and values. This layout keeps layer and head indexing explicit and makes later backend-specific optimization local to attention kernels.
+      </p>
+
+      <h3>5.7 LlamaInferEngine</h3>
+      <p>
+        <code>LlamaInferEngine</code> is the public inference API. It owns the backend reference, config, arenas, model views, KV cache views, workspace, logits view, and current sequence length.
+      </p>
+      <pre>static Result&lt;LlamaInferEngine&gt; create(Backend&amp; backend, const LlamaConfig&amp; config, uint32_t max_seq_len);
+Status reset();
+Status prefill(std::span&lt;const TokenId&gt; prompt, TokenId&amp; next_token);
+Status decode_one(TokenId token, TokenId&amp; next_token);
+Status generate(std::span&lt;const TokenId&gt; prompt, std::span&lt;TokenId&gt; output, const GenerateConfig&amp; config, uint32_t&amp; output_count);</pre>
+      <p>
+        The inference flow should remain readable: embedding, per-layer attention path, per-layer MLP path, final norm, lm head, argmax. Allocation planning stays inside <code>create</code>; runtime methods should only reset and reuse workspace.
+      </p>
+    </section>
+
+    <section>
+      <h2>6. Implementation Plan</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Scope</th>
+              <th>Implementation</th>
+              <th>Acceptance Criteria</th>
+              <th>Depends On</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Core metadata</td>
+              <td>Implement dtype size, shape validation, numel, contiguous strides, tensor byte-size helpers.</td>
+              <td>Unit tests pass for scalar-like edge cases, normal shapes, invalid shapes, contiguous and non-contiguous views.</td>
+              <td>None</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Backend memory contract</td>
+              <td>Finalize <code>Backend::alloc_arena</code>, protected <code>bind_arena</code>, and protected <code>release_arena</code>.</td>
+              <td>Fake backend can allocate and release a native host block through the public backend contract.</td>
+              <td>Step 1</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>MemoryArena</td>
+              <td>Implement move-only RAII, aligned bump allocation, reset, accounting, and native-handle offset.</td>
+              <td>Tests cover move, destruction, reset, alignment, out-of-capacity errors, undefined arena errors.</td>
+              <td>Step 2</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>CPU backend baseline</td>
+              <td>Add CPU backend or test backend with host allocation, copy, argmax, RMSNorm, matmul, RoPE, SwiGLU, attention.</td>
+              <td>Small deterministic numerical tests pass without Metal.</td>
+              <td>Step 3</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Model memory layout</td>
+              <td>Compute arena sizes in <code>LlamaInferEngine::create</code>; bind weight, KV cache, and workspace views.</td>
+              <td>Layout tests verify expected offsets, shapes, strides, and total arena usage.</td>
+              <td>Step 3</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Engine inference flow</td>
+              <td>Implement <code>prefill</code>, <code>decode_one</code>, and <code>generate</code> using Backend ops and internal workspace views.</td>
+              <td>Fake backend call-order tests prove expected high-level sequence and seq_len updates.</td>
+              <td>Step 4, Step 5</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Metal backend memory</td>
+              <td>Implement Metal arena allocation, release, copy, and synchronize.</td>
+              <td>Host/device copy tests pass for weights, KV cache, workspace-sized buffers.</td>
+              <td>Step 3</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>Metal backend ops</td>
+              <td>Replace CPU reference ops one at a time with Metal kernels.</td>
+              <td>Each Metal op matches CPU reference within dtype tolerance on small and representative shapes.</td>
+              <td>Step 4, Step 7</td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td>Profiling hooks</td>
+              <td>Add optional stats and event collection for arena usage, op duration, bytes, shape, and token latency.</td>
+              <td>Profiling is off by default and does not add hidden allocation to decode.</td>
+              <td>Step 6</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Dependency Graph</h2>
+      <pre>Step 1 Core metadata
+  └─ Step 2 Backend memory contract
+       └─ Step 3 MemoryArena
+            ├─ Step 4 CPU backend baseline
+            │    └─ Step 6 Engine inference flow
+            ├─ Step 5 Model memory layout
+            │    └─ Step 6 Engine inference flow
+            └─ Step 7 Metal backend memory
+                 └─ Step 8 Metal backend ops
+
+Step 9 Profiling hooks depends on a stable engine flow.</pre>
+    </section>
+
+    <section>
+      <h2>8. Test Plan</h2>
+      <ul>
+        <li>Compile smoke test for all public headers.</li>
+        <li>Core tests for <code>DType</code>, <code>Shape</code>, <code>Strides</code>, and <code>TensorView</code> byte calculations.</li>
+        <li>Arena tests for allocation, reset, alignment, move-only behavior, and release behavior.</li>
+        <li>Fake backend tests for engine call order and sequence length updates.</li>
+        <li>CPU backend numerical tests for each operator.</li>
+        <li>CPU-vs-Metal parity tests after Metal kernels exist.</li>
+        <li>End-to-end token parity against the Python reference after checkpoint loading exists.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>9. Alternatives Considered</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Alternative</th>
+              <th>Decision</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Owning <code>Tensor</code></td>
+              <td>Rejected for v1.</td>
+              <td>It hides allocation and lifetime in the core data object, which conflicts with static arena planning.</td>
+            </tr>
+            <tr>
+              <td>Public <code>Stream</code></td>
+              <td>Rejected for v1.</td>
+              <td>Single device and single request do not need user-visible stream control. Backend can own its default queue.</td>
+            </tr>
+            <tr>
+              <td>Generic graph runtime</td>
+              <td>Rejected.</td>
+              <td>The project is a dedicated LLaMA inference engine. A graph adds more abstraction than the current scope needs.</td>
+            </tr>
+            <tr>
+              <td>Separate public memory plan object</td>
+              <td>Rejected for v1.</td>
+              <td>Memory planning belongs inside <code>LlamaInferEngine::create</code> until there is a real external use case.</td>
+            </tr>
+            <tr>
+              <td>Operator class hierarchy</td>
+              <td>Rejected for v1.</td>
+              <td>Backend methods are simpler and easier to inspect. Each op is already a stable coarse boundary.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>10. Risks</h2>
+      <ul>
+        <li>Arena sizing can be wrong early. Mitigation: layout tests must verify every view offset and total used bytes.</li>
+        <li><code>TensorView</code> can outlive its arena. Mitigation: keep views internal to engine wherever possible and avoid returning long-lived internal views publicly.</li>
+        <li>CPU reference ops may not match final Metal numerical behavior exactly. Mitigation: define dtype tolerance per op before parity testing.</li>
+        <li>Fixed KV layout may need adjustment for optimized attention. Mitigation: keep layout decision localized in model binding and attention kernels.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>11. References</h2>
+      <ul>
+        <li><a href="https://www.industrialempathy.com/posts/design-docs-at-google/">Design Docs at Google</a>: context/scope, goals/non-goals, actual design, alternatives, and lifecycle.</li>
+        <li><a href="https://research.tedneward.com/architecture/design-docs/">Design Docs (Google notes)</a>: concise summary of common Google-style design doc sections.</li>
+        <li><a href="https://gerrit-review.googlesource.com/Documentation/dev-design-docs.html">Gerrit Design Docs</a>: acceptance criteria, possible solutions, conclusion, and implementation follow-through.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
