@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+DEFAULT_MODEL_DIR = REPO_ROOT / "models" / "TinyLlama-1.1B-Chat-v1.0"
+REQUIRED_MODEL_FILES = (
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+)
 
 
 @dataclass(frozen=True)
@@ -310,13 +325,47 @@ class TinyLlama(nn.Module):
 TinyLLaMA = TinyLlama
 
 
+def model_files_ready(model_dir: Path) -> bool:
+    return all((model_dir / file).is_file() for file in REQUIRED_MODEL_FILES)
+
+
+def ensure_hf_checkpoint(
+    model_dir: Path,
+    *,
+    model_id: str = DEFAULT_MODEL_ID,
+    hf_home: Path | None = None,
+) -> Path:
+    if model_files_ready(model_dir):
+        return model_dir
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required to download TinyLlama. "
+            "Run `uv sync --project reference --locked` first."
+        ) from exc
+
+    hf_home = hf_home or Path(os.environ.get("HF_HOME", REPO_ROOT / "hf_cache"))
+    model_dir.mkdir(parents=True, exist_ok=True)
+    print(f"downloading model: {model_id}")
+    return Path(
+        snapshot_download(
+            repo_id=model_id,
+            local_dir=model_dir,
+            cache_dir=hf_home,
+            allow_patterns=list(REQUIRED_MODEL_FILES),
+        )
+    )
+
+
 def load_hf_checkpoint(model_dir: Path, *, dtype: torch.dtype = torch.float32) -> TinyLlama:
     try:
         from safetensors.torch import load_file
     except ImportError as exc:
         raise RuntimeError(
             "safetensors is required to load Hugging Face weights. "
-            "Run `./scripts/test_ref.sh` to sync the ref environment."
+            "Run `./scripts/test_reference.sh` to sync the reference environment."
         ) from exc
 
     config = TinyLlamaConfig.from_hf_config(model_dir)
@@ -352,12 +401,19 @@ def load_hf_checkpoint(model_dir: Path, *, dtype: torch.dtype = torch.float32) -
     return model
 
 
-def _demo(model_dir: Path | None = None, max_new_tokens: int = 4) -> None:
+def _demo(
+    model_dir: Path | None = None,
+    *,
+    max_new_tokens: int = 4,
+    model_id: str = DEFAULT_MODEL_ID,
+    hf_home: Path | None = None,
+) -> None:
     torch.manual_seed(0)
     if model_dir is None:
         config = TinyLlamaConfig.demo()
         model = TinyLlama(config).eval()
     else:
+        model_dir = ensure_hf_checkpoint(model_dir, model_id=model_id, hf_home=hf_home)
         model = load_hf_checkpoint(model_dir).eval()
         config = model.config
 
@@ -379,9 +435,25 @@ def main() -> None:
         default=None,
         help="Local Hugging Face snapshot directory containing config.json and model.safetensors.",
     )
+    parser.add_argument(
+        "--model-id",
+        default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID),
+        help="Hugging Face model id to download when --model-dir is missing required files.",
+    )
+    parser.add_argument(
+        "--hf-home",
+        type=Path,
+        default=Path(os.environ.get("HF_HOME", REPO_ROOT / "hf_cache")),
+        help="Hugging Face cache directory used for automatic downloads.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=4)
     args = parser.parse_args()
-    _demo(model_dir=args.model_dir, max_new_tokens=args.max_new_tokens)
+    _demo(
+        model_dir=args.model_dir,
+        max_new_tokens=args.max_new_tokens,
+        model_id=args.model_id,
+        hf_home=args.hf_home,
+    )
 
 
 if __name__ == "__main__":
