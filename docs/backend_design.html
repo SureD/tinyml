@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer Backend Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer Backend Design</h1>
+      <p class="muted">
+        Design doc for the first concrete TinyInfer backend. This document defines the backend boundary, CPU baseline implementation, operator contracts, dependencies, and acceptance criteria before optimized Metal kernels are implemented.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Draft for Step 2 implementation review.</span></div>
+        <div><strong>Parent design</strong><span><a href="./design.html">TinyInfer Core Runtime Design</a></span></div>
+        <div><strong>Depends on</strong><span><a href="./tensor_view_design.html">TensorView Design</a></span></div>
+        <div><strong>Main decision</strong><span>Implement CPU backend first as the correctness baseline.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Context And Scope</h2>
+      <p>
+        TinyInfer has a fixed tensor metadata layer: <code>TensorView</code> describes a slice in <code>MemoryArena</code>, and only <code>Backend</code> may interpret the arena native handle. The next implementation step is to replace the fake test backend with a real backend that can allocate memory, copy bytes, and execute deterministic operator math.
+      </p>
+      <pre>TensorView
+  arena pointer + byte offset + dtype + shape + strides
+        ↓
+Backend
+  owns native arena handle interpretation
+  owns copies, operators, and synchronization
+        ↓
+CPUBackend
+  host allocation + f32 reference kernels
+        ↓
+MetalBackend
+  later optimized backend validated against CPUBackend</pre>
+      <p>
+        This design covers the concrete CPU backend and the shared backend operator contract. It does not implement model loading, tokenizer, quantization, batching, or Metal kernels.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Goals</h2>
+      <ul>
+        <li>Add a concrete <code>CPUBackend</code> that can run deterministic small numerical tests without Metal.</li>
+        <li>Keep <code>Backend</code> as the only layer that reads or writes backend-native memory.</li>
+        <li>Define simple v1 operator contracts: f32 math, contiguous inputs/outputs unless stated otherwise, and strict shape validation.</li>
+        <li>Use CPU behavior as the correctness oracle for later Metal operator parity tests.</li>
+        <li>Keep backend polymorphism at coarse operator boundaries only; do not introduce an <code>Op</code> class hierarchy.</li>
+        <li>Keep runtime allocation explicit: backend allocates arenas, <code>MemoryArena</code> carves views, ops write to caller-provided outputs.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Non-Goals</h2>
+      <ul>
+        <li>No optimized CPU SIMD kernels in the first backend implementation.</li>
+        <li>No thread pool or parallel execution in v1 CPU backend.</li>
+        <li>No public stream API.</li>
+        <li>No hidden workspace allocation inside backend ops.</li>
+        <li>No implicit dtype conversion.</li>
+        <li>No support for non-contiguous op inputs unless an op contract explicitly allows it later.</li>
+        <li>No Metal implementation work in this step beyond keeping the existing stub compiling.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Requirements And Constraints</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Requirement</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Ownership</td>
+              <td><code>CPUBackend::alloc_arena</code> allocates one native host block and binds it through protected <code>bind_arena</code>.</td>
+              <td>Keeps arena ownership under RAII and keeps native handles private to backend code.</td>
+            </tr>
+            <tr>
+              <td>Release</td>
+              <td><code>release_arena</code> must free only CPU-owned arena handles and tolerate an undefined arena.</td>
+              <td>Move-only arenas and partially initialized engines must not double free or leak.</td>
+            </tr>
+            <tr>
+              <td>Addressing</td>
+              <td>CPU pointer calculation is internal: <code>base + TensorView::byte_offset</code>.</td>
+              <td>Core tensor code must not assume all backend handles are byte-addressable pointers.</td>
+            </tr>
+            <tr>
+              <td>Validation</td>
+              <td>Each op validates defined views, owning backend, device type, dtype, shape, capacity span, and contiguity.</td>
+              <td>Failing closed is better than producing silent numerical corruption.</td>
+            </tr>
+            <tr>
+              <td>Math dtype</td>
+              <td>Initial CPU math supports <code>DType::f32</code> only.</td>
+              <td>It fixes correctness semantics before introducing f16/bf16 conversion and rounding behavior.</td>
+            </tr>
+            <tr>
+              <td>Hot path</td>
+              <td>Ops must write to caller-provided output views and must not allocate heap memory.</td>
+              <td>Decode latency should remain easy to inspect and profile.</td>
+            </tr>
+            <tr>
+              <td>Synchronization</td>
+              <td><code>CPUBackend::synchronize</code> is a no-op success.</td>
+              <td>CPU execution is synchronous in v1, but the shared API keeps parity with future asynchronous backends.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Proposed Design</h2>
+
+      <h3>5.1 Public Factory</h3>
+      <p>
+        Add a CPU backend factory next to the existing Metal factory:
+      </p>
+      <pre>Result&lt;std::unique_ptr&lt;Backend&gt;&gt; create_cpu_backend();
+Result&lt;std::unique_ptr&lt;Backend&gt;&gt; create_metal_backend();</pre>
+      <p>
+        The factory returns the abstract <code>Backend</code> pointer because model code should not depend on concrete backend classes.
+      </p>
+
+      <h3>5.2 CPU Arena Allocation</h3>
+      <p>
+        <code>CPUBackend</code> stores a native host allocation in <code>MemoryArena</code>. The handle is treated as a base byte pointer inside CPU backend code only.
+      </p>
+      <pre>class CPUBackend final : public Backend {
+public:
+    Device device() const override { return {DeviceType::cpu, 0}; }
+    Status alloc_arena(MemoryArena&amp; arena, size_t bytes, MemoryKind kind) override;
+    Status copy_from_host(const TensorView&amp; dst, const void* src, size_t bytes) override;
+    Status copy_to_host(void* dst, const TensorView&amp; src, size_t bytes) override;
+    ...
+
+protected:
+    Status release_arena(MemoryArena&amp; arena) override;
+};</pre>
+      <ul>
+        <li>Use one host allocation per arena.</li>
+        <li>Use at least 64-byte alignment for cache-line-friendly base addresses.</li>
+        <li>Reject zero-byte allocation.</li>
+        <li>Bind <code>MemoryKind</code> without changing behavior; it is metadata for tests and later profiling.</li>
+      </ul>
+
+      <h3>5.3 Internal Pointer Access</h3>
+      <p>
+        CPU backend should centralize pointer calculation in private helpers:
+      </p>
+      <pre>uint8_t* bytes(const TensorView&amp; view);
+const uint8_t* bytes(const TensorView&amp; view) const;
+float* f32_data(const TensorView&amp; view);
+const float* f32_data(const TensorView&amp; view) const;</pre>
+      <p>
+        These helpers must validate the view before pointer use. They are implementation details, not public API.
+      </p>
+
+      <h3>5.4 Copy Contract</h3>
+      <ul>
+        <li><code>copy_from_host</code> requires a defined contiguous destination view.</li>
+        <li><code>copy_to_host</code> requires a defined contiguous source view.</li>
+        <li><code>bytes</code> must be less than or equal to <code>logical_nbytes()</code>.</li>
+        <li>Host pointers must be non-null when <code>bytes &gt; 0</code>.</li>
+        <li>Copies are raw byte copies and do not perform dtype conversion.</li>
+      </ul>
+
+      <h3>5.5 Operator Contract</h3>
+      <p>
+        All v1 CPU math operators require f32 contiguous tensors and caller-owned output buffers. Shape mismatches return <code>Status::invalid_argument</code>. Unsupported dtype returns <code>Status::unimplemented</code> until explicit conversion semantics exist.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Op</th>
+              <th>Shape Contract</th>
+              <th>Semantics</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>matmul_out(out, x, w)</code></td>
+              <td><code>x=[M,K]</code>, <code>w=[K,N]</code>, <code>out=[M,N]</code></td>
+              <td>Row-major dense matrix multiply. No bias, no transpose flag.</td>
+            </tr>
+            <tr>
+              <td><code>rms_norm_out(out, x, weight, eps)</code></td>
+              <td><code>x=[T,H]</code>, <code>weight=[H]</code>, <code>out=[T,H]</code></td>
+              <td>Per-row RMSNorm: <code>x * rsqrt(mean(x^2) + eps) * weight</code>.</td>
+            </tr>
+            <tr>
+              <td><code>rope_inplace(q, k, start_pos)</code></td>
+              <td><code>q=[T,n_heads,head_dim]</code>, <code>k=[T,n_kv_heads,head_dim]</code></td>
+              <td>Apply LLaMA-style rotary embedding in place. Requires even <code>head_dim</code>.</td>
+            </tr>
+            <tr>
+              <td><code>attention_out(out, q, k_cache, v_cache, kv_len)</code></td>
+              <td><code>q=[T,n_heads,head_dim]</code>, cache layout <code>[layer,kv_head,pos,head_dim]</code> slice contract TBD by engine binding</td>
+              <td>Causal attention over the first <code>kv_len</code> cache positions. The exact cache slice shape must be finalized with model layout.</td>
+            </tr>
+            <tr>
+              <td><code>swiglu_out(out, gate, up)</code></td>
+              <td><code>gate</code>, <code>up</code>, and <code>out</code> have identical shape</td>
+              <td><code>out = silu(gate) * up</code>.</td>
+            </tr>
+            <tr>
+              <td><code>argmax(out_token, logits)</code></td>
+              <td><code>logits=[vocab]</code> or <code>[1,vocab]</code></td>
+              <td>Return first index of the largest f32 value.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>5.6 Attention Boundary</h3>
+      <p>
+        Attention is the only op whose final shape contract depends on model layout. The implementation should start with the simplest engine-owned cache slices and keep the public backend method unchanged. If the current <code>TensorView</code> cannot describe a clean per-layer cache view without unsafe manual offsets, fix model binding before writing attention math.
+      </p>
+
+      <h3>5.7 Error Model</h3>
+      <ul>
+        <li><code>invalid_argument</code>: bad shape, undefined view, wrong owning backend, wrong device, non-contiguous view, null host pointer, insufficient byte range.</li>
+        <li><code>unimplemented</code>: dtype or layout intentionally unsupported in v1.</li>
+        <li><code>backend_error</code>: host allocation failure or unrecoverable backend-specific failure.</li>
+        <li><code>synchronize</code>: success for CPU backend.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>6. Implementation Plan</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Scope</th>
+              <th>Implementation</th>
+              <th>Acceptance Criteria</th>
+              <th>Depends On</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Factory and build wiring</td>
+              <td>Add <code>create_cpu_backend</code>, <code>infer/src/cpu_backend.cc</code>, and CMake source entry.</td>
+              <td>Public headers compile; factory returns a CPU backend with <code>DeviceType::cpu</code>.</td>
+              <td>Current Backend API</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Arena allocation</td>
+              <td>Implement aligned host allocation, protected binding, release, and no-op synchronize.</td>
+              <td>Arena tests verify allocation, capacity, device, release, move behavior, and failure on zero bytes.</td>
+              <td>Step 1</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>View validation helpers</td>
+              <td>Add private CPU backend helpers for defined view checks, contiguous checks, dtype checks, and byte pointer access.</td>
+              <td>Unit tests prove invalid views fail before memory is touched.</td>
+              <td>Step 2</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Host copies</td>
+              <td>Implement <code>copy_from_host</code> and <code>copy_to_host</code> as raw byte copies over contiguous views.</td>
+              <td>Round-trip copy tests pass for f32 and byte-sized payloads.</td>
+              <td>Step 3</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Simple ops</td>
+              <td>Implement <code>argmax</code>, <code>swiglu_out</code>, <code>rms_norm_out</code>, and <code>matmul_out</code>.</td>
+              <td>Small deterministic numerical tests pass with exact or tight float tolerance.</td>
+              <td>Step 4</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>RoPE</td>
+              <td>Implement in-place f32 RoPE for q/k using the model's <code>rope_theta</code> path once the op has access to required configuration.</td>
+              <td>RoPE tests match a small scalar reference implementation.</td>
+              <td>Step 5, model config access decision</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Attention</td>
+              <td>Finalize cache slice contract and implement causal attention reference math.</td>
+              <td>Attention tests cover one-token decode and short prompt prefill shapes.</td>
+              <td>Step 5, model layout details</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>Engine test migration</td>
+              <td>Use CPU backend in numerical tests while keeping fake backend for call-order tests.</td>
+              <td>Fake backend proves flow; CPU backend proves math.</td>
+              <td>Step 7</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Dependency Graph</h2>
+      <pre>TensorView + MemoryArena
+  └─ Backend protected arena access
+       └─ CPUBackend factory
+            └─ CPU arena allocation/release
+                 └─ CPU pointer/view validation helpers
+                      ├─ Host copy tests
+                      └─ f32 op tests
+                           ├─ argmax
+                           ├─ swiglu
+                           ├─ rms_norm
+                           ├─ matmul
+                           ├─ rope
+                           └─ attention
+
+CPUBackend numerical behavior
+  └─ later Metal parity tests</pre>
+    </section>
+
+    <section>
+      <h2>8. Test Plan</h2>
+      <ul>
+        <li>Compile smoke test for <code>tinyinfer/backend.h</code> with both CPU and Metal factories declared.</li>
+        <li>CPU factory test for device type and successful construction.</li>
+        <li>Arena allocation tests for capacity, used bytes, runtime-managed tensor offset alignment, release, and move behavior.</li>
+        <li>Copy round-trip tests using host arrays and contiguous <code>TensorView</code> slices.</li>
+        <li>Negative tests for undefined view, wrong device, non-contiguous copy, unsupported dtype, shape mismatch, and byte count overflow.</li>
+        <li>Numerical tests for <code>argmax</code>, <code>swiglu_out</code>, <code>rms_norm_out</code>, and <code>matmul_out</code>.</li>
+        <li>RoPE and attention tests after their missing contract details are resolved.</li>
+        <li>Keep fake backend call-order tests for <code>LlamaInferEngine</code>; CPU backend tests should validate math, not control flow.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>9. Alternatives Considered</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Alternative</th>
+              <th>Decision</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Implement Metal first</td>
+              <td>Rejected.</td>
+              <td>It mixes API design, kernel debugging, and numerical validation. CPU gives a simple oracle first.</td>
+            </tr>
+            <tr>
+              <td>Keep only fake backend for now</td>
+              <td>Rejected.</td>
+              <td>Fake backend proves call order but cannot validate memory copies or operator math.</td>
+            </tr>
+            <tr>
+              <td>Add an <code>Op</code> abstraction</td>
+              <td>Rejected.</td>
+              <td>Dedicated LLaMA inference needs explicit coarse functions, not a generic operator registry.</td>
+            </tr>
+            <tr>
+              <td>Support f16/bf16 immediately</td>
+              <td>Deferred.</td>
+              <td>f32 first keeps reference math easy to inspect. Lower precision can be added once parity tests exist.</td>
+            </tr>
+            <tr>
+              <td>Add CPU threading immediately</td>
+              <td>Deferred.</td>
+              <td>Single-thread scalar code is easier to validate; threading is a performance step after correctness.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>10. Risks</h2>
+      <ul>
+        <li>The current <code>rope_inplace</code> Backend API does not receive <code>rope_theta</code>. Mitigation: decide whether RoPE uses config stored in backend, an extra method argument, or an engine-side precomputed table before implementation.</li>
+        <li>The current <code>attention_out</code> API does not identify layer index directly. Mitigation: pass per-layer cache views from engine, or add an explicit layer/cache-slice contract before implementing attention.</li>
+        <li>Default-moving <code>LlamaInferEngine</code> can leave internal <code>TensorView</code> arena pointers stale. Mitigation: fix engine move semantics before relying on CPU backend for end-to-end engine tests.</li>
+        <li>CPU reference math may be slow. Mitigation: keep small deterministic tests first; optimize only after correctness is locked down.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>11. Open Questions</h2>
+      <ul>
+        <li>Should <code>rope_theta</code> become an argument to <code>rope_inplace</code>, or should RoPE move out of Backend and into model-specific code?</li>
+        <li>Should attention receive a per-layer cache view only, or should the Backend op receive layer index and full cache view?</li>
+        <li>Should <code>matmul_out</code> define weight layout as <code>[K,N]</code> or match checkpoint layout and make the loader transform it?</li>
+        <li>Should CPU backend reject all non-f32 math tensors now, or allow <code>i32/u32</code> only for future indexing utilities?</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

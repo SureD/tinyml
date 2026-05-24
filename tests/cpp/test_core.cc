@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -253,6 +254,65 @@ void test_arena_reset_reuses_memory() {
     EXPECT_EQ(arena.used(), 64u);
 }
 
+void test_cpu_backend_memory() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    EXPECT_TRUE(backend.value != nullptr);
+    EXPECT_TRUE(backend.value->device().type == DeviceType::cpu);
+
+    MemoryArena zero;
+    Status zero_status = backend.value->alloc_arena(zero, 0, MemoryKind::workspace);
+    EXPECT_EQ(zero_status.code, Status::invalid_argument);
+    EXPECT_TRUE(!zero.defined());
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 256, MemoryKind::host));
+    EXPECT_TRUE(arena.defined());
+    EXPECT_EQ(arena.capacity(), 256u);
+    EXPECT_TRUE(arena.device().type == DeviceType::cpu);
+
+    MemoryArena moved = std::move(arena);
+    EXPECT_TRUE(!arena.defined());
+    EXPECT_TRUE(moved.defined());
+
+    Result<TensorView> tensor = moved.alloc(make_shape({4}), DType::f32);
+    EXPECT_TRUE(tensor.status);
+    EXPECT_EQ(tensor.value.byte_offset % 64, 0u);
+
+    const float input[] = {1.0f, -2.0f, 3.5f, 4.0f};
+    float output[] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    EXPECT_TRUE(backend.value->copy_from_host(tensor.value, input, sizeof(input)));
+    EXPECT_TRUE(backend.value->copy_to_host(output, tensor.value, sizeof(output)));
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(output[i], input[i]);
+    }
+
+    EXPECT_TRUE(backend.value->copy_from_host(tensor.value, nullptr, 0));
+    EXPECT_EQ(
+        backend.value->copy_from_host(tensor.value, input, sizeof(input) + 1).code,
+        Status::invalid_argument);
+
+    TensorView non_contiguous = tensor.value;
+    non_contiguous.strides.values[0] = 2;
+    EXPECT_EQ(
+        backend.value->copy_from_host(non_contiguous, input, sizeof(input)).code,
+        Status::invalid_argument);
+
+    FakeBackend foreign_backend;
+    MemoryArena foreign_arena;
+    EXPECT_TRUE(foreign_backend.alloc_arena(foreign_arena, 256, MemoryKind::host));
+    Result<TensorView> foreign_tensor = foreign_arena.alloc(make_shape({4}), DType::f32);
+    EXPECT_TRUE(foreign_tensor.status);
+    EXPECT_EQ(
+        backend.value->copy_from_host(foreign_tensor.value, input, sizeof(input)).code,
+        Status::invalid_argument);
+
+    uint32_t token = 0;
+    EXPECT_EQ(backend.value->argmax(token, tensor.value).code, Status::unimplemented);
+    EXPECT_TRUE(backend.value->synchronize());
+}
+
 void test_engine_flow_with_fake_backend() {
     FakeBackend backend;
     LlamaConfig config = LlamaConfig::demo();
@@ -302,6 +362,7 @@ int main() {
     test_shape_stride_tensor_view_helpers();
     test_tensor_view_edge_cases();
     test_arena_reset_reuses_memory();
+    test_cpu_backend_memory();
     test_engine_flow_with_fake_backend();
 
     if (g_failures != 0) {

@@ -107,10 +107,7 @@ public:
     MemoryArena& operator=(const MemoryArena&) = delete;
     ~MemoryArena();
 
-    Result<TensorView> alloc(
-        const Shape& shape,
-        DType dtype,
-        size_t alignment = 64);
+    Result<TensorView> alloc(const Shape& shape, DType dtype);
 
     void reset();
 

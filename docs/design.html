@@ -308,6 +308,9 @@ LlamaInferEngine: prefill / decode_one / generate</pre>
       <p>
         Backend allocation is required before <code>MemoryArena</code> can be fully implemented. The minimal contract is:
       </p>
+      <p>
+        Detailed design: <a href="./backend_design.html">TinyInfer Backend Design</a>.
+      </p>
       <pre>class Backend {
 public:
     virtual Device device() const = 0;
@@ -329,7 +332,7 @@ protected:
       <ul>
         <li>Move-only. Copy is disabled.</li>
         <li>Destructor calls the owning backend's <code>release_arena</code>.</li>
-        <li><code>alloc(shape, dtype, alignment)</code> returns a <code>TensorView</code> with aligned byte offset.</li>
+        <li><code>alloc(shape, dtype)</code> returns a <code>TensorView</code> with runtime-managed aligned byte offset.</li>
         <li><code>reset()</code> sets used bytes to zero and keeps the native allocation.</li>
         <li><code>capacity()</code> and <code>used()</code> expose memory accounting for tests and profiling.</li>
       </ul>

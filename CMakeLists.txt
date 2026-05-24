@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(tinyinfer STATIC
+    infer/src/cpu_backend.cc
     infer/src/core.cc
     infer/src/llama.cc
     infer/src/metal_backend.mm

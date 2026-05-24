@@ -65,11 +65,13 @@ protected:
         void* native_handle,
         size_t bytes,
         MemoryKind kind);
+    bool owns_arena(const MemoryArena& arena) const;
     void* arena_handle(const MemoryArena& arena) const;
 
     virtual Status release_arena(MemoryArena& arena) = 0;
 };
 
+Result<std::unique_ptr<Backend>> create_cpu_backend();
 Result<std::unique_ptr<Backend>> create_metal_backend();
 
 }  // namespace tinyinfer

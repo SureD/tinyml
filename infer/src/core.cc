@@ -9,6 +9,8 @@
 namespace tinyinfer {
 namespace {
 
+constexpr size_t kTensorAlignment = 64;
+
 bool checked_add(size_t a, size_t b, size_t& out) {
     if (a > std::numeric_limits<size_t>::max() - b) {
         return false;
@@ -164,10 +166,7 @@ MemoryArena::~MemoryArena() {
     release();
 }
 
-Result<TensorView> MemoryArena::alloc(
-    const Shape& shape,
-    DType dtype,
-    size_t alignment) {
+Result<TensorView> MemoryArena::alloc(const Shape& shape, DType dtype) {
     if (!defined()) {
         return {Status::invalid_argument_status("arena is not allocated"), {}};
     }
@@ -185,7 +184,7 @@ Result<TensorView> MemoryArena::alloc(
     }
 
     size_t start = 0;
-    if (!checked_align_up(offset_, alignment, start)) {
+    if (!checked_align_up(offset_, kTensorAlignment, start)) {
         return {Status::invalid_argument_status("arena offset overflow"), {}};
     }
 
@@ -339,6 +338,10 @@ void Backend::bind_arena(
 
 void* Backend::arena_handle(const MemoryArena& arena) const {
     return arena.handle_;
+}
+
+bool Backend::owns_arena(const MemoryArena& arena) const {
+    return arena.backend_ == this;
 }
 
 }  // namespace tinyinfer
