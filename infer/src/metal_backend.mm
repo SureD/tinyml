@@ -64,23 +64,31 @@ public:
     Status rope_inplace(
         const TensorView& q,
         const TensorView& k,
-        uint32_t start_pos) override {
+        uint32_t start_pos,
+        float theta) override {
         (void)q;
         (void)k;
         (void)start_pos;
+        (void)theta;
         return Status::unimplemented_status("Metal RoPE is not implemented yet");
     }
 
     Status attention_out(
         const TensorView& out,
         const TensorView& q,
+        const TensorView& k,
+        const TensorView& v,
         const TensorView& k_cache,
         const TensorView& v_cache,
+        uint32_t start_pos,
         uint32_t kv_len) override {
         (void)out;
         (void)q;
+        (void)k;
+        (void)v;
         (void)k_cache;
         (void)v_cache;
+        (void)start_pos;
         (void)kv_len;
         return Status::unimplemented_status("Metal attention is not implemented yet");
     }

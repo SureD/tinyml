@@ -37,8 +37,8 @@ struct GenerateConfig {
 
 class LlamaInferEngine {
 public:
-    LlamaInferEngine(LlamaInferEngine&&) noexcept = default;
-    LlamaInferEngine& operator=(LlamaInferEngine&&) noexcept = default;
+    LlamaInferEngine(LlamaInferEngine&& other) noexcept;
+    LlamaInferEngine& operator=(LlamaInferEngine&& other) noexcept;
     LlamaInferEngine(const LlamaInferEngine&) = delete;
     LlamaInferEngine& operator=(const LlamaInferEngine&) = delete;
 
@@ -94,6 +94,8 @@ private:
     Status bind_model();
     Status init_kv_cache();
     Status check_ready() const;
+    void rebind_views_after_move(const LlamaInferEngine& source);
+    void rebind_view_after_move(TensorView& view, const LlamaInferEngine& source);
     Result<TensorView> workspace_tensor(const Shape& shape);
     Status run_layers(uint32_t start_pos, uint32_t seq_len, TensorView& logits);
 

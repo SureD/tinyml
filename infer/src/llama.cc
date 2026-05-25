@@ -106,6 +106,34 @@ Status alloc_view(MemoryArena& arena, const Shape& shape, TensorView& out) {
     return Status::success();
 }
 
+Result<TensorView> layer_cache_view(const TensorView& cache, uint32_t layer) {
+    if (!cache.defined()) {
+        return {Status::invalid_argument_status("cache tensor is not defined"), {}};
+    }
+    if (cache.shape.ndim != 4) {
+        return {Status::invalid_argument_status("cache tensor must have shape [L,KVH,S,D]"), {}};
+    }
+    if (layer >= static_cast<uint32_t>(cache.dim(0))) {
+        return {Status::invalid_argument_status("cache layer index is out of range"), {}};
+    }
+
+    TensorView view = cache;
+    view.byte_offset +=
+        static_cast<size_t>(layer) *
+        static_cast<size_t>(cache.strides.stride(0)) *
+        cache.item_size();
+    view.shape = make_shape({cache.dim(1), cache.dim(2), cache.dim(3)});
+    view.strides.ndim = 3;
+    view.strides.values[0] = cache.strides.stride(1);
+    view.strides.values[1] = cache.strides.stride(2);
+    view.strides.values[2] = cache.strides.stride(3);
+
+    if (!view.defined() || !view.contiguous()) {
+        return {Status::invalid_argument_status("cache layer view is invalid"), {}};
+    }
+    return {Status::success(), view};
+}
+
 }  // namespace
 
 uint32_t LlamaConfig::head_dim() const {
@@ -191,6 +219,47 @@ LlamaInferEngine::LlamaInferEngine(
     : backend_(&backend),
       config_(config),
       max_seq_len_(max_seq_len) {}
+
+LlamaInferEngine::LlamaInferEngine(LlamaInferEngine&& other) noexcept
+    : backend_(other.backend_),
+      config_(other.config_),
+      max_seq_len_(other.max_seq_len_),
+      weights_(std::move(other.weights_)),
+      kv_cache_arena_(std::move(other.kv_cache_arena_)),
+      workspace_(std::move(other.workspace_)),
+      model_(std::move(other.model_)),
+      cache_(other.cache_),
+      logits_(other.logits_) {
+    rebind_views_after_move(other);
+
+    other.backend_ = nullptr;
+    other.max_seq_len_ = 0;
+    other.cache_ = {};
+    other.logits_ = {};
+}
+
+LlamaInferEngine& LlamaInferEngine::operator=(LlamaInferEngine&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    backend_ = other.backend_;
+    config_ = other.config_;
+    max_seq_len_ = other.max_seq_len_;
+    weights_ = std::move(other.weights_);
+    kv_cache_arena_ = std::move(other.kv_cache_arena_);
+    workspace_ = std::move(other.workspace_);
+    model_ = std::move(other.model_);
+    cache_ = other.cache_;
+    logits_ = other.logits_;
+    rebind_views_after_move(other);
+
+    other.backend_ = nullptr;
+    other.max_seq_len_ = 0;
+    other.cache_ = {};
+    other.logits_ = {};
+    return *this;
+}
 
 Result<LlamaInferEngine> LlamaInferEngine::create(
     Backend& backend,
@@ -379,6 +448,40 @@ Status LlamaInferEngine::check_ready() const {
 
 Result<TensorView> LlamaInferEngine::workspace_tensor(const Shape& shape) {
     return workspace_.alloc(shape, DType::f32);
+}
+
+void LlamaInferEngine::rebind_view_after_move(
+    TensorView& view,
+    const LlamaInferEngine& source) {
+    if (view.arena == &source.weights_) {
+        view.arena = &weights_;
+    } else if (view.arena == &source.kv_cache_arena_) {
+        view.arena = &kv_cache_arena_;
+    } else if (view.arena == &source.workspace_) {
+        view.arena = &workspace_;
+    }
+}
+
+void LlamaInferEngine::rebind_views_after_move(const LlamaInferEngine& source) {
+    rebind_view_after_move(model_.token_embedding, source);
+    rebind_view_after_move(model_.final_norm, source);
+    rebind_view_after_move(model_.lm_head, source);
+
+    for (LayerWeights& layer : model_.layers) {
+        rebind_view_after_move(layer.attn_norm, source);
+        rebind_view_after_move(layer.q_proj, source);
+        rebind_view_after_move(layer.k_proj, source);
+        rebind_view_after_move(layer.v_proj, source);
+        rebind_view_after_move(layer.o_proj, source);
+        rebind_view_after_move(layer.ffn_norm, source);
+        rebind_view_after_move(layer.gate_proj, source);
+        rebind_view_after_move(layer.up_proj, source);
+        rebind_view_after_move(layer.down_proj, source);
+    }
+
+    rebind_view_after_move(cache_.keys, source);
+    rebind_view_after_move(cache_.values, source);
+    rebind_view_after_move(logits_, source);
 }
 
 Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_token) {
@@ -587,15 +690,26 @@ Status LlamaInferEngine::run_layers(
         if (!status) {
             return status;
         }
-        status = backend_->rope_inplace(q.value, k.value, start_pos);
+        status = backend_->rope_inplace(q.value, k.value, start_pos, config_.rope_theta);
         if (!status) {
             return status;
+        }
+        Result<TensorView> layer_k_cache = layer_cache_view(cache_.keys, i);
+        if (!layer_k_cache.status) {
+            return layer_k_cache.status;
+        }
+        Result<TensorView> layer_v_cache = layer_cache_view(cache_.values, i);
+        if (!layer_v_cache.status) {
+            return layer_v_cache.status;
         }
         status = backend_->attention_out(
             attn_out.value,
             q.value,
-            cache_.keys,
-            cache_.values,
+            k.value,
+            v.value,
+            layer_k_cache.value,
+            layer_v_cache.value,
+            start_pos,
             start_pos + seq_len);
         if (!status) {
             return status;

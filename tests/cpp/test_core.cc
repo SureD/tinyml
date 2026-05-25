@@ -1,5 +1,6 @@
 #include "tinyinfer/llama.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -37,6 +38,19 @@ static_assert(!HasNativeHandle<MemoryArena>);
         if (!(lhs_value == rhs_value)) {                                          \
             std::cerr << __FILE__ << ":" << __LINE__ << " failed: " #lhs         \
                       << " == " #rhs << " (" << lhs_value << " vs "             \
+                      << rhs_value << ")\n";                                     \
+            ++g_failures;                                                        \
+        }                                                                        \
+    } while (false)
+
+#define EXPECT_NEAR(lhs, rhs, tolerance)                                         \
+    do {                                                                         \
+        const double lhs_value = static_cast<double>(lhs);                        \
+        const double rhs_value = static_cast<double>(rhs);                        \
+        const double tolerance_value = static_cast<double>(tolerance);            \
+        if (std::fabs(lhs_value - rhs_value) > tolerance_value) {                 \
+            std::cerr << __FILE__ << ":" << __LINE__ << " failed: " #lhs         \
+                      << " ~= " #rhs << " (" << lhs_value << " vs "             \
                       << rhs_value << ")\n";                                     \
             ++g_failures;                                                        \
         }                                                                        \
@@ -93,10 +107,15 @@ public:
         return Status::success();
     }
 
-    Status rope_inplace(const TensorView& q, const TensorView& k, uint32_t start_pos) override {
+    Status rope_inplace(
+        const TensorView& q,
+        const TensorView& k,
+        uint32_t start_pos,
+        float theta) override {
         (void)q;
         (void)k;
         (void)start_pos;
+        (void)theta;
         calls.push_back("rope");
         return Status::success();
     }
@@ -104,13 +123,19 @@ public:
     Status attention_out(
         const TensorView& out,
         const TensorView& q,
+        const TensorView& k,
+        const TensorView& v,
         const TensorView& k_cache,
         const TensorView& v_cache,
+        uint32_t start_pos,
         uint32_t kv_len) override {
         (void)out;
         (void)q;
+        (void)k;
+        (void)v;
         (void)k_cache;
         (void)v_cache;
+        (void)start_pos;
         (void)kv_len;
         calls.push_back("attention");
         return Status::success();
@@ -146,6 +171,23 @@ protected:
         return Status::success();
     }
 };
+
+void copy_f32_to_tensor(Backend& backend, const TensorView& tensor, const float* values) {
+    EXPECT_TRUE(backend.copy_from_host(tensor, values, tensor.logical_nbytes()));
+}
+
+void expect_f32_tensor_near(
+    Backend& backend,
+    const TensorView& tensor,
+    const std::vector<float>& expected,
+    float tolerance = 1e-5f) {
+    std::vector<float> actual(expected.size(), 0.0f);
+    EXPECT_EQ(tensor.logical_nbytes(), expected.size() * sizeof(float));
+    EXPECT_TRUE(backend.copy_to_host(actual.data(), tensor, tensor.logical_nbytes()));
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(actual[i], expected[i], tolerance);
+    }
+}
 
 void test_config_validation() {
     LlamaConfig config = LlamaConfig::tinyllama_1_1b();
@@ -357,6 +399,259 @@ void test_cpu_backend_argmax() {
     EXPECT_EQ(backend.value->argmax(token, foreign_logits.value).code, Status::invalid_argument);
 }
 
+void test_cpu_backend_matmul() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 4096, MemoryKind::workspace));
+
+    Result<TensorView> x = arena.alloc(make_shape({2, 3}), DType::f32);
+    Result<TensorView> w = arena.alloc(make_shape({2, 3}), DType::f32);
+    Result<TensorView> out = arena.alloc(make_shape({2, 2}), DType::f32);
+    EXPECT_TRUE(x.status);
+    EXPECT_TRUE(w.status);
+    EXPECT_TRUE(out.status);
+
+    const float x_values[] = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f,
+    };
+    const float w_values[] = {
+        10.0f, 20.0f, 30.0f,
+        1.0f, 0.0f, -1.0f,
+    };
+    copy_f32_to_tensor(*backend.value, x.value, x_values);
+    copy_f32_to_tensor(*backend.value, w.value, w_values);
+
+    EXPECT_TRUE(backend.value->matmul_out(out.value, x.value, w.value));
+    expect_f32_tensor_near(*backend.value, out.value, {140.0f, -2.0f, 320.0f, -2.0f});
+
+    Result<TensorView> out3 = arena.alloc(make_shape({2, 1, 2}), DType::f32);
+    EXPECT_TRUE(out3.status);
+    EXPECT_TRUE(backend.value->matmul_out(out3.value, x.value, w.value));
+    expect_f32_tensor_near(*backend.value, out3.value, {140.0f, -2.0f, 320.0f, -2.0f});
+
+    Result<TensorView> bad_w = arena.alloc(make_shape({3, 2}), DType::f32);
+    Result<TensorView> bad_out = arena.alloc(make_shape({2, 3}), DType::f32);
+    EXPECT_TRUE(bad_w.status);
+    EXPECT_TRUE(bad_out.status);
+    EXPECT_EQ(backend.value->matmul_out(out.value, x.value, bad_w.value).code, Status::invalid_argument);
+    EXPECT_EQ(backend.value->matmul_out(bad_out.value, x.value, w.value).code, Status::invalid_argument);
+}
+
+void test_cpu_backend_rms_norm_and_swiglu() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 4096, MemoryKind::workspace));
+
+    Result<TensorView> x = arena.alloc(make_shape({2, 3}), DType::f32);
+    Result<TensorView> weight = arena.alloc(make_shape({3}), DType::f32);
+    Result<TensorView> out = arena.alloc(make_shape({2, 3}), DType::f32);
+    EXPECT_TRUE(x.status);
+    EXPECT_TRUE(weight.status);
+    EXPECT_TRUE(out.status);
+
+    const float x_values[] = {
+        1.0f, 2.0f, 2.0f,
+        3.0f, 0.0f, 4.0f,
+    };
+    const float weight_values[] = {1.0f, 0.5f, -1.0f};
+    copy_f32_to_tensor(*backend.value, x.value, x_values);
+    copy_f32_to_tensor(*backend.value, weight.value, weight_values);
+
+    constexpr float eps = 1e-5f;
+    EXPECT_TRUE(backend.value->rms_norm_out(out.value, x.value, weight.value, eps));
+
+    std::vector<float> expected_rms;
+    for (int row = 0; row < 2; ++row) {
+        const float* x_row = x_values + row * 3;
+        float mean_sq = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            mean_sq += x_row[i] * x_row[i];
+        }
+        mean_sq /= 3.0f;
+        const float scale = 1.0f / std::sqrt(mean_sq + eps);
+        for (int i = 0; i < 3; ++i) {
+            expected_rms.push_back(x_row[i] * scale * weight_values[i]);
+        }
+    }
+    expect_f32_tensor_near(*backend.value, out.value, expected_rms);
+    EXPECT_EQ(
+        backend.value->rms_norm_out(out.value, x.value, weight.value, 0.0f).code,
+        Status::invalid_argument);
+
+    Result<TensorView> gate = arena.alloc(make_shape({3}), DType::f32);
+    Result<TensorView> up = arena.alloc(make_shape({3}), DType::f32);
+    Result<TensorView> swiglu = arena.alloc(make_shape({3}), DType::f32);
+    EXPECT_TRUE(gate.status);
+    EXPECT_TRUE(up.status);
+    EXPECT_TRUE(swiglu.status);
+
+    const float gate_values[] = {0.0f, 1.0f, -1.0f};
+    const float up_values[] = {2.0f, 3.0f, 4.0f};
+    copy_f32_to_tensor(*backend.value, gate.value, gate_values);
+    copy_f32_to_tensor(*backend.value, up.value, up_values);
+
+    EXPECT_TRUE(backend.value->swiglu_out(swiglu.value, gate.value, up.value));
+    expect_f32_tensor_near(
+        *backend.value,
+        swiglu.value,
+        {
+            0.0f,
+            (1.0f / (1.0f + std::exp(-1.0f))) * 3.0f,
+            (-1.0f / (1.0f + std::exp(1.0f))) * 4.0f,
+        });
+}
+
+void test_cpu_backend_rope() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 4096, MemoryKind::workspace));
+
+    Result<TensorView> q = arena.alloc(make_shape({1, 1, 4}), DType::f32);
+    Result<TensorView> k = arena.alloc(make_shape({1, 1, 4}), DType::f32);
+    EXPECT_TRUE(q.status);
+    EXPECT_TRUE(k.status);
+
+    const float q_values[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float k_values[] = {-1.0f, 0.5f, 2.0f, -0.25f};
+    copy_f32_to_tensor(*backend.value, q.value, q_values);
+    copy_f32_to_tensor(*backend.value, k.value, k_values);
+
+    constexpr float theta = 10000.0f;
+    EXPECT_TRUE(backend.value->rope_inplace(q.value, k.value, 1, theta));
+
+    auto expected_rope = [](const float* values) {
+        std::vector<float> expected(values, values + 4);
+        for (int i = 0; i < 2; ++i) {
+            const float exponent = static_cast<float>(2 * i) / 4.0f;
+            const float angle = 1.0f / std::pow(10000.0f, exponent);
+            const float c = std::cos(angle);
+            const float s = std::sin(angle);
+            const float x0 = values[i];
+            const float x1 = values[i + 2];
+            expected[i] = x0 * c - x1 * s;
+            expected[i + 2] = x1 * c + x0 * s;
+        }
+        return expected;
+    };
+
+    expect_f32_tensor_near(*backend.value, q.value, expected_rope(q_values));
+    expect_f32_tensor_near(*backend.value, k.value, expected_rope(k_values));
+    EXPECT_EQ(backend.value->rope_inplace(q.value, k.value, 0, 0.0f).code, Status::invalid_argument);
+}
+
+void test_cpu_backend_attention() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 8192, MemoryKind::workspace));
+
+    Result<TensorView> q = arena.alloc(make_shape({2, 2, 2}), DType::f32);
+    Result<TensorView> k = arena.alloc(make_shape({2, 1, 2}), DType::f32);
+    Result<TensorView> v = arena.alloc(make_shape({2, 1, 2}), DType::f32);
+    Result<TensorView> k_cache = arena.alloc(make_shape({1, 4, 2}), DType::f32);
+    Result<TensorView> v_cache = arena.alloc(make_shape({1, 4, 2}), DType::f32);
+    Result<TensorView> out = arena.alloc(make_shape({2, 4}), DType::f32);
+    EXPECT_TRUE(q.status);
+    EXPECT_TRUE(k.status);
+    EXPECT_TRUE(v.status);
+    EXPECT_TRUE(k_cache.status);
+    EXPECT_TRUE(v_cache.status);
+    EXPECT_TRUE(out.status);
+
+    const float q_values[] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+    };
+    const float k_values[] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+    };
+    const float v_values[] = {
+        10.0f, 100.0f,
+        20.0f, 200.0f,
+    };
+    const float zero_cache[] = {
+        0.0f, 0.0f,
+        0.0f, 0.0f,
+        0.0f, 0.0f,
+        0.0f, 0.0f,
+    };
+    copy_f32_to_tensor(*backend.value, q.value, q_values);
+    copy_f32_to_tensor(*backend.value, k.value, k_values);
+    copy_f32_to_tensor(*backend.value, v.value, v_values);
+    copy_f32_to_tensor(*backend.value, k_cache.value, zero_cache);
+    copy_f32_to_tensor(*backend.value, v_cache.value, zero_cache);
+
+    EXPECT_TRUE(backend.value->attention_out(
+        out.value,
+        q.value,
+        k.value,
+        v.value,
+        k_cache.value,
+        v_cache.value,
+        0,
+        2));
+
+    const float a = 1.0f / std::sqrt(2.0f);
+    const float exp_a = std::exp(a);
+    const float head0_w0 = exp_a / (exp_a + 1.0f);
+    const float head0_w1 = 1.0f / (exp_a + 1.0f);
+    const float head1_w0 = 1.0f / (1.0f + exp_a);
+    const float head1_w1 = exp_a / (1.0f + exp_a);
+    expect_f32_tensor_near(
+        *backend.value,
+        out.value,
+        {
+            10.0f, 100.0f,
+            10.0f, 100.0f,
+            head0_w0 * 10.0f + head0_w1 * 20.0f,
+            head0_w0 * 100.0f + head0_w1 * 200.0f,
+            head1_w0 * 10.0f + head1_w1 * 20.0f,
+            head1_w0 * 100.0f + head1_w1 * 200.0f,
+        },
+        1e-4f);
+    expect_f32_tensor_near(
+        *backend.value,
+        k_cache.value,
+        {
+            1.0f, 0.0f,
+            0.0f, 1.0f,
+            0.0f, 0.0f,
+            0.0f, 0.0f,
+        });
+    expect_f32_tensor_near(
+        *backend.value,
+        v_cache.value,
+        {
+            10.0f, 100.0f,
+            20.0f, 200.0f,
+            0.0f, 0.0f,
+            0.0f, 0.0f,
+        });
+    EXPECT_EQ(
+        backend.value->attention_out(
+            out.value,
+            q.value,
+            k.value,
+            v.value,
+            k_cache.value,
+            v_cache.value,
+            0,
+            1)
+            .code,
+        Status::invalid_argument);
+}
+
 void test_engine_flow_with_fake_backend() {
     FakeBackend backend;
     LlamaConfig config = LlamaConfig::demo();
@@ -408,6 +703,10 @@ int main() {
     test_arena_reset_reuses_memory();
     test_cpu_backend_memory();
     test_cpu_backend_argmax();
+    test_cpu_backend_matmul();
+    test_cpu_backend_rms_norm_and_swiglu();
+    test_cpu_backend_rope();
+    test_cpu_backend_attention();
     test_engine_flow_with_fake_backend();
 
     if (g_failures != 0) {

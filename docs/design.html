@@ -345,8 +345,8 @@ protected:
 copy_to_host(dst, src, bytes)
 matmul_out(out, x, w)
 rms_norm_out(out, x, weight, eps)
-rope_inplace(q, k, start_pos)
-attention_out(out, q, k_cache, v_cache, kv_len)
+rope_inplace(q, k, start_pos, theta)
+attention_out(out, q, k, v, k_cache, v_cache, start_pos, kv_len)
 swiglu_out(out, gate, up)
 argmax(out_token, logits)
 synchronize()</pre>

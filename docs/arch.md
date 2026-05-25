@@ -42,7 +42,7 @@ The model is specialized; the backend is flexible. This keeps the code simple wi
 4. During prefill, write all prompt positions into the KV cache.
 5. During decode, append one KV position and select the next token greedily.
 
-The current skeleton records the API and high-level call order. Real kernels, scratch-buffer planning, embedding lookup, residual adds, and KV writes will be filled in later.
+The current CPU backend provides f32 reference kernels for matmul, RMSNorm, RoPE, attention, SwiGLU, argmax, and KV writes. The engine still needs complete embedding lookup, residual adds, model loading, and end-to-end checkpoint parity work.
 
 ## Why This Shape
 

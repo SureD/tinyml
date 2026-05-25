@@ -40,12 +40,16 @@ public:
     virtual Status rope_inplace(
         const TensorView& q,
         const TensorView& k,
-        uint32_t start_pos) = 0;
+        uint32_t start_pos,
+        float theta) = 0;
     virtual Status attention_out(
         const TensorView& out,
         const TensorView& q,
+        const TensorView& k,
+        const TensorView& v,
         const TensorView& k_cache,
         const TensorView& v_cache,
+        uint32_t start_pos,
         uint32_t kv_len) = 0;
     virtual Status swiglu_out(
         const TensorView& out,
