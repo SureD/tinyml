@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer CPU Backend Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer CPU Backend Design</h1>
+      <p class="muted">
+        Design doc for the implemented CPU f32 correctness backend: memory boundary, operator contracts, KV cache behavior, move safety, and verification coverage.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Implemented as the f32 correctness backend.</span></div>
+        <div><strong>Parent design</strong><span><a href="./backend_design.html">TinyInfer Backend Design</a></span></div>
+        <div><strong>Backend role</strong><span>Numerical oracle for later Metal kernels.</span></div>
+        <div><strong>Main constraint</strong><span>No hidden heap allocation inside CPU ops.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Scope</h2>
+      <p>
+        The CPU backend is intentionally simple: single-threaded scalar kernels, strict shape checks, no hidden heap allocation in operator hot paths, and no dtype conversion. It is not the final performance target. It exists to make correctness observable before Metal kernels and lower-precision paths are added.
+      </p>
+      <pre>MemoryArena -> native CPU allocation
+TensorView  -> byte offset + shape + strides
+CPUBackend  -> validate view, compute pointer, run op</pre>
+      <p>
+        <code>TensorView</code> owns no memory and never interprets backend storage. <code>CPUBackend</code> is the only code that turns a <code>MemoryArena</code> native handle into a host pointer.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Common Contract</h2>
+      <ul>
+        <li>Every math op requires f32 contiguous tensors owned by the same CPU backend.</li>
+        <li>Bad shapes, foreign arenas, undefined views, wrong devices, and non-contiguous views return <code>invalid_argument</code>.</li>
+        <li>Unsupported dtypes return <code>unimplemented</code>.</li>
+        <li>Output views must be caller-provided. CPU ops do not allocate temporary tensors.</li>
+        <li>Copies are raw byte copies and do not perform dtype conversion.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Operator Contracts</h2>
+
+      <h3>3.1 Matmul</h3>
+      <pre>matmul_out(out, x, w)
+
+x:   [M, K]
+w:   [N, K]
+out: [M, N] or any contiguous shape with first dim M and M*N elements
+
+out[m,n] = sum_k x[m,k] * w[n,k]</pre>
+      <p>
+        The <code>[N,K]</code> weight layout matches PyTorch and Hugging Face linear weights. This avoids a loader-side transpose during early bring-up and keeps checkpoint parity easier to reason about.
+      </p>
+
+      <h3>3.2 RMSNorm</h3>
+      <pre>rms_norm_out(out, x, weight, eps)
+
+x:      [T, H]
+weight: [H]
+out:    [T, H]</pre>
+      <p>
+        For each row, compute f32 <code>mean(x^2)</code>, then write <code>x * rsqrt(mean + eps) * weight</code>. In-place <code>out == x</code> is valid because the row reduction completes before writing.
+      </p>
+
+      <h3>3.3 RoPE</h3>
+      <pre>rope_inplace(q, k, start_pos, theta)
+
+q: [T, H, D]
+k: [T, KVH, D]
+D must be even</pre>
+      <p>
+        RoPE uses the TinyLlama/LLaMA half-split rotation:
+      </p>
+      <pre>x0 = x[i]
+x1 = x[i + D/2]
+angle = position / theta^(2*i/D)
+y[i]       = x0*cos(angle) - x1*sin(angle)
+y[i + D/2] = x1*cos(angle) + x0*sin(angle)</pre>
+      <p>
+        <code>theta</code> is explicit in the backend API so the kernel does not hard-code model config.
+      </p>
+
+      <h3>3.4 Attention</h3>
+      <pre>attention_out(out, q, k, v, k_cache, v_cache, start_pos, kv_len)
+
+q:       [T, H, D]
+k, v:    [T, KVH, D]
+k_cache: [KVH, S, D]
+v_cache: [KVH, S, D]
+out:     [T, H*D] or [T, H, D]</pre>
+      <p>
+        The engine passes per-layer cache views. The op first writes current <code>k/v</code> into cache positions <code>[start_pos, start_pos + T)</code>. It then computes grouped-query causal attention over keys <code>[0, kv_len)</code>, where query head <code>h</code> maps to KV head <code>h / (H / KVH)</code>.
+      </p>
+      <p>
+        The CPU implementation recomputes scores during softmax instead of allocating a score buffer. That is slower but keeps ownership explicit and makes the baseline easy to debug.
+      </p>
+
+      <h3>3.5 SwiGLU</h3>
+      <pre>swiglu_out(out, gate, up)
+
+out[i] = silu(gate[i]) * up[i]
+silu(x) = x / (1 + exp(-x))</pre>
+      <p>
+        <code>out</code>, <code>gate</code>, and <code>up</code> must have exactly the same shape.
+      </p>
+
+      <h3>3.6 Argmax</h3>
+      <p>
+        <code>argmax(out_token, logits)</code> accepts <code>[V]</code> or <code>[1,V]</code> logits and returns the first maximum index. Tie behavior is deterministic.
+      </p>
+    </section>
+
+    <section>
+      <h2>4. Engine Integration</h2>
+      <p>
+        The KV arena is stored as <code>[layer, kv_head, position, head_dim]</code>. <code>LlamaInferEngine</code> derives a per-layer <code>[kv_head, position, head_dim]</code> view before calling <code>attention_out</code>, keeping layer indexing out of the backend kernel.
+      </p>
+      <p>
+        <code>LlamaInferEngine</code> has custom move construction and move assignment. Moving an engine also rebinds all internal <code>TensorView::arena</code> pointers to the destination arenas. Without this, views would point at moved-from arenas and fail backend validation.
+      </p>
+    </section>
+
+    <section>
+      <h2>5. Non-Goals</h2>
+      <ul>
+        <li>No SIMD or threading yet.</li>
+        <li>No f16 or bf16 arithmetic yet.</li>
+        <li>No Metal implementation in this step.</li>
+        <li>No hidden temporary tensor allocation inside CPU ops.</li>
+        <li>No generic graph or operator registry.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>6. Verification</h2>
+      <ul>
+        <li>CPU arena allocation, copy, and argmax.</li>
+        <li>Matmul numerical output and shape failures.</li>
+        <li>RMSNorm and SwiGLU numerical output.</li>
+        <li>RoPE half-split rotation.</li>
+        <li>Grouped-query causal attention, including KV cache writes.</li>
+        <li>Engine move safety through the fake backend flow test.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
