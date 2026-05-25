@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 
@@ -134,9 +135,33 @@ public:
     Status argmax(
         uint32_t& out_token,
         const TensorView& logits) override {
-        (void)out_token;
-        (void)logits;
-        return Status::unimplemented_status("CPU argmax is not implemented yet");
+        Status status = validate_f32_contiguous(logits);
+        if (!status) {
+            return status;
+        }
+        if (logits.shape.ndim != 1 &&
+            !(logits.shape.ndim == 2 && logits.dim(0) == 1)) {
+            return Status::invalid_argument_status("argmax expects logits shape [V] or [1,V]");
+        }
+
+        const int64_t count = logits.numel();
+        if (count <= 0 ||
+            static_cast<uint64_t>(count) > std::numeric_limits<uint32_t>::max()) {
+            return Status::invalid_argument_status("argmax logits size is invalid");
+        }
+
+        const float* values = f32_data(logits);
+        uint32_t best_index = 0;
+        float best_value = values[0];
+        for (uint32_t i = 1; i < static_cast<uint32_t>(count); ++i) {
+            if (values[i] > best_value) {
+                best_value = values[i];
+                best_index = i;
+            }
+        }
+
+        out_token = best_index;
+        return Status::success();
     }
 
     Status synchronize() override {
@@ -154,6 +179,17 @@ protected:
 
 private:
     Status validate_copy_view(const TensorView& view, size_t bytes) const {
+        Status status = validate_cpu_contiguous(view);
+        if (!status) {
+            return status;
+        }
+        if (bytes > view.logical_nbytes()) {
+            return Status::invalid_argument_status("copy exceeds tensor logical byte size");
+        }
+        return Status::success();
+    }
+
+    Status validate_cpu_contiguous(const TensorView& view) const {
         if (!view.defined()) {
             return Status::invalid_argument_status("tensor view is not defined");
         }
@@ -164,10 +200,18 @@ private:
             return Status::invalid_argument_status("tensor view is not on CPU");
         }
         if (!view.contiguous()) {
-            return Status::invalid_argument_status("copy requires a contiguous tensor view");
+            return Status::invalid_argument_status("tensor view must be contiguous");
         }
-        if (bytes > view.logical_nbytes()) {
-            return Status::invalid_argument_status("copy exceeds tensor logical byte size");
+        return Status::success();
+    }
+
+    Status validate_f32_contiguous(const TensorView& view) const {
+        Status status = validate_cpu_contiguous(view);
+        if (!status) {
+            return status;
+        }
+        if (view.dtype != DType::f32) {
+            return Status::unimplemented_status("CPU math only supports f32 tensors");
         }
         return Status::success();
     }
@@ -178,6 +222,14 @@ private:
 
     const uint8_t* data(const TensorView& view) const {
         return static_cast<const uint8_t*>(arena_handle(*view.arena)) + view.byte_offset;
+    }
+
+    float* f32_data(const TensorView& view) {
+        return reinterpret_cast<float*>(data(view));
+    }
+
+    const float* f32_data(const TensorView& view) const {
+        return reinterpret_cast<const float*>(data(view));
     }
 };
 

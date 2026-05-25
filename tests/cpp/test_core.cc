@@ -308,9 +308,53 @@ void test_cpu_backend_memory() {
         backend.value->copy_from_host(foreign_tensor.value, input, sizeof(input)).code,
         Status::invalid_argument);
 
-    uint32_t token = 0;
-    EXPECT_EQ(backend.value->argmax(token, tensor.value).code, Status::unimplemented);
     EXPECT_TRUE(backend.value->synchronize());
+}
+
+void test_cpu_backend_argmax() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 2048, MemoryKind::workspace));
+
+    Result<TensorView> logits = arena.alloc(make_shape({5}), DType::f32);
+    EXPECT_TRUE(logits.status);
+    const float input[] = {1.0f, 3.0f, 3.0f, -1.0f, 2.0f};
+    EXPECT_TRUE(backend.value->copy_from_host(logits.value, input, sizeof(input)));
+
+    uint32_t token = 99;
+    EXPECT_TRUE(backend.value->argmax(token, logits.value));
+    EXPECT_EQ(token, 1u);
+
+    Result<TensorView> batched_logits = arena.alloc(make_shape({1, 4}), DType::f32);
+    EXPECT_TRUE(batched_logits.status);
+    const float batched_input[] = {-4.0f, -2.0f, 0.5f, 0.25f};
+    EXPECT_TRUE(backend.value->copy_from_host(
+        batched_logits.value,
+        batched_input,
+        sizeof(batched_input)));
+    EXPECT_TRUE(backend.value->argmax(token, batched_logits.value));
+    EXPECT_EQ(token, 2u);
+
+    Result<TensorView> f16_logits = arena.alloc(make_shape({4}), DType::f16);
+    EXPECT_TRUE(f16_logits.status);
+    EXPECT_EQ(backend.value->argmax(token, f16_logits.value).code, Status::unimplemented);
+
+    TensorView non_contiguous = logits.value;
+    non_contiguous.strides.values[0] = 2;
+    EXPECT_EQ(backend.value->argmax(token, non_contiguous).code, Status::invalid_argument);
+
+    Result<TensorView> bad_rank = arena.alloc(make_shape({1, 1, 5}), DType::f32);
+    EXPECT_TRUE(bad_rank.status);
+    EXPECT_EQ(backend.value->argmax(token, bad_rank.value).code, Status::invalid_argument);
+
+    FakeBackend foreign_backend;
+    MemoryArena foreign_arena;
+    EXPECT_TRUE(foreign_backend.alloc_arena(foreign_arena, 256, MemoryKind::workspace));
+    Result<TensorView> foreign_logits = foreign_arena.alloc(make_shape({4}), DType::f32);
+    EXPECT_TRUE(foreign_logits.status);
+    EXPECT_EQ(backend.value->argmax(token, foreign_logits.value).code, Status::invalid_argument);
 }
 
 void test_engine_flow_with_fake_backend() {
@@ -363,6 +407,7 @@ int main() {
     test_tensor_view_edge_cases();
     test_arena_reset_reuses_memory();
     test_cpu_backend_memory();
+    test_cpu_backend_argmax();
     test_engine_flow_with_fake_backend();
 
     if (g_failures != 0) {

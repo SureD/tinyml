@@ -333,10 +333,40 @@ const float* f32_data(const TensorView&amp; view) const;</pre>
         <li>Copies are raw byte copies and do not perform dtype conversion.</li>
       </ul>
 
-      <h3>5.5 Operator Contract</h3>
+      <h3>5.5 Operator Implementation Scope</h3>
       <p>
-        All v1 CPU math operators require f32 contiguous tensors and caller-owned output buffers. Shape mismatches return <code>Status::invalid_argument</code>. Unsupported dtype returns <code>Status::unimplemented</code> until explicit conversion semantics exist.
+        CPU ops are reference kernels, not optimized kernels. They establish exact shape, dtype, layout, and numerical behavior for later Metal parity tests. Phase A implements only the ops whose contracts are already independent of model-specific cache details:
       </p>
+      <pre>Phase A, implement now:
+  argmax
+  swiglu_out
+  rms_norm_out
+  matmul_out
+
+Phase B, defer until API/model-layout decision:
+  rope_inplace
+  attention_out</pre>
+      <p>
+        All Phase A CPU math operators require f32 contiguous tensors owned by the same CPU backend. Shape mismatches return <code>Status::invalid_argument</code>. Unsupported dtype returns <code>Status::unimplemented</code> until explicit conversion semantics exist.
+      </p>
+
+      <h3>5.6 Common Op Validation</h3>
+      <p>
+        CPUBackend should add private validation helpers before implementing math loops. The intent is to make every op fail before touching memory.
+      </p>
+      <pre>Status validate_f32_contiguous(const TensorView&amp; view);
+Status validate_same_shape(const TensorView&amp; a, const TensorView&amp; b);
+Status validate_rank(const TensorView&amp; view, uint32_t rank);</pre>
+      <ul>
+        <li>View must be defined.</li>
+        <li>View's arena must be owned by this backend.</li>
+        <li>View must be on <code>DeviceType::cpu</code>.</li>
+        <li>View dtype must be <code>DType::f32</code> for math ops.</li>
+        <li>View must be contiguous in v1.</li>
+        <li>Output views may alias inputs only when the op contract explicitly allows it. Phase A should assume no aliasing except <code>argmax</code>, which has no tensor output.</li>
+      </ul>
+
+      <h3>5.7 Phase A Operator Specs</h3>
       <div class="table-wrap">
         <table>
           <thead>
@@ -344,49 +374,67 @@ const float* f32_data(const TensorView&amp; view) const;</pre>
               <th>Op</th>
               <th>Shape Contract</th>
               <th>Semantics</th>
+              <th>Implementation Notes</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td><code>matmul_out(out, x, w)</code></td>
-              <td><code>x=[M,K]</code>, <code>w=[K,N]</code>, <code>out=[M,N]</code></td>
-              <td>Row-major dense matrix multiply. No bias, no transpose flag.</td>
+              <td><code>argmax(out_token, logits)</code></td>
+              <td><code>logits=[V]</code> or <code>[1,V]</code></td>
+              <td>Return the first index of the largest f32 value.</td>
+              <td>Single pass over contiguous logits. Ties keep the smaller index. Inputs are expected finite; v1 does not scan separately for NaN.</td>
+            </tr>
+            <tr>
+              <td><code>swiglu_out(out, gate, up)</code></td>
+              <td><code>out</code>, <code>gate</code>, and <code>up</code> have identical shape and element count.</td>
+              <td><code>out[i] = silu(gate[i]) * up[i]</code>, where <code>silu(x)=x/(1+exp(-x))</code>.</td>
+              <td>Elementwise loop. Use <code>std::exp</code> for the reference implementation. No allocation and no fusion in Phase A.</td>
             </tr>
             <tr>
               <td><code>rms_norm_out(out, x, weight, eps)</code></td>
               <td><code>x=[T,H]</code>, <code>weight=[H]</code>, <code>out=[T,H]</code></td>
-              <td>Per-row RMSNorm: <code>x * rsqrt(mean(x^2) + eps) * weight</code>.</td>
+              <td>For each row: <code>out[t,i] = x[t,i] * rsqrt(mean(x[t,*]^2) + eps) * weight[i]</code>.</td>
+              <td>Two loops per row: reduction, then write output. Reject <code>eps &lt; 0</code>. Use f32 accumulation for the baseline.</td>
             </tr>
             <tr>
-              <td><code>rope_inplace(q, k, start_pos)</code></td>
-              <td><code>q=[T,n_heads,head_dim]</code>, <code>k=[T,n_kv_heads,head_dim]</code></td>
-              <td>Apply LLaMA-style rotary embedding in place. Requires even <code>head_dim</code>.</td>
-            </tr>
-            <tr>
-              <td><code>attention_out(out, q, k_cache, v_cache, kv_len)</code></td>
-              <td><code>q=[T,n_heads,head_dim]</code>, cache layout <code>[layer,kv_head,pos,head_dim]</code> slice contract TBD by engine binding</td>
-              <td>Causal attention over the first <code>kv_len</code> cache positions. The exact cache slice shape must be finalized with model layout.</td>
-            </tr>
-            <tr>
-              <td><code>swiglu_out(out, gate, up)</code></td>
-              <td><code>gate</code>, <code>up</code>, and <code>out</code> have identical shape</td>
-              <td><code>out = silu(gate) * up</code>.</td>
-            </tr>
-            <tr>
-              <td><code>argmax(out_token, logits)</code></td>
-              <td><code>logits=[vocab]</code> or <code>[1,vocab]</code></td>
-              <td>Return first index of the largest f32 value.</td>
+              <td><code>matmul_out(out, x, w)</code></td>
+              <td><code>x=[M,K]</code>, <code>w=[K,N]</code>, <code>out=[M,N]</code></td>
+              <td>Row-major dense matrix multiply: <code>out[m,n] = sum_k x[m,k] * w[k,n]</code>.</td>
+              <td>Scalar triple loop in row-major order. No bias, no transpose flag, no packing, no SIMD in Phase A.</td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <h3>5.6 Attention Boundary</h3>
+      <h3>5.8 Deferred Operator Specs</h3>
       <p>
-        Attention is the only op whose final shape contract depends on model layout. The implementation should start with the simplest engine-owned cache slices and keep the public backend method unchanged. If the current <code>TensorView</code> cannot describe a clean per-layer cache view without unsafe manual offsets, fix model binding before writing attention math.
+        <code>rope_inplace</code> and <code>attention_out</code> are intentionally deferred. They are not hard because of scalar CPU math; they are hard because the current Backend API does not yet carry all model-specific information cleanly.
       </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Op</th>
+              <th>Blocked By</th>
+              <th>Decision Needed Before Implementation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>rope_inplace(q, k, start_pos)</code></td>
+              <td><code>rope_theta</code> is not an argument, and interleaved-vs-half-split pair layout is not yet specified.</td>
+              <td>Either add <code>rope_theta</code> to the op API, pass a precomputed frequency table, or move RoPE into model-specific code with explicit config access.</td>
+            </tr>
+            <tr>
+              <td><code>attention_out(out, q, k_cache, v_cache, kv_len)</code></td>
+              <td>The op does not identify layer index, cache slice shape, or query-head to kv-head grouping.</td>
+              <td>Define whether engine passes per-layer cache views or full cache plus layer index. Also define cache view shape for decode and prefill.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
-      <h3>5.7 Error Model</h3>
+      <h3>5.9 Error Model</h3>
       <ul>
         <li><code>invalid_argument</code>: bad shape, undefined view, wrong owning backend, wrong device, non-contiguous view, null host pointer, insufficient byte range.</li>
         <li><code>unimplemented</code>: dtype or layout intentionally unsupported in v1.</li>
@@ -439,30 +487,37 @@ const float* f32_data(const TensorView&amp; view) const;</pre>
             </tr>
             <tr>
               <td>5</td>
-              <td>Simple ops</td>
-              <td>Implement <code>argmax</code>, <code>swiglu_out</code>, <code>rms_norm_out</code>, and <code>matmul_out</code>.</td>
-              <td>Small deterministic numerical tests pass with exact or tight float tolerance.</td>
+              <td>Phase A op validation</td>
+              <td>Add private helpers for owned CPU f32 contiguous views, exact shape equality, and rank checks.</td>
+              <td>Negative tests prove bad dtype, bad rank, shape mismatch, non-contiguous view, and foreign backend arena fail before memory access.</td>
               <td>Step 4</td>
             </tr>
             <tr>
               <td>6</td>
-              <td>RoPE</td>
-              <td>Implement in-place f32 RoPE for q/k using the model's <code>rope_theta</code> path once the op has access to required configuration.</td>
-              <td>RoPE tests match a small scalar reference implementation.</td>
-              <td>Step 5, model config access decision</td>
+              <td>Phase A simple elementwise/reduction ops</td>
+              <td>Implement <code>argmax</code>, <code>swiglu_out</code>, and <code>rms_norm_out</code> with scalar f32 loops.</td>
+              <td>Numerical tests pass for ties in argmax, SwiGLU expected values, RMSNorm row scaling, and invalid eps.</td>
+              <td>Step 5</td>
             </tr>
             <tr>
               <td>7</td>
-              <td>Attention</td>
-              <td>Finalize cache slice contract and implement causal attention reference math.</td>
-              <td>Attention tests cover one-token decode and short prompt prefill shapes.</td>
-              <td>Step 5, model layout details</td>
+              <td>Phase A matmul</td>
+              <td>Implement row-major f32 <code>matmul_out</code> for <code>[M,K] * [K,N] -> [M,N]</code>.</td>
+              <td>Small deterministic matrix tests pass and shape mismatch tests fail cleanly.</td>
+              <td>Step 5</td>
             </tr>
             <tr>
               <td>8</td>
+              <td>Deferred op API decisions</td>
+              <td>Resolve <code>rope_inplace</code> config access and <code>attention_out</code> cache-slice contract before writing their math.</td>
+              <td>Design doc records final API decision and tests to write for RoPE and attention.</td>
+              <td>Model layout details</td>
+            </tr>
+            <tr>
+              <td>9</td>
               <td>Engine test migration</td>
               <td>Use CPU backend in numerical tests while keeping fake backend for call-order tests.</td>
-              <td>Fake backend proves flow; CPU backend proves math.</td>
+              <td>Fake backend proves flow; CPU backend proves Phase A math.</td>
               <td>Step 7</td>
             </tr>
           </tbody>
@@ -478,13 +533,12 @@ const float* f32_data(const TensorView&amp; view) const;</pre>
             └─ CPU arena allocation/release
                  └─ CPU pointer/view validation helpers
                       ├─ Host copy tests
-                      └─ f32 op tests
+                      └─ Phase A f32 op tests
+                           ├─ common op validation
                            ├─ argmax
                            ├─ swiglu
                            ├─ rms_norm
-                           ├─ matmul
-                           ├─ rope
-                           └─ attention
+                           └─ matmul
 
 CPUBackend numerical behavior
   └─ later Metal parity tests</pre>
@@ -498,8 +552,10 @@ CPUBackend numerical behavior
         <li>Arena allocation tests for capacity, used bytes, runtime-managed tensor offset alignment, release, and move behavior.</li>
         <li>Copy round-trip tests using host arrays and contiguous <code>TensorView</code> slices.</li>
         <li>Negative tests for undefined view, wrong device, non-contiguous copy, unsupported dtype, shape mismatch, and byte count overflow.</li>
+        <li>Common op validation tests for unsupported dtype, rank mismatch, shape mismatch, non-contiguous views, and foreign backend arenas.</li>
         <li>Numerical tests for <code>argmax</code>, <code>swiglu_out</code>, <code>rms_norm_out</code>, and <code>matmul_out</code>.</li>
-        <li>RoPE and attention tests after their missing contract details are resolved.</li>
+        <li>RoPE tests only after <code>rope_theta</code> and pair layout are specified.</li>
+        <li>Attention tests only after cache-slice shape and head grouping are specified.</li>
         <li>Keep fake backend call-order tests for <code>LlamaInferEngine</code>; CPU backend tests should validate math, not control flow.</li>
       </ul>
     </section>
