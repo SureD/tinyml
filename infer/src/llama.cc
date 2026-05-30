@@ -134,6 +134,33 @@ Result<TensorView> layer_cache_view(const TensorView& cache, uint32_t layer) {
     return {Status::success(), view};
 }
 
+Result<TensorView> last_token_view(const TensorView& values, uint32_t token_index) {
+    if (!values.defined()) {
+        return {Status::invalid_argument_status("last token source is not defined"), {}};
+    }
+    if (values.shape.ndim != 2) {
+        return {Status::invalid_argument_status("last token source must have shape [T,H]"), {}};
+    }
+    if (token_index >= static_cast<uint32_t>(values.dim(0))) {
+        return {Status::invalid_argument_status("last token index is out of range"), {}};
+    }
+
+    TensorView view = values;
+    view.byte_offset +=
+        static_cast<size_t>(token_index) *
+        static_cast<size_t>(values.strides.stride(0)) *
+        values.item_size();
+    view.shape = make_shape({1, values.dim(1)});
+    view.strides.ndim = 2;
+    view.strides.values[0] = values.strides.stride(0);
+    view.strides.values[1] = values.strides.stride(1);
+
+    if (!view.defined() || !view.contiguous()) {
+        return {Status::invalid_argument_status("last token view is invalid"), {}};
+    }
+    return {Status::success(), view};
+}
+
 }  // namespace
 
 uint32_t LlamaConfig::head_dim() const {
@@ -498,7 +525,7 @@ Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_
     }
 
     workspace_.reset();
-    status = run_layers(0, static_cast<uint32_t>(prompt.size()), logits_);
+    status = run_layers(prompt, 0, logits_);
     if (!status) {
         return status;
     }
@@ -524,7 +551,7 @@ Status LlamaInferEngine::decode_one(TokenId token, TokenId& next_token) {
     }
 
     workspace_.reset();
-    status = run_layers(cache_.seq_len, 1, logits_);
+    status = run_layers(one_token, cache_.seq_len, logits_);
     if (!status) {
         return status;
     }
@@ -606,9 +633,10 @@ uint32_t LlamaInferEngine::max_seq_len() const {
 }
 
 Status LlamaInferEngine::run_layers(
+    std::span<const TokenId> tokens,
     uint32_t start_pos,
-    uint32_t seq_len,
     TensorView& logits) {
+    const uint32_t seq_len = static_cast<uint32_t>(tokens.size());
     Result<TensorView> hidden = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.hidden_size),
@@ -671,10 +699,18 @@ Status LlamaInferEngine::run_layers(
         }
     }
 
+    Status status = backend_->embedding_out(
+        hidden.value,
+        model_.token_embedding,
+        tokens);
+    if (!status) {
+        return status;
+    }
+
     for (uint32_t i = 0; i < config_.n_layers; ++i) {
         LayerWeights& layer = model_.layers[i];
 
-        Status status = backend_->rms_norm_out(normed.value, hidden.value, layer.attn_norm, config_.rms_eps);
+        status = backend_->rms_norm_out(normed.value, hidden.value, layer.attn_norm, config_.rms_eps);
         if (!status) {
             return status;
         }
@@ -714,11 +750,15 @@ Status LlamaInferEngine::run_layers(
         if (!status) {
             return status;
         }
-        status = backend_->matmul_out(hidden.value, attn_out.value, layer.o_proj);
+        status = backend_->matmul_out(ffn_out.value, attn_out.value, layer.o_proj);
         if (!status) {
             return status;
         }
-        status = backend_->rms_norm_out(normed.value, hidden.value, layer.ffn_norm, config_.rms_eps);
+        status = backend_->add_inplace(ffn_out.value, hidden.value);
+        if (!status) {
+            return status;
+        }
+        status = backend_->rms_norm_out(normed.value, ffn_out.value, layer.ffn_norm, config_.rms_eps);
         if (!status) {
             return status;
         }
@@ -734,12 +774,14 @@ Status LlamaInferEngine::run_layers(
         if (!status) {
             return status;
         }
-        status = backend_->matmul_out(ffn_out.value, swiglu.value, layer.down_proj);
+        status = backend_->matmul_out(hidden.value, swiglu.value, layer.down_proj);
         if (!status) {
             return status;
         }
-
-        hidden.value = ffn_out.value;
+        status = backend_->add_inplace(hidden.value, ffn_out.value);
+        if (!status) {
+            return status;
+        }
     }
 
     Result<TensorView> logits_view = workspace_tensor(make_shape({
@@ -751,11 +793,15 @@ Status LlamaInferEngine::run_layers(
     }
     logits = logits_view.value;
 
-    Status status = backend_->rms_norm_out(hidden.value, hidden.value, model_.final_norm, config_.rms_eps);
+    status = backend_->rms_norm_out(hidden.value, hidden.value, model_.final_norm, config_.rms_eps);
     if (!status) {
         return status;
     }
-    return backend_->matmul_out(logits, hidden.value, model_.lm_head);
+    Result<TensorView> last_hidden = last_token_view(hidden.value, seq_len - 1);
+    if (!last_hidden.status) {
+        return last_hidden.status;
+    }
+    return backend_->matmul_out(logits, last_hidden.value, model_.lm_head);
 }
 
 }  // namespace tinyinfer

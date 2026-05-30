@@ -126,6 +126,69 @@ public:
         return Status::success();
     }
 
+    Status embedding_out(
+        const TensorView& out,
+        const TensorView& table,
+        std::span<const uint32_t> token_ids) override {
+        Status status = validate_f32_contiguous(out);
+        if (!status) {
+            return status;
+        }
+        status = validate_f32_contiguous(table);
+        if (!status) {
+            return status;
+        }
+        if (token_ids.empty()) {
+            return Status::invalid_argument_status("embedding token_ids must not be empty");
+        }
+        if (out.shape.ndim != 2 || table.shape.ndim != 2) {
+            return Status::invalid_argument_status("embedding expects out=[T,H], table=[V,H]");
+        }
+        if (out.dim(0) != static_cast<int64_t>(token_ids.size()) ||
+            out.dim(1) != table.dim(1)) {
+            return Status::invalid_argument_status("embedding output shape mismatch");
+        }
+
+        const int64_t vocab = table.dim(0);
+        const int64_t hidden = table.dim(1);
+        const float* table_data = f32_data(table);
+        float* out_data = f32_data(out);
+        for (size_t t = 0; t < token_ids.size(); ++t) {
+            const uint32_t token = token_ids[t];
+            if (static_cast<int64_t>(token) >= vocab) {
+                return Status::invalid_argument_status("embedding token id exceeds vocab size");
+            }
+            const float* src = table_data + static_cast<int64_t>(token) * hidden;
+            float* dst = out_data + static_cast<int64_t>(t) * hidden;
+            std::memcpy(dst, src, static_cast<size_t>(hidden) * sizeof(float));
+        }
+        return Status::success();
+    }
+
+    Status add_inplace(
+        const TensorView& dst,
+        const TensorView& src) override {
+        Status status = validate_f32_contiguous(dst);
+        if (!status) {
+            return status;
+        }
+        status = validate_f32_contiguous(src);
+        if (!status) {
+            return status;
+        }
+        if (!same_shape(dst, src)) {
+            return Status::invalid_argument_status("add shape mismatch");
+        }
+
+        float* dst_data = f32_data(dst);
+        const float* src_data = f32_data(src);
+        const int64_t count = dst.numel();
+        for (int64_t i = 0; i < count; ++i) {
+            dst_data[i] += src_data[i];
+        }
+        return Status::success();
+    }
+
     Status rms_norm_out(
         const TensorView& out,
         const TensorView& x,

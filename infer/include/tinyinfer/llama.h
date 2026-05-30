@@ -97,7 +97,7 @@ private:
     void rebind_views_after_move(const LlamaInferEngine& source);
     void rebind_view_after_move(TensorView& view, const LlamaInferEngine& source);
     Result<TensorView> workspace_tensor(const Shape& shape);
-    Status run_layers(uint32_t start_pos, uint32_t seq_len, TensorView& logits);
+    Status run_layers(std::span<const TokenId> tokens, uint32_t start_pos, TensorView& logits);
 
     Backend* backend_ = nullptr;
     LlamaConfig config_;

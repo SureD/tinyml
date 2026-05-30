@@ -94,6 +94,24 @@ public:
         return Status::success();
     }
 
+    Status embedding_out(
+        const TensorView& out,
+        const TensorView& table,
+        std::span<const uint32_t> token_ids) override {
+        (void)out;
+        (void)table;
+        (void)token_ids;
+        calls.push_back("embedding");
+        return Status::success();
+    }
+
+    Status add_inplace(const TensorView& dst, const TensorView& src) override {
+        (void)dst;
+        (void)src;
+        calls.push_back("add");
+        return Status::success();
+    }
+
     Status rms_norm_out(
         const TensorView& out,
         const TensorView& x,
@@ -440,6 +458,59 @@ void test_cpu_backend_matmul() {
     EXPECT_EQ(backend.value->matmul_out(bad_out.value, x.value, w.value).code, Status::invalid_argument);
 }
 
+void test_cpu_backend_embedding_and_add() {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+
+    MemoryArena arena;
+    EXPECT_TRUE(backend.value->alloc_arena(arena, 4096, MemoryKind::workspace));
+
+    Result<TensorView> table = arena.alloc(make_shape({4, 3}), DType::f32);
+    Result<TensorView> out = arena.alloc(make_shape({2, 3}), DType::f32);
+    EXPECT_TRUE(table.status);
+    EXPECT_TRUE(out.status);
+
+    const float table_values[] = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f,
+        7.0f, 8.0f, 9.0f,
+        10.0f, 11.0f, 12.0f,
+    };
+    copy_f32_to_tensor(*backend.value, table.value, table_values);
+
+    const uint32_t tokens[] = {2, 0};
+    EXPECT_TRUE(backend.value->embedding_out(out.value, table.value, tokens));
+    expect_f32_tensor_near(*backend.value, out.value, {
+        7.0f, 8.0f, 9.0f,
+        1.0f, 2.0f, 3.0f,
+    });
+
+    const uint32_t bad_tokens[] = {4};
+    EXPECT_EQ(
+        backend.value->embedding_out(out.value, table.value, bad_tokens).code,
+        Status::invalid_argument);
+
+    Result<TensorView> add_src = arena.alloc(make_shape({2, 3}), DType::f32);
+    EXPECT_TRUE(add_src.status);
+    const float add_values[] = {
+        0.5f, -1.0f, 2.0f,
+        3.0f, 4.0f, -5.0f,
+    };
+    copy_f32_to_tensor(*backend.value, add_src.value, add_values);
+
+    EXPECT_TRUE(backend.value->add_inplace(out.value, add_src.value));
+    expect_f32_tensor_near(*backend.value, out.value, {
+        7.5f, 7.0f, 11.0f,
+        4.0f, 6.0f, -2.0f,
+    });
+
+    Result<TensorView> bad_add = arena.alloc(make_shape({3}), DType::f32);
+    EXPECT_TRUE(bad_add.status);
+    EXPECT_EQ(
+        backend.value->add_inplace(out.value, bad_add.value).code,
+        Status::invalid_argument);
+}
+
 void test_cpu_backend_rms_norm_and_swiglu() {
     Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
     EXPECT_TRUE(backend.status);
@@ -683,14 +754,20 @@ void test_engine_flow_with_fake_backend() {
 
     bool saw_attention = false;
     bool saw_argmax = false;
+    bool saw_embedding = false;
+    bool saw_add = false;
     uint32_t arena_allocs = 0;
     for (const std::string& call : backend.calls) {
         saw_attention = saw_attention || call == "attention";
         saw_argmax = saw_argmax || call == "argmax";
+        saw_embedding = saw_embedding || call == "embedding";
+        saw_add = saw_add || call == "add";
         arena_allocs += call == "alloc_arena" ? 1u : 0u;
     }
     EXPECT_EQ(arena_allocs, 3u);
+    EXPECT_TRUE(saw_embedding);
     EXPECT_TRUE(saw_attention);
+    EXPECT_TRUE(saw_add);
     EXPECT_TRUE(saw_argmax);
 }
 
@@ -704,6 +781,7 @@ int main() {
     test_cpu_backend_memory();
     test_cpu_backend_argmax();
     test_cpu_backend_matmul();
+    test_cpu_backend_embedding_and_add();
     test_cpu_backend_rms_norm_and_swiglu();
     test_cpu_backend_rope();
     test_cpu_backend_attention();

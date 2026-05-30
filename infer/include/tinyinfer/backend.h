@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 
 #include "tinyinfer/core.h"
 
@@ -32,6 +33,13 @@ public:
         const TensorView& out,
         const TensorView& x,
         const TensorView& w) = 0;
+    virtual Status embedding_out(
+        const TensorView& out,
+        const TensorView& table,
+        std::span<const uint32_t> token_ids) = 0;
+    virtual Status add_inplace(
+        const TensorView& dst,
+        const TensorView& src) = 0;
     virtual Status rms_norm_out(
         const TensorView& out,
         const TensorView& x,

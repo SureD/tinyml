@@ -49,6 +49,24 @@ public:
         return Status::unimplemented_status("Metal matmul is not implemented yet");
     }
 
+    Status embedding_out(
+        const TensorView& out,
+        const TensorView& table,
+        std::span<const uint32_t> token_ids) override {
+        (void)out;
+        (void)table;
+        (void)token_ids;
+        return Status::unimplemented_status("Metal embedding lookup is not implemented yet");
+    }
+
+    Status add_inplace(
+        const TensorView& dst,
+        const TensorView& src) override {
+        (void)dst;
+        (void)src;
+        return Status::unimplemented_status("Metal add is not implemented yet");
+    }
+
     Status rms_norm_out(
         const TensorView& out,
         const TensorView& x,
