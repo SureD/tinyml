@@ -1,5 +1,6 @@
 #include "tinyinfer/backend.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -469,13 +470,22 @@ private:
         int64_t max_seq_len,
         int64_t head_dim,
         uint32_t start_pos) {
+        // Source K/V are contiguous [seq_len, n_kv_heads, head_dim].
+        const int64_t src_token_stride = n_kv_heads * head_dim;
+        const int64_t src_head_stride = head_dim;
+        // Cache K/V are contiguous [n_kv_heads, max_seq_len, head_dim].
+        const int64_t cache_head_stride = max_seq_len * head_dim;
+        const int64_t cache_pos_stride = head_dim;
+
         for (int64_t t = 0; t < seq_len; ++t) {
             const int64_t pos = static_cast<int64_t>(start_pos) + t;
             for (int64_t h = 0; h < n_kv_heads; ++h) {
-                float* k_dst = k_cache + (h * max_seq_len + pos) * head_dim;
-                float* v_dst = v_cache + (h * max_seq_len + pos) * head_dim;
-                const float* k_src = k + (t * n_kv_heads + h) * head_dim;
-                const float* v_src = v + (t * n_kv_heads + h) * head_dim;
+                float* k_dst =
+                    k_cache + h * cache_head_stride + pos * cache_pos_stride;
+                float* v_dst =
+                    v_cache + h * cache_head_stride + pos * cache_pos_stride;
+                const float* k_src = k + t * src_token_stride + h * src_head_stride;
+                const float* v_src = v + t * src_token_stride + h * src_head_stride;
                 std::memcpy(k_dst, k_src, static_cast<size_t>(head_dim) * sizeof(float));
                 std::memcpy(v_dst, v_src, static_cast<size_t>(head_dim) * sizeof(float));
             }
@@ -487,10 +497,12 @@ private:
         const float* k_cache,
         int64_t kv_head,
         int64_t key_pos,
-        int64_t max_seq_len,
+        int64_t cache_head_stride,
+        int64_t cache_pos_stride,
         int64_t head_dim,
         float scale) const {
-        const float* k_row = k_cache + (kv_head * max_seq_len + key_pos) * head_dim;
+        const float* k_row =
+            k_cache + kv_head * cache_head_stride + key_pos * cache_pos_stride;
         float dot = 0.0f;
         for (int64_t d = 0; d < head_dim; ++d) {
             dot += q_row[d] * k_row[d];
@@ -512,26 +524,33 @@ private:
         uint32_t kv_len) const {
         const int64_t group_size = n_heads / n_kv_heads;
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        const int64_t out_cols = n_heads * head_dim;
+        // Q/out are contiguous [seq_len, n_heads, head_dim].
+        const int64_t q_token_stride = n_heads * head_dim;
+        const int64_t q_head_stride = head_dim;
+        const int64_t out_token_stride = n_heads * head_dim;
+        const int64_t out_head_stride = head_dim;
+        // K/V cache are contiguous [n_kv_heads, max_seq_len, head_dim].
+        const int64_t cache_head_stride = max_seq_len * head_dim;
+        const int64_t cache_pos_stride = head_dim;
 
         for (int64_t t = 0; t < seq_len; ++t) {
             const int64_t query_pos = static_cast<int64_t>(start_pos) + t;
+            const int64_t valid_len =
+                std::min(static_cast<int64_t>(kv_len), query_pos + 1);
             for (int64_t h = 0; h < n_heads; ++h) {
                 const int64_t kv_head = h / group_size;
-                const float* q_row = q + (t * n_heads + h) * head_dim;
-                float* out_row = out + t * out_cols + h * head_dim;
+                const float* q_row = q + t * q_token_stride + h * q_head_stride;
+                float* out_row = out + t * out_token_stride + h * out_head_stride;
 
                 float max_score = -std::numeric_limits<float>::infinity();
-                for (int64_t p = 0; p < static_cast<int64_t>(kv_len); ++p) {
-                    if (p > query_pos) {
-                        continue;
-                    }
+                for (int64_t p = 0; p < valid_len; ++p) {
                     const float score = attention_score(
                         q_row,
                         k_cache,
                         kv_head,
                         p,
-                        max_seq_len,
+                        cache_head_stride,
+                        cache_pos_stride,
                         head_dim,
                         scale);
                     if (score > max_score) {
@@ -540,16 +559,14 @@ private:
                 }
 
                 float denom = 0.0f;
-                for (int64_t p = 0; p < static_cast<int64_t>(kv_len); ++p) {
-                    if (p > query_pos) {
-                        continue;
-                    }
+                for (int64_t p = 0; p < valid_len; ++p) {
                     const float score = attention_score(
                         q_row,
                         k_cache,
                         kv_head,
                         p,
-                        max_seq_len,
+                        cache_head_stride,
+                        cache_pos_stride,
                         head_dim,
                         scale);
                     denom += std::exp(score - max_score);
@@ -557,21 +574,20 @@ private:
 
                 for (int64_t d = 0; d < head_dim; ++d) {
                     float sum = 0.0f;
-                    for (int64_t p = 0; p < static_cast<int64_t>(kv_len); ++p) {
-                        if (p > query_pos) {
-                            continue;
-                        }
+                    for (int64_t p = 0; p < valid_len; ++p) {
                         const float score = attention_score(
                             q_row,
                             k_cache,
                             kv_head,
                             p,
-                            max_seq_len,
+                            cache_head_stride,
+                            cache_pos_stride,
                             head_dim,
                             scale);
                         const float weight = std::exp(score - max_score) / denom;
                         const float* v_row =
-                            v_cache + (kv_head * max_seq_len + p) * head_dim;
+                            v_cache + kv_head * cache_head_stride
+                            + p * cache_pos_stride;
                         sum += weight * v_row[d];
                     }
                     out_row[d] = sum;

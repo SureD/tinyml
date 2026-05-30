@@ -1,0 +1,847 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>compute_attention 代码讲解</title>
+  <style>
+    :root {
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --text: #1f2933;
+      --muted: #5f6b76;
+      --line: #d7d9d2;
+      --accent: #1f7a6d;
+      --accent-2: #8a5a12;
+      --code-bg: #17212b;
+      --code-text: #e9eef2;
+      --warn-bg: #fff7dc;
+      --warn-line: #dfbd5f;
+      --ok-bg: #eaf7f2;
+      --ok-line: #78bfa8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.62;
+    }
+
+    main {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 20px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 24px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 20px 0 8px;
+      font-size: 18px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 8px 0;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.94em;
+    }
+
+    .lead {
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      margin: 18px 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .three {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .mini {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fbfbf9;
+    }
+
+    .mini strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .ok {
+      border-left: 4px solid var(--ok-line);
+      background: var(--ok-bg);
+      padding: 12px 14px;
+      border-radius: 6px;
+      margin: 12px 0;
+    }
+
+    .warn {
+      border-left: 4px solid var(--warn-line);
+      background: var(--warn-bg);
+      padding: 12px 14px;
+      border-radius: 6px;
+      margin: 12px 0;
+    }
+
+    pre {
+      margin: 12px 0;
+      overflow-x: auto;
+      background: var(--code-bg);
+      color: var(--code-text);
+      border-radius: 8px;
+      padding: 16px;
+      line-height: 1.45;
+      font-size: 14px;
+    }
+
+    pre code {
+      font-size: inherit;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+      font-size: 15px;
+    }
+
+    th,
+    td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #ededeb;
+    }
+
+    .formula {
+      display: block;
+      margin: 12px 0;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #eef5f4;
+      border: 1px solid #c5dcd8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-x: auto;
+    }
+
+    .flow {
+      display: grid;
+      gap: 8px;
+      margin: 12px 0;
+    }
+
+    .flow div {
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--accent);
+      border-radius: 8px;
+      background: #fbfbf9;
+      padding: 10px 12px;
+    }
+
+    .tag {
+      display: inline-block;
+      color: #ffffff;
+      background: var(--accent);
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      vertical-align: middle;
+    }
+
+    .tag.slow {
+      background: var(--accent-2);
+    }
+
+    .split-code {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .side-note {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfbf9;
+      padding: 14px;
+    }
+
+    ul,
+    ol {
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    @media (max-width: 820px) {
+      .grid,
+      .three,
+      .split-code {
+        grid-template-columns: 1fr;
+      }
+
+      main {
+        width: min(100vw - 20px, 1120px);
+        padding-top: 20px;
+      }
+
+      .section {
+        padding: 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>compute_attention 代码讲解</h1>
+      <p class="lead">
+        这份说明对应 <code>infer/src/cpu_backend.cc</code> 里的
+        <code>attention_score()</code> 和 <code>compute_attention()</code>。
+        它解释这段 CPU attention 代码在算什么、每个循环的意义、为什么
+        attention score 被重复计算，以及一个更适合性能优化的写法应该长什么样。
+      </p>
+    </header>
+
+    <section class="section">
+      <h2>一句话先讲明白</h2>
+      <p>
+        <code>compute_attention()</code> 做的是 Transformer 里的
+        <strong>causal self-attention</strong>：
+        当前 token 的 query 去和 KV cache 里的历史 key 做点积，得到 score；
+        对 score 做 softmax，得到每个历史 token 的权重；
+        最后用这些权重对 value 加权求和，得到 attention 输出。
+      </p>
+      <span class="formula">
+        score[p] = dot(q, k[p]) / sqrt(head_dim)<br>
+        weight[p] = softmax(score[p])<br>
+        out = sum_p weight[p] * v[p]
+      </span>
+      <div class="ok">
+        这份代码是一个很直接、容易 debug 的正确性版本。它的主要问题不是逻辑复杂，
+        而是为了省中间 buffer，反复计算了同一个 <code>dot(q, k)</code>。
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>相关代码长什么样</h2>
+      <div class="split-code">
+        <pre><code>float attention_score(
+    const float* q_row,
+    const float* k_cache,
+    int64_t kv_head,
+    int64_t key_pos,
+    int64_t cache_head_stride,
+    int64_t cache_pos_stride,
+    int64_t head_dim,
+    float scale) const {
+    const float* k_row =
+        k_cache + kv_head * cache_head_stride
+        + key_pos * cache_pos_stride;
+
+    float dot = 0.0f;
+    for (int64_t d = 0; d &lt; head_dim; ++d) {
+        dot += q_row[d] * k_row[d];
+    }
+    return dot * scale;
+}</code></pre>
+
+        <div class="side-note">
+          <h3>这段 helper 做什么？</h3>
+          <p>
+            它只做一件事：计算一个 query head 和一个 key row 的点积。
+          </p>
+          <p>
+            <code>k_cache</code> 是一个一维 <code>float*</code>，代码把它解释成
+            一个三维逻辑数组：
+          </p>
+          <pre><code>[n_kv_heads, max_seq_len, head_dim]</code></pre>
+          <p>
+            这不是说内存里真的有三层数组；真正的内存还是一整条 float。
+            当前 CPU backend 已经要求这些 tensor 是 contiguous，所以底层可以从
+            dims 推导出简单 stride。
+          </p>
+          <pre><code>offset =
+    kv_head * cache_head_stride
+  + key_pos * cache_pos_stride
+  + d</code></pre>
+          <p>
+            在 contiguous <code>[n_kv_heads, max_seq_len, head_dim]</code>
+            布局里，内部 stride 是：
+          </p>
+          <pre><code>cache_head_stride = max_seq_len * head_dim
+cache_pos_stride  = head_dim</code></pre>
+          <p>
+            代码里取的是一整行 key，所以先算到这一行的起点：
+          </p>
+          <pre><code>k_row = k_cache + kv_head * cache_head_stride
+                + key_pos * cache_pos_stride</code></pre>
+          <p>
+            然后 <code>k_row[d]</code> 再取这一行里的第 <code>d</code> 个 float。
+          </p>
+        </div>
+      </div>
+
+      <pre><code>void compute_attention(
+    float* out,
+    const float* q,
+    const float* k_cache,
+    const float* v_cache,
+    int64_t seq_len,
+    int64_t n_heads,
+    int64_t n_kv_heads,
+    int64_t max_seq_len,
+    int64_t head_dim,
+    uint32_t start_pos,
+    uint32_t kv_len) const {
+    const int64_t group_size = n_heads / n_kv_heads;
+    const float scale = 1.0f / std::sqrt(static_cast&lt;float&gt;(head_dim));
+    const int64_t q_token_stride = n_heads * head_dim;
+    const int64_t q_head_stride = head_dim;
+    const int64_t out_token_stride = n_heads * head_dim;
+    const int64_t out_head_stride = head_dim;
+    const int64_t cache_head_stride = max_seq_len * head_dim;
+    const int64_t cache_pos_stride = head_dim;
+
+    for (int64_t t = 0; t &lt; seq_len; ++t) {
+        const int64_t query_pos = static_cast&lt;int64_t&gt;(start_pos) + t;
+        const int64_t valid_len =
+            std::min(static_cast&lt;int64_t&gt;(kv_len), query_pos + 1);
+        for (int64_t h = 0; h &lt; n_heads; ++h) {
+            const int64_t kv_head = h / group_size;
+            const float* q_row = q + t * q_token_stride + h * q_head_stride;
+            float* out_row = out + t * out_token_stride + h * out_head_stride;
+
+            // pass 1: find max score
+            float max_score = -std::numeric_limits&lt;float&gt;::infinity();
+            for (int64_t p = 0; p &lt; valid_len; ++p) {
+                const float score = attention_score(...);
+                if (score &gt; max_score) max_score = score;
+            }
+
+            // pass 2: compute softmax denominator
+            float denom = 0.0f;
+            for (int64_t p = 0; p &lt; valid_len; ++p) {
+                const float score = attention_score(...);
+                denom += std::exp(score - max_score);
+            }
+
+            // pass 3: weighted sum of values
+            for (int64_t d = 0; d &lt; head_dim; ++d) {
+                float sum = 0.0f;
+                for (int64_t p = 0; p &lt; valid_len; ++p) {
+                    const float score = attention_score(...);
+                    const float weight = std::exp(score - max_score) / denom;
+                    const float* v_row =
+                        v_cache + kv_head * cache_head_stride
+                                + p * cache_pos_stride;
+                    sum += weight * v_row[d];
+                }
+                out_row[d] = sum;
+            }
+        }
+    }
+}</code></pre>
+    </section>
+
+    <section class="section">
+      <h2>输入输出的内存布局</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>数据</th>
+            <th>代码里的访问方式</th>
+            <th>逻辑形状</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>q</code></td>
+            <td><code>q + t * q_token_stride + h * q_head_stride</code></td>
+            <td><code>[seq_len, n_heads, head_dim]</code></td>
+          </tr>
+          <tr>
+            <td><code>out</code></td>
+            <td><code>out + t * out_token_stride + h * out_head_stride</code></td>
+            <td><code>[seq_len, n_heads, head_dim]</code></td>
+          </tr>
+          <tr>
+            <td><code>k_cache</code></td>
+            <td><code>k_cache + kv_head * cache_head_stride + p * cache_pos_stride</code></td>
+            <td><code>[n_kv_heads, max_seq_len, head_dim]</code></td>
+          </tr>
+          <tr>
+            <td><code>v_cache</code></td>
+            <td><code>v_cache + kv_head * cache_head_stride + p * cache_pos_stride</code></td>
+            <td><code>[n_kv_heads, max_seq_len, head_dim]</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        这些数组都是扁平的 <code>float*</code>。上层已经验证它们 contiguous，
+        所以底层函数用局部 stride 变量把一维地址计算写清楚。
+      </p>
+
+      <h3>把 <code>k_cache</code> 当成 stride 来看</h3>
+      <p>
+        你的理解是对的：<code>k_cache</code> 的一维寻址就是先跳到某个 head 的起始块，
+        再在这个 head 里面找 <code>key_pos</code>，最后在这个 key row 里面找
+        <code>d</code>。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>逻辑下标</th>
+            <th>stride，单位是 float</th>
+            <th>意思</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>kv_head</code></td>
+            <td><code>cache_head_stride</code></td>
+            <td>KV head 之间的跳跃长度，等于 <code>max_seq_len * head_dim</code>。</td>
+          </tr>
+          <tr>
+            <td><code>key_pos</code></td>
+            <td><code>cache_pos_stride</code></td>
+            <td>同一个 KV head 内，位置之间的跳跃长度，等于 <code>head_dim</code>。</td>
+          </tr>
+          <tr>
+            <td><code>d</code></td>
+            <td><code>1</code></td>
+            <td>一个 key 向量内部是连续 float，下一个维度就是下一个 float。</td>
+          </tr>
+        </tbody>
+      </table>
+      <pre><code>// 逻辑访问：
+k_cache[kv_head][key_pos][d]
+
+// 真实一维地址，单位是 float：
+k_cache[
+    kv_head * cache_head_stride
+  + key_pos * cache_pos_stride
+  + d
+]
+
+// 代码先拿到 row 起点：
+const float* k_row =
+    k_cache + kv_head * cache_head_stride
+    + key_pos * cache_pos_stride;
+
+// 再连续读 head_dim 个 float：
+dot += q_row[d] * k_row[d];</code></pre>
+      <div class="warn">
+        当前 CPU backend 已经先检查 tensor 是否 contiguous，所以这里不需要把
+        <code>TensorView.strides</code> 一路传进 hot path。局部 stride 变量只是为了让
+        地址计算更容易读。
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>外层循环怎么读</h2>
+      <div class="flow">
+        <div>
+          <strong>第一层：遍历当前 batch 里的 token</strong><br>
+          <code>for (t = 0; t &lt; seq_len; ++t)</code><br>
+          每个 <code>t</code> 是一个要计算 attention 的 query token。
+        </div>
+        <div>
+          <strong>第二层：遍历 query head</strong><br>
+          <code>for (h = 0; h &lt; n_heads; ++h)</code><br>
+          每个 head 都有自己的 query，也会产生自己的 output row。
+        </div>
+        <div>
+          <strong>第三层：遍历 KV cache 里的历史位置</strong><br>
+          <code>for (p = 0; p &lt; kv_len; ++p)</code><br>
+          每个 <code>p</code> 是一个可被关注的 key/value 位置。
+        </div>
+        <div>
+          <strong>最后一层：遍历 head_dim</strong><br>
+          <code>for (d = 0; d &lt; head_dim; ++d)</code><br>
+          attention 输出本身是一个长度为 <code>head_dim</code> 的向量。
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>GQA / MQA 是怎么映射的</h2>
+      <pre><code>const int64_t group_size = n_heads / n_kv_heads;
+const int64_t kv_head = h / group_size;</code></pre>
+
+      <p>
+        <code>n_heads</code> 是 query head 数量，<code>n_kv_heads</code> 是
+        key/value head 数量。很多 LLM 用 GQA，也就是多个 query head 共享一个 KV head。
+      </p>
+
+      <div class="grid">
+        <div class="mini">
+          <strong>普通 MHA</strong>
+          <p>
+            <code>n_heads == n_kv_heads</code>，每个 query head 都有自己的 key/value head。
+          </p>
+          <pre><code>q head 0 -> kv head 0
+q head 1 -> kv head 1
+q head 2 -> kv head 2</code></pre>
+        </div>
+        <div class="mini">
+          <strong>GQA / MQA</strong>
+          <p>
+            <code>n_kv_heads</code> 小于 <code>n_heads</code>，多个 query head 共享 KV。
+          </p>
+          <pre><code>n_heads = 8
+n_kv_heads = 2
+group_size = 4
+
+q head 0,1,2,3 -> kv head 0
+q head 4,5,6,7 -> kv head 1</code></pre>
+        </div>
+      </div>
+
+      <div class="ok">
+        这样做的直接收益是 KV cache 更小。decode 时 KV cache 经常是内存带宽瓶颈，
+        减少 KV head 数量可以降低带宽压力。
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Causal mask 在哪里</h2>
+      <pre><code>const int64_t query_pos = static_cast&lt;int64_t&gt;(start_pos) + t;
+
+if (p &gt; query_pos) {
+    continue;
+}</code></pre>
+
+      <p>
+        <code>query_pos</code> 是当前 query token 在完整序列里的绝对位置。
+        <code>p</code> 是 KV cache 里的位置。
+      </p>
+      <p>
+        如果 <code>p &gt; query_pos</code>，说明这个 key/value 来自未来 token。
+        自回归模型不能偷看未来，所以要跳过。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>当前 query 位置</th>
+            <th>可以看的 KV 位置</th>
+            <th>不能看的 KV 位置</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>query_pos = 0</code></td>
+            <td><code>0</code></td>
+            <td><code>1, 2, 3, ...</code></td>
+          </tr>
+          <tr>
+            <td><code>query_pos = 1</code></td>
+            <td><code>0, 1</code></td>
+            <td><code>2, 3, ...</code></td>
+          </tr>
+          <tr>
+            <td><code>query_pos = 2</code></td>
+            <td><code>0, 1, 2</code></td>
+            <td><code>3, 4, ...</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2>为什么 score 被算了三遍</h2>
+      <p>
+        attention score 是：
+      </p>
+      <span class="formula">
+        score[p] = dot(q_row, k_cache[kv_head, p]) * scale
+      </span>
+      <p>
+        这份代码没有把 <code>score[p]</code> 存下来，所以后面每次需要它时，
+        都重新调用 <code>attention_score()</code>。
+      </p>
+
+      <div class="three">
+        <div class="mini">
+          <strong><span class="tag">第 1 遍</span> 找 max_score</strong>
+          <p>
+            softmax 需要先减去最大值，避免 <code>exp(score)</code> 溢出。
+          </p>
+          <pre><code>max_score = max(score[p])</code></pre>
+        </div>
+        <div class="mini">
+          <strong><span class="tag">第 2 遍</span> 算 denom</strong>
+          <p>
+            计算 softmax 分母。
+          </p>
+          <pre><code>denom = sum(exp(score[p] - max_score))</code></pre>
+        </div>
+        <div class="mini">
+          <strong><span class="tag slow">第 3 部分</span> 加权 V</strong>
+          <p>
+            对 value 做加权求和，得到输出向量。
+          </p>
+          <pre><code>out[d] =
+  sum(weight[p] * v[p][d])</code></pre>
+        </div>
+      </div>
+
+      <div class="warn">
+        关键点：第三部分不只是又算一遍 score。因为它外面还有
+        <code>for (d = 0; d &lt; head_dim; ++d)</code>，
+        所以它会对每个输出维度都重新计算所有 score。
+      </div>
+
+      <p>
+        对一个固定的 <code>(t, h)</code>，如果可见 KV 数量是
+        <code>valid_len</code>，当前代码里的 <code>attention_score()</code>
+        调用次数大概是：
+      </p>
+      <span class="formula">
+        valid_len + valid_len + head_dim * valid_len<br>
+        = (head_dim + 2) * valid_len
+      </span>
+      <p>
+        如果 <code>head_dim = 128</code>，那就是
+        <code>130 * valid_len</code> 次 score 计算。理论上 score 只需要计算
+        <code>valid_len</code> 次，然后缓存起来。
+      </p>
+    </section>
+
+    <section class="section">
+      <h2>为什么要先找 max_score</h2>
+      <p>
+        softmax 的数学定义是：
+      </p>
+      <span class="formula">
+        softmax(x_i) = exp(x_i) / sum_j exp(x_j)
+      </span>
+      <p>
+        但如果 <code>x_i</code> 很大，<code>exp(x_i)</code> 可能直接变成
+        <code>inf</code>。实际实现通常写成：
+      </p>
+      <span class="formula">
+        softmax(x_i) = exp(x_i - max_x) / sum_j exp(x_j - max_x)
+      </span>
+      <p>
+        减掉同一个 <code>max_x</code> 不会改变 softmax 结果，但是可以让指数运算更稳定。
+        所以第一遍扫描是为了数值稳定，不是多余的。
+      </p>
+    </section>
+
+    <section class="section">
+      <h2>当前写法的性能问题</h2>
+      <p>
+        <code>attention_score()</code> 里真正贵的是这个循环：
+      </p>
+      <pre><code>for (int64_t d = 0; d &lt; head_dim; ++d) {
+    dot += q_row[d] * k_row[d];
+}</code></pre>
+      <p>
+        它每次都会连续读取一段 <code>q_row</code> 和一段 <code>k_row</code>。
+        对 CPU 来说，这主要消耗：
+      </p>
+      <ul>
+        <li>浮点乘加计算量，尤其 <code>head_dim</code> 大时更明显。</li>
+        <li>内存带宽和 cache，因为同一批 key row 被重复读取。</li>
+        <li>函数调用和循环开销，虽然编译器可能 inline，但重复 dot product 仍然存在。</li>
+      </ul>
+      <p>
+        在 decode 阶段，<code>seq_len</code> 通常是 1，但是 <code>kv_len</code>
+        会随着上下文长度增长。上下文越长，这个重复计算越伤。
+      </p>
+    </section>
+
+    <section class="section">
+      <h2>更清楚的伪代码</h2>
+      <p>
+        当前代码按数学意义可以整理成这样：
+      </p>
+      <pre><code>for each query token t:
+  query_pos = start_pos + t
+
+  for each query head h:
+    kv_head = h / group_size
+    q_row = q[t, h]
+
+    # 1. 找最大 score，用于稳定 softmax
+    max_score = -inf
+    for p in 0..kv_len:
+      if p &gt; query_pos:
+        skip
+      score = dot(q_row, k_cache[kv_head, p]) / sqrt(head_dim)
+      max_score = max(max_score, score)
+
+    # 2. 算 softmax 分母
+    denom = 0
+    for p in 0..kv_len:
+      if p &gt; query_pos:
+        skip
+      score = dot(q_row, k_cache[kv_head, p]) / sqrt(head_dim)
+      denom += exp(score - max_score)
+
+    # 3. 算输出向量的每个维度
+    for d in 0..head_dim:
+      sum = 0
+      for p in 0..kv_len:
+        if p &gt; query_pos:
+          skip
+        score = dot(q_row, k_cache[kv_head, p]) / sqrt(head_dim)
+        weight = exp(score - max_score) / denom
+        sum += weight * v_cache[kv_head, p, d]
+      out[t, h, d] = sum</code></pre>
+    </section>
+
+    <section class="section">
+      <h2>更合理的实现形状</h2>
+      <p>
+        如果要优化，第一步通常是准备一个 scratch buffer，把每个可见位置的
+        score 或 weight 存下来。
+      </p>
+
+      <pre><code>// scratch 长度至少是 kv_len
+float* scores = scratch;
+
+// pass 1: score 只算一次，并顺便找 max
+float max_score = -inf;
+for (int64_t p = 0; p &lt; valid_len; ++p) {
+    scores[p] = attention_score(q_row, k_cache, kv_head, p,
+                                max_seq_len, head_dim, scale);
+    max_score = std::max(max_score, scores[p]);
+}
+
+// pass 2: scores 原地变成未归一化的 weight
+float denom = 0.0f;
+for (int64_t p = 0; p &lt; valid_len; ++p) {
+    scores[p] = std::exp(scores[p] - max_score);
+    denom += scores[p];
+}
+
+// pass 3: 用缓存下来的 weight 加权 V
+for (int64_t d = 0; d &lt; head_dim; ++d) {
+    float sum = 0.0f;
+    for (int64_t p = 0; p &lt; valid_len; ++p) {
+        const float weight = scores[p] / denom;
+        const float* v_row =
+            v_cache + (kv_head * max_seq_len + p) * head_dim;
+        sum += weight * v_row[d];
+    }
+    out_row[d] = sum;
+}</code></pre>
+
+      <div class="ok">
+        这个版本仍然有三段循环，因为 softmax 本来就需要 max 和 denom。
+        但它把最贵的 <code>dot(q, k)</code> 从
+        <code>(head_dim + 2) * valid_len</code> 次降到了
+        <code>valid_len</code> 次。
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>可以继续改进的地方</h2>
+      <ul>
+        <li>
+          <strong>避免 hot path 分配：</strong>
+          scratch buffer 应该由 backend 或调用方预分配，不要在
+          <code>compute_attention()</code> 里面临时 <code>malloc</code>。
+        </li>
+        <li>
+          <strong>把可见长度算出来：</strong>
+          可以用 <code>valid_len = min(kv_len, query_pos + 1)</code>，
+          这样内层循环就不需要每次判断 <code>if (p &gt; query_pos)</code>。
+        </li>
+        <li>
+          <strong>检查 GQA 参数：</strong>
+          这段代码假设 <code>n_heads</code> 能整除 <code>n_kv_heads</code>。
+          如果不能整除，<code>kv_head = h / group_size</code> 会出错。
+        </li>
+        <li>
+          <strong>后续再做 SIMD：</strong>
+          dot product 可以考虑让编译器 auto-vectorize，或者手写 SIMD。
+          但先去掉重复 score 计算，收益更直接。
+        </li>
+        <li>
+          <strong>value 加权的循环顺序：</strong>
+          当前是外层 <code>d</code>、内层 <code>p</code>。
+          这会让读取 <code>v_row[d]</code> 跨 row 访问。也可以考虑外层
+          <code>p</code>、内层 <code>d</code>，每次连续扫一整行 value，
+          对 cache 更友好。
+        </li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>最后总结</h2>
+      <p>
+        这段代码的本质很简单：对每个 query token、每个 query head，从 KV cache
+        中取出能看到的历史 key/value，计算 causal attention。
+      </p>
+      <p>
+        score 被重复计算的原因是：代码没有保存 <code>score[p]</code> 或
+        <code>weight[p]</code>。第一遍需要 max，第二遍需要 denom，第三部分需要
+        weight 来乘 value。为了保持实现简单，它选择了重复调用
+        <code>attention_score()</code>。
+      </p>
+      <p>
+        从系统工程角度看，这个版本清楚但慢。下一步最值得做的优化是引入预分配
+        scratch buffer，把 score 只算一次，然后再做 softmax 和 value 加权。
+      </p>
+    </section>
+  </main>
+</body>
+</html>
