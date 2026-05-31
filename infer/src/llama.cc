@@ -17,10 +17,6 @@ size_t f32_bytes(size_t elems) {
     return elems * dtype_size(DType::f32);
 }
 
-size_t product(size_t a, size_t b) {
-    return a * b;
-}
-
 MemoryPlan build_memory_plan(const LlamaConfig& config, uint32_t max_seq_len) {
     MemoryPlan plan;
     if (!config.validate()) {
@@ -36,26 +32,34 @@ MemoryPlan build_memory_plan(const LlamaConfig& config, uint32_t max_seq_len) {
     const size_t head_dim = config.head_dim();
     const size_t kv_dim = config.n_kv_heads * head_dim;
 
-    size_t weight_elems = 0;
-    weight_elems += product(vocab, hidden);
-    weight_elems += hidden;
-    weight_elems += product(vocab, hidden);
+    const size_t global_weight_elems =
+        vocab * hidden +  // token_embedding
+        hidden +          // final_norm
+        vocab * hidden;   // lm_head
 
     const size_t layer_elems =
-        hidden +
-        product(hidden, hidden) +
-        product(kv_dim, hidden) +
-        product(kv_dim, hidden) +
-        product(hidden, hidden) +
-        hidden +
-        product(inter, hidden) +
-        product(inter, hidden) +
-        product(hidden, inter);
+        hidden +          // attn_norm
+        hidden * hidden + // q_proj
+        kv_dim * hidden + // k_proj
+        kv_dim * hidden + // v_proj
+        hidden * hidden + // o_proj
+        hidden +          // ffn_norm
+        inter * hidden +  // gate_proj
+        inter * hidden +  // up_proj
+        hidden * inter;   // down_proj
 
     constexpr size_t kTensorAlignmentSlack = 64;
-    const size_t weight_tensors = 3 + static_cast<size_t>(config.n_layers) * 9;
-    weight_elems += static_cast<size_t>(config.n_layers) * layer_elems;
-    plan.weights_bytes = f32_bytes(weight_elems) + weight_tensors * kTensorAlignmentSlack;
+    constexpr size_t kGlobalWeightTensors = 3;
+    constexpr size_t kLayerWeightTensors = 9;
+    const size_t layer_count = config.n_layers;
+
+    const size_t weight_elems = global_weight_elems + layer_count * layer_elems;
+    const size_t weight_tensor_count =
+        kGlobalWeightTensors + layer_count * kLayerWeightTensors;
+    const size_t weight_alignment_slack =
+        weight_tensor_count * kTensorAlignmentSlack;
+
+    plan.weights_bytes = f32_bytes(weight_elems) + weight_alignment_slack;
 
     const size_t kv_elems =
         2ULL *

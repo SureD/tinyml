@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Llama 推理流程与内存视角</title>
+  <style>
+    :root {
+      --bg: #fbfbf8;
+      --panel: #ffffff;
+      --text: #20242a;
+      --muted: #5b6670;
+      --line: #d9ded8;
+      --soft: #f1f5f2;
+      --code-bg: #14191f;
+      --code-text: #eef3f7;
+      --accent: #0f766e;
+      --warn-bg: #fff8df;
+      --warn-line: #d8b94c;
+      --ok-bg: #edf8f3;
+      --ok-line: #78b99e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.66 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 60px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 22px;
+      padding-bottom: 20px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      color: #111418;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(30px, 4vw, 44px);
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    code {
+      border-radius: 4px;
+      background: #eef2f0;
+      padding: 2px 5px;
+      font: 0.93em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 15px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre code {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+      font-size: inherit;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #edf1ef;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .lead {
+      max-width: 880px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .muted,
+    .summary span {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 16px 18px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+
+    .flow {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .step {
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px 14px;
+    }
+
+    .step strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .formula {
+      display: block;
+      overflow-x: auto;
+      border: 1px solid #c7ddd8;
+      border-radius: 8px;
+      background: #eef7f4;
+      margin: 12px 0;
+      padding: 12px 14px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+    }
+
+    .note,
+    .warn {
+      border-radius: 8px;
+      margin-top: 12px;
+      padding: 12px 14px;
+    }
+
+    .note {
+      border-left: 4px solid var(--ok-line);
+      background: var(--ok-bg);
+    }
+
+    .warn {
+      border-left: 4px solid var(--warn-line);
+      background: var(--warn-bg);
+    }
+
+    .columns {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 12px;
+    }
+
+    .mini {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft);
+      padding: 13px 14px;
+    }
+
+    .mini strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    .shape {
+      color: #34524c;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.94em;
+    }
+
+    @media (max-width: 760px) {
+      .columns {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Llama 推理流程与内存视角</h1>
+      <p class="lead">
+        这份笔记用 TinyInfer 当前的 <code>llama.cc</code> 为线索，从一个 token id 开始，解释它如何变成 hidden 向量，如何经过每一层 Transformer block 的 attention 和 FFN，最后如何得到下一个 token。
+      </p>
+      <div class="summary">
+        <div><strong>主线</strong><span>token id → embedding → layers → logits → next token</span></div>
+        <div><strong>内存视角</strong><span>weights 长期只读，KV cache 跨 token 保存，workspace 每次 forward 复用。</span></div>
+        <div><strong>代码入口</strong><span><code>LlamaInferEngine::run_layers()</code></span></div>
+        <div><strong>重点形状</strong><span><code>[T,H]</code>、<code>[T,NH,D]</code>、<code>[KVH,S,D]</code>。</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>先建立符号</h2>
+      <p>
+        推理代码里大量计算都可以用几个维度描述。先把这些符号记住，后面看 shape 会顺很多。
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>符号</th>
+              <th>代码字段</th>
+              <th>含义</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>T</code></td>
+              <td><code>tokens.size()</code></td>
+              <td>本次 forward 的 token 数。prefill 时是 prompt 长度，decode 时通常是 1。</td>
+            </tr>
+            <tr>
+              <td><code>H</code></td>
+              <td><code>hidden_size</code></td>
+              <td>每个 token 的隐藏向量长度，也是模型主干宽度。</td>
+            </tr>
+            <tr>
+              <td><code>I</code></td>
+              <td><code>intermediate_size</code></td>
+              <td>FFN 中间层宽度，通常比 <code>H</code> 大。</td>
+            </tr>
+            <tr>
+              <td><code>V</code></td>
+              <td><code>vocab_size</code></td>
+              <td>词表大小，logits 的最后一维。</td>
+            </tr>
+            <tr>
+              <td><code>NH</code></td>
+              <td><code>n_heads</code></td>
+              <td>Query attention head 数。</td>
+            </tr>
+            <tr>
+              <td><code>KVH</code></td>
+              <td><code>n_kv_heads</code></td>
+              <td>Key/Value head 数。GQA 下它小于 <code>NH</code>。</td>
+            </tr>
+            <tr>
+              <td><code>D</code></td>
+              <td><code>head_dim()</code></td>
+              <td>每个 head 的维度，<code>D = H / NH</code>。</td>
+            </tr>
+            <tr>
+              <td><code>KVD</code></td>
+              <td><code>n_kv_heads * head_dim()</code></td>
+              <td>所有 KV heads 拼起来的宽度，<code>KVD = KVH * D</code>。</td>
+            </tr>
+            <tr>
+              <td><code>S</code></td>
+              <td><code>max_seq_len</code></td>
+              <td>KV cache 最大可保存的序列长度。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>三块核心内存</h2>
+      <p>
+        从内存角度理解推理，最重要的是先分清三类数据的生命周期。TinyInfer 里正好把它们分成三个 arena。
+      </p>
+      <div class="columns">
+        <div class="mini">
+          <strong><code>weights_</code></strong>
+          模型参数。加载后长期存在，推理时主要只读。比如 embedding table、Q/K/V/O projection、FFN projection、norm weight、lm_head。
+        </div>
+        <div class="mini">
+          <strong><code>kv_cache_arena_</code></strong>
+          一次 request/generation 的历史状态。每生成一个 token，每一层都会把新 K/V 写进去，后续 token 的 attention 会继续读它。
+        </div>
+        <div class="mini">
+          <strong><code>workspace_</code></strong>
+          本次 forward 的临时 buffer。<code>prefill()</code> 和 <code>decode_one()</code> 进入 <code>run_layers()</code> 前都会 reset，然后顺序切出 hidden、q、k、v、FFN 中间结果等。
+        </div>
+        <div class="mini">
+          <strong>对齐 padding</strong>
+          arena 是一大块内存，但每个 tensor 的起始地址要对齐。padding 通常插在 tensor 之间，memory plan 会为这些间隙预留空间。
+        </div>
+      </div>
+      <p class="formula">weights:   模型参数，生命周期 = engine
+kv_cache:  历史 K/V，生命周期 = request/generation
+workspace: 临时激活，生命周期 = 单次 run_layers()</p>
+    </section>
+
+    <section>
+      <h2>总流程</h2>
+      <p>
+        <code>run_layers()</code> 是推理主干。它拿到一段 token ids，输出最后一个位置的 logits。
+      </p>
+      <div class="flow">
+        <div class="step">
+          <strong>1. token ids</strong>
+          输入是一段整数 token id：<span class="shape">[T]</span>。这些整数本身没有语义向量，只是词表里的行号。
+        </div>
+        <div class="step">
+          <strong>2. embedding lookup</strong>
+          从 <code>token_embedding</code> 表里按行拷贝，得到 <span class="shape">hidden=[T,H]</span>。
+        </div>
+        <div class="step">
+          <strong>3. 重复 N 层 Transformer block</strong>
+          每层做 attention 子层和 FFN 子层，每个子层都有 RMSNorm、权重投影和 residual add。
+        </div>
+        <div class="step">
+          <strong>4. final norm + lm_head</strong>
+          最后一层输出再做 RMSNorm，取最后一个 token 的 hidden，乘 <code>lm_head</code> 得到 <span class="shape">logits=[1,V]</span>。
+        </div>
+        <div class="step">
+          <strong>5. sample 或 argmax</strong>
+          当前实现用 <code>argmax()</code> 选出最大 logit 的 token id，作为下一个 token。
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>token 如何变成 hidden 向量</h2>
+      <p>
+        token id 是一个整数，例如 <code>42</code>。模型不能直接对整数做 attention，所以第一步是查 embedding table：
+      </p>
+      <p class="formula">token_embedding: [V,H]
+tokens:          [T]
+hidden:          [T,H]
+
+hidden[t] = token_embedding[tokens[t]]</p>
+      <p>
+        这一步不是矩阵乘法，而是按行拷贝。CPU backend 里 <code>embedding_out()</code> 做的就是：
+      </p>
+      <pre><code>const float* src = table_data + token * hidden;
+float* dst = out_data + t * hidden;
+memcpy(dst, src, hidden * sizeof(float));</code></pre>
+      <div class="note">
+        <strong>内存归属：</strong>
+        <code>token_embedding</code> 属于 weights；<code>hidden</code> 属于 workspace。一个 token 进入模型以后，后续所有主干计算基本都围绕这个 hidden 向量变换。
+      </div>
+    </section>
+
+    <section>
+      <h2>Transformer Block 的骨架</h2>
+      <p>
+        每一层的输入和输出都是 <span class="shape">[T,H]</span>。这点很重要：block 内部会把 hidden 展开成 Q/K/V 或 FFN 中间维度，但最终都会回到 <span class="shape">[T,H]</span>，这样下一层才能继续接上。
+      </p>
+      <pre><code>// layer input
+hidden: [T,H]
+
+// attention sublayer
+normed   = rms_norm(hidden, attn_norm)
+q        = matmul(normed, q_proj)
+k        = matmul(normed, k_proj)
+v        = matmul(normed, v_proj)
+q, k     = rope(q, k)
+attn_out = attention(q, k, v, kv_cache)
+ffn_out  = matmul(attn_out, o_proj)
+ffn_out += hidden
+
+// FFN sublayer
+normed  = rms_norm(ffn_out, ffn_norm)
+gate    = matmul(normed, gate_proj)
+up      = matmul(normed, up_proj)
+swiglu  = silu(gate) * up
+hidden  = matmul(swiglu, down_proj)
+hidden += ffn_out
+
+// layer output
+hidden: [T,H]</code></pre>
+      <p>
+        当前代码变量名里 <code>ffn_out</code> 有一点容易误解：attention 的 <code>o_proj</code> 输出先放进 <code>ffn_out</code>，再加 residual，随后它作为 FFN 子层的输入残差。
+      </p>
+    </section>
+
+    <section>
+      <h2>Attention 子层</h2>
+      <h3>RMSNorm</h3>
+      <p>
+        attention 前先做 RMSNorm：
+      </p>
+      <p class="formula">hidden: [T,H]
+attn_norm weight: [H]
+normed: [T,H]</p>
+      <p>
+        <code>attn_norm</code> 是权重，<code>normed</code> 是 workspace 中的临时激活。RMSNorm 不改变 shape，只改变数值尺度。
+      </p>
+
+      <h3>Q/K/V projection</h3>
+      <p>
+        然后用三组权重把 <code>normed</code> 投影成 Query、Key、Value：
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>tensor</th>
+              <th>weight shape</th>
+              <th>output shape</th>
+              <th>为什么是这个形状</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>q_proj</code></td>
+              <td><span class="shape">[H,H]</span></td>
+              <td><span class="shape">q=[T,NH,D]</span>，元素数等于 <span class="shape">[T,H]</span></td>
+              <td>Query 有 <code>NH</code> 个 heads，<code>NH * D = H</code>，所以输出总宽度还是 <code>H</code>。</td>
+            </tr>
+            <tr>
+              <td><code>k_proj</code></td>
+              <td><span class="shape">[KVD,H]</span></td>
+              <td><span class="shape">k=[T,KVH,D]</span></td>
+              <td>GQA 下 KV heads 更少，<code>KVD = KVH * D</code>，所以 K 比 Q 小。</td>
+            </tr>
+            <tr>
+              <td><code>v_proj</code></td>
+              <td><span class="shape">[KVD,H]</span></td>
+              <td><span class="shape">v=[T,KVH,D]</span></td>
+              <td>Value 和 Key 使用同样的 KV head 数。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        CPU backend 的 <code>matmul_out()</code> 约定是 <code>x=[M,K]</code>，<code>w=[N,K]</code>，输出元素数是 <code>M*N</code>。所以 <code>q_proj=[H,H]</code> 会把 <code>normed=[T,H]</code> 变成总元素布局为 <code>[T,H]</code> 的 Q，再用三维 shape 解释为 <code>[T,NH,D]</code>。
+      </p>
+
+      <h3>RoPE</h3>
+      <p>
+        RoPE 作用在 Q 和 K 上，注入位置信息：
+      </p>
+      <p class="formula">q: [T,NH,D]
+k: [T,KVH,D]
+start_pos: 当前 token 在整段序列中的起始位置</p>
+      <p>
+        decode 时 <code>start_pos</code> 不是 0，而是当前 KV cache 已经保存的长度。这样新 token 的位置编码能接在历史序列后面。
+      </p>
+
+      <h3>写 KV cache，再读历史做 attention</h3>
+      <p>
+        当前层 attention 会先把本次 token 的 K/V 写进该层 KV cache：
+      </p>
+      <p class="formula">layer_k_cache: [KVH,S,D]
+layer_v_cache: [KVH,S,D]
+k current:     [T,KVH,D]
+v current:     [T,KVH,D]</p>
+      <p>
+        写完以后，attention 会让每个 query 位置读取它允许看到的历史 K/V。为了保持 causal 语义，位置 <code>query_pos</code> 最多只能看到 <code>0..query_pos</code>，不能看未来位置。
+      </p>
+      <p class="formula">query_pos = start_pos + t
+valid_len = min(kv_len, query_pos + 1)
+
+score = dot(q_head, k_cache_head) / sqrt(D)
+prob  = softmax(score)
+out   = sum(prob * v_cache_head)</p>
+      <div class="note">
+        <strong>GQA 的关键：</strong>
+        如果 <code>NH=32</code>、<code>KVH=4</code>，那么 8 个 query heads 共享 1 个 KV head。这样 KV cache 体积和 decode 时读取历史 K/V 的带宽都会下降。
+      </div>
+
+      <h3>O projection 和 residual</h3>
+      <p>
+        attention 输出是 <span class="shape">[T,H]</span>。随后经过 <code>o_proj=[H,H]</code>，仍然得到 <span class="shape">[T,H]</span>，最后加回 attention 子层输入：
+      </p>
+      <p class="formula">attn_out: [T,H]
+o_proj:   [H,H]
+ffn_out:  [T,H]
+
+ffn_out += hidden</p>
+    </section>
+
+    <section>
+      <h2>FFN 子层</h2>
+      <p>
+        FFN 是每个 token 独立做的 MLP，不跨 token 混合信息。跨 token 的信息混合已经在 attention 里完成了。
+      </p>
+      <div class="flow">
+        <div class="step">
+          <strong>1. RMSNorm</strong>
+          <span class="shape">ffn_out=[T,H]</span> 经过 <code>ffn_norm=[H]</code> 得到 <span class="shape">normed=[T,H]</span>。
+        </div>
+        <div class="step">
+          <strong>2. 两条上投影分支</strong>
+          <code>gate_proj=[I,H]</code> 产生 <span class="shape">gate=[T,I]</span>，<code>up_proj=[I,H]</code> 产生 <span class="shape">up=[T,I]</span>。
+        </div>
+        <div class="step">
+          <strong>3. SwiGLU</strong>
+          对每个元素做 <code>silu(gate) * up</code>，得到 <span class="shape">swiglu=[T,I]</span>。
+        </div>
+        <div class="step">
+          <strong>4. 下投影</strong>
+          <code>down_proj=[H,I]</code> 把 <span class="shape">[T,I]</span> 压回 <span class="shape">[T,H]</span>。
+        </div>
+        <div class="step">
+          <strong>5. residual add</strong>
+          加回 FFN 子层输入 <span class="shape">ffn_out=[T,H]</span>，得到下一层要用的 <span class="shape">hidden=[T,H]</span>。
+        </div>
+      </div>
+      <p class="formula">gate   = normed @ gate_proj
+up     = normed @ up_proj
+swiglu = silu(gate) * up
+hidden = swiglu @ down_proj
+hidden += ffn_out</p>
+      <div class="warn">
+        <strong>性能直觉：</strong>
+        FFN 的大头是两次 <code>[T,H] x [I,H]</code> 上投影和一次 <code>[T,I] x [H,I]</code> 下投影。prefill 时 <code>T</code> 大，矩阵乘更容易吃满算力；decode 时 <code>T=1</code>，小矩阵乘更容易受内存带宽和调度开销影响。
+      </div>
+    </section>
+
+    <section>
+      <h2>最后如何得到 next token</h2>
+      <p>
+        所有层跑完以后，<code>hidden</code> 仍然是 <span class="shape">[T,H]</span>。当前实现只需要最后一个位置的下一个 token，所以取最后一行：
+      </p>
+      <p class="formula">hidden:      [T,H]
+last_hidden: [1,H]</p>
+      <p>
+        然后做 final RMSNorm，再乘 <code>lm_head=[V,H]</code>：
+      </p>
+      <p class="formula">logits: [1,V]
+logits = last_hidden @ lm_head</p>
+      <p>
+        <code>logits[v]</code> 表示下一个 token 是词表里第 <code>v</code> 个 token 的分数。TinyInfer 当前用 <code>argmax()</code>，直接选择分数最高的 token。
+      </p>
+    </section>
+
+    <section>
+      <h2>prefill 和 decode 的区别</h2>
+      <p>
+        两者走的是同一个 <code>run_layers()</code>，但 <code>T</code>、<code>start_pos</code> 和 KV cache 行为不同。
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>阶段</th>
+              <th>输入 T</th>
+              <th>KV cache</th>
+              <th>主要成本</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>prefill(prompt)</code></td>
+              <td>prompt 长度，通常大于 1</td>
+              <td>从空 cache 开始，一次写入 prompt 的每个位置。</td>
+              <td>大矩阵乘和 attention。因为 <code>T</code> 大，更像吞吐型计算。</td>
+            </tr>
+            <tr>
+              <td><code>decode_one(token)</code></td>
+              <td>通常是 1</td>
+              <td>只写入新 token 的 K/V，但 attention 要读取所有历史 K/V。</td>
+              <td>KV cache 读取带宽、attention 扫历史长度、小 batch matmul 的开销。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="formula">prefill:
+  T = prompt_len
+  start_pos = 0
+  kv_len = prompt_len
+
+decode:
+  T = 1
+  start_pos = cache.seq_len
+  kv_len = cache.seq_len + 1</p>
+      <div class="note">
+        <strong>为什么 KV cache 重要：</strong>
+        没有 KV cache 时，每生成一个新 token 都要重新计算所有历史 token 的 K/V。KV cache 把历史 K/V 存下来，decode 时只计算新 token 的 K/V，然后读历史 cache 做 attention。
+      </div>
+    </section>
+
+    <section>
+      <h2>一张表看所有关键 tensor</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>tensor</th>
+              <th>shape</th>
+              <th>内存归属</th>
+              <th>生命周期</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>token_embedding</code></td>
+              <td><span class="shape">[V,H]</span></td>
+              <td>weights</td>
+              <td>engine 生命周期，只读参数。</td>
+            </tr>
+            <tr>
+              <td><code>q_proj</code></td>
+              <td><span class="shape">[H,H]</span></td>
+              <td>weights</td>
+              <td>每层一个，只读参数。</td>
+            </tr>
+            <tr>
+              <td><code>k_proj</code> / <code>v_proj</code></td>
+              <td><span class="shape">[KVD,H]</span></td>
+              <td>weights</td>
+              <td>每层各一个，只读参数。</td>
+            </tr>
+            <tr>
+              <td><code>o_proj</code></td>
+              <td><span class="shape">[H,H]</span></td>
+              <td>weights</td>
+              <td>每层一个，只读参数。</td>
+            </tr>
+            <tr>
+              <td><code>gate_proj</code> / <code>up_proj</code></td>
+              <td><span class="shape">[I,H]</span></td>
+              <td>weights</td>
+              <td>每层各一个，只读参数。</td>
+            </tr>
+            <tr>
+              <td><code>down_proj</code></td>
+              <td><span class="shape">[H,I]</span></td>
+              <td>weights</td>
+              <td>每层一个，只读参数。</td>
+            </tr>
+            <tr>
+              <td><code>cache_.keys</code> / <code>cache_.values</code></td>
+              <td><span class="shape">[L,KVH,S,D]</span></td>
+              <td>kv_cache</td>
+              <td>一次 generation 期间保存历史 K/V。</td>
+            </tr>
+            <tr>
+              <td><code>hidden</code> / <code>normed</code> / <code>attn_out</code> / <code>ffn_out</code></td>
+              <td><span class="shape">[T,H]</span></td>
+              <td>workspace</td>
+              <td>单次 <code>run_layers()</code> 临时激活。</td>
+            </tr>
+            <tr>
+              <td><code>q</code></td>
+              <td><span class="shape">[T,NH,D]</span></td>
+              <td>workspace</td>
+              <td>单层 attention 临时激活。</td>
+            </tr>
+            <tr>
+              <td><code>k</code> / <code>v</code></td>
+              <td><span class="shape">[T,KVH,D]</span></td>
+              <td>workspace，然后写入 kv_cache</td>
+              <td>当前 token 的 K/V 是临时激活，写进 cache 后成为历史状态。</td>
+            </tr>
+            <tr>
+              <td><code>gate</code> / <code>up</code> / <code>swiglu</code></td>
+              <td><span class="shape">[T,I]</span></td>
+              <td>workspace</td>
+              <td>FFN 临时激活。</td>
+            </tr>
+            <tr>
+              <td><code>logits</code></td>
+              <td><span class="shape">[1,V]</span></td>
+              <td>workspace</td>
+              <td>用于选择 next token。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>MemoryPlan 怎么对应这些 tensor</h2>
+      <p>
+        <code>build_memory_plan()</code> 做的是静态预算。它不真的分配 tensor，只是提前算出 arena 要多大。
+      </p>
+      <h3>weights</h3>
+      <p class="formula">global weights:
+  token_embedding [V,H]
+  final_norm      [H]
+  lm_head         [V,H]
+
+per-layer weights:
+  attn_norm [H]
+  q_proj    [H,H]
+  k_proj    [KVD,H]
+  v_proj    [KVD,H]
+  o_proj    [H,H]
+  ffn_norm  [H]
+  gate_proj [I,H]
+  up_proj   [I,H]
+  down_proj [H,I]</p>
+      <h3>KV cache</h3>
+      <p class="formula">keys   [L,KVH,S,D]
+values [L,KVH,S,D]
+
+kv_elems = 2 * L * KVH * S * D</p>
+      <h3>workspace</h3>
+      <p class="formula">rough scratch budget:
+  7 * S * H   // hidden-like buffers
+  3 * S * I   // FFN intermediate buffers
+  S * V       // logits budget, conservative in current code</p>
+      <p>
+        这里的 workspace 预算偏保守。比如实际 logits 当前只需要 <span class="shape">[1,V]</span>，但 memory plan 里按 <span class="shape">[S,V]</span> 预留。保守预算的好处是简单，不容易不够；坏处是可能浪费内存。
+      </p>
+      <div class="warn">
+        <strong>工程边界：</strong>
+        shape 和 tensor 数量是 Llama 模型知识，放在 <code>llama.cc</code> 合理。alignment 和 padding 是 allocator/backend 知识，后续如果支持 GPU，最好由 backend 或 arena 提供真实对齐规则。
+      </div>
+    </section>
+
+    <section>
+      <h2>硬件视角的直觉</h2>
+      <ul>
+        <li><strong>embedding</strong> 主要是内存读取和拷贝，访问模式由 token id 决定。</li>
+        <li><strong>projection matmul</strong> 是主要算力来源，prefill 时 <code>T</code> 大，更容易利用 SIMD/GPU。</li>
+        <li><strong>decode attention</strong> 常常受 KV cache 读取带宽影响，因为每个新 token 都要扫描越来越长的历史 K/V。</li>
+        <li><strong>GQA</strong> 通过减少 <code>KVH</code> 降低 KV cache 大小和历史读取带宽。</li>
+        <li><strong>workspace arena</strong> 避免 hot path 里反复 heap allocation，内存布局也更容易 debug 和 profile。</li>
+        <li><strong>对齐</strong> 让 tensor 起始地址更适合 cache line、SIMD load、GPU vectorized load。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>读代码建议</h2>
+      <p>
+        建议按这个顺序读代码，能把“数据流”和“内存流”同时串起来：
+      </p>
+      <ol>
+        <li><code>LlamaInferEngine::init()</code>：看三个 arena 如何按 memory plan 分配。</li>
+        <li><code>bind_model()</code>：看 weights arena 里每个参数 tensor 的 shape。</li>
+        <li><code>init_kv_cache()</code>：看 KV cache 的真实 shape。</li>
+        <li><code>prefill()</code> 和 <code>decode_one()</code>：看 workspace reset 和 cache 长度如何推进。</li>
+        <li><code>run_layers()</code>：看 token 到 logits 的完整主路径。</li>
+        <li><code>CpuBackend::attention_out()</code>：看当前 K/V 如何写入 cache，以及 attention 如何读取历史。</li>
+      </ol>
+      <div class="note">
+        <strong>核心心智模型：</strong>
+        权重负责“怎么变换”，workspace 保存“这次正在算什么”，KV cache 保存“过去已经算过什么”。推理就是把这三类数据按层组织起来，让一个 token 一步步变成下一个 token 的概率分布。
+      </div>
+    </section>
+  </main>
+</body>
+</html>
