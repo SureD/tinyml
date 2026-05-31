@@ -2,6 +2,17 @@ cmake_minimum_required(VERSION 3.20)
 
 project(tiny_test LANGUAGES CXX OBJCXX)
 
+include(FetchContent)
+
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+)
+
+FetchContent_MakeAvailable(nlohmann_json)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -10,6 +21,7 @@ add_library(tinyinfer STATIC
     infer/src/cpu_backend.cc
     infer/src/core.cc
     infer/src/llama.cc
+    infer/src/model_loader.cc
     infer/src/metal_backend.mm
 )
 
@@ -17,6 +29,8 @@ target_include_directories(tinyinfer
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/infer/include
 )
+
+target_link_libraries(tinyinfer PRIVATE nlohmann_json::nlohmann_json)
 
 target_compile_options(tinyinfer PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>
@@ -29,6 +43,20 @@ add_executable(tinyinfer_tests
 
 target_link_libraries(tinyinfer_tests PRIVATE tinyinfer)
 target_compile_options(tinyinfer_tests PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(load_checkpoint_smoke
+    tests/cpp/load_checkpoint_smoke.cc
+)
+
+target_link_libraries(load_checkpoint_smoke PRIVATE tinyinfer)
+target_compile_options(load_checkpoint_smoke PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(run_token_ids_smoke
+    tests/cpp/run_token_ids_smoke.cc
+)
+
+target_link_libraries(run_token_ids_smoke PRIVATE tinyinfer)
+target_compile_options(run_token_ids_smoke PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
 add_test(NAME tinyinfer_tests COMMAND tinyinfer_tests)

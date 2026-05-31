@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer Tokenized Inference Smoke Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer Tokenized Inference Smoke Design</h1>
+      <p class="muted">
+        Design doc for the first text-level TinyLlama smoke test. The smoke uses a mature Python tokenizer to produce real token ids, then runs those ids through the C++ TinyInfer engine.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Draft; implementation should follow after review.</span></div>
+        <div><strong>Depends on</strong><span><a href="./safetensors_config_loader_design.html">Safetensors Config Loader Design</a></span></div>
+        <div><strong>Tokenizer</strong><span>Use Python <code>tokenizers</code> library for v1 smoke.</span></div>
+        <div><strong>Main decision</strong><span>Expose a simple script entry; keep tokenizer out of C++ runtime.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Context And Scope</h2>
+      <p>
+        The loader can now load TinyLlama's real config and safetensors checkpoint. A hard-coded token id sequence only proves that the numeric path does not crash. It does not prove that the model is being prompted with real text or that generated token ids can be decoded back into readable output.
+      </p>
+      <p>
+        The next smoke test should use the model's actual tokenizer files. To avoid spending time on tokenizer implementation before the inference path is validated, v1 should use a mature Python tokenizer library as the orchestration layer.
+      </p>
+      <pre>prompt text
+        ↓
+Python tokenizers.Tokenizer.from_file(tokenizer.json)
+        ↓
+real token ids
+        ↓
+C++ TinyInfer engine
+  load config + safetensors
+  prefill + decode token ids
+        ↓
+generated token ids
+        ↓
+Python tokenizer.decode(...)
+        ↓
+readable generated text</pre>
+      <p>
+        This design covers a smoke/integration workflow only. It does not add tokenizer APIs to the C++ runtime and does not implement a full user-facing CLI.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Goals</h2>
+      <ul>
+        <li>Use TinyLlama's real tokenizer files to encode a fixed prompt into real token ids.</li>
+        <li>Run those token ids through the C++ engine loaded with real TinyLlama weights.</li>
+        <li>Decode generated token ids back into text with the same tokenizer.</li>
+        <li>Keep tokenizer code outside the C++ runtime for now.</li>
+        <li>Use a mature library instead of implementing SentencePiece/BPE logic manually.</li>
+        <li>Make the smoke deterministic: greedy argmax, fixed prompt, fixed max token count.</li>
+        <li>Keep the test manual, not part of default <code>ctest</code>, because scalar CPU inference is slow.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Non-Goals</h2>
+      <ul>
+        <li>No C++ tokenizer implementation in this step.</li>
+        <li>No interactive prompt loop.</li>
+        <li>No chat UI and no streaming output.</li>
+        <li>No sampling, temperature, top-p, top-k, repetition penalty, or beam search.</li>
+        <li>No attempt to make CPU inference fast.</li>
+        <li>No default CTest dependency on the 2GB checkpoint.</li>
+        <li>No full tokenizer abstraction in <code>infer/include</code> yet.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Requirements And Constraints</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Requirement</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tokenizer</td>
+              <td>Use Python <code>tokenizers</code> with local <code>tokenizer.json</code>.</td>
+              <td>The reference environment already depends on <code>tokenizers</code>, and it avoids reimplementing tokenizer internals.</td>
+            </tr>
+            <tr>
+              <td>Prompt</td>
+              <td>Use a fixed text prompt checked into the script.</td>
+              <td>The goal is deterministic smoke validation, not user interaction.</td>
+            </tr>
+            <tr>
+              <td>C++ boundary</td>
+              <td>C++ executable should accept token ids and return generated token ids.</td>
+              <td>Keeps C++ runtime focused on inference while Python owns text/token conversion.</td>
+            </tr>
+            <tr>
+              <td>Generation</td>
+              <td>Use greedy argmax only.</td>
+              <td>Matches the current <code>LlamaInferEngine</code> API and keeps output deterministic.</td>
+            </tr>
+            <tr>
+              <td>Runtime cost</td>
+              <td>Keep the default generated token count small.</td>
+              <td>Current CPU backend is scalar f32 and decode is expected to be slow.</td>
+            </tr>
+            <tr>
+              <td>Build</td>
+              <td>Do not require Python tokenizer packages to build the C++ library.</td>
+              <td>Tokenizer orchestration is a smoke tool, not a core runtime dependency.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Proposed Components</h2>
+      <h3>5.1 User-Facing Entry</h3>
+      <pre>./scripts/tinyinfer "Hello, my name is"</pre>
+      <p>
+        This is the command humans should run. It hides tokenizer setup, C++ runner arguments, and token id plumbing. If no prompt argument is provided, it asks for one interactively:
+      </p>
+      <pre>./scripts/tinyinfer
+prompt&gt; Hello, my name is</pre>
+      <p>
+        Internally it runs through the existing Python reference environment with <code>uv</code>, uses the real tokenizer, calls the C++ token runner, decodes the result, and prints text.
+      </p>
+
+      <h3>5.2 Python Prompt Driver</h3>
+      <pre>scripts/tinyinfer_prompt.py</pre>
+      <p>
+        This script owns the actual prompt flow: parse text, encode tokens, call the C++ runner, decode generated tokens, and print a concise answer. It is not a unit test; it is the simple manual inference entry.
+      </p>
+
+      <h3>5.3 Tokenized Smoke Driver</h3>
+      <pre>scripts/run_tokenized_smoke.py</pre>
+      <p>
+        This remains a more verbose diagnostic path. It prints prompt ids, generated ids, elapsed times, and decoded text for debugging.
+      </p>
+
+      <h3>5.4 C++ Token Runner</h3>
+      <pre>tests/cpp/run_token_ids_smoke.cc</pre>
+      <p>
+        The C++ executable should load the model and run inference from token ids passed by the caller. It should print generated token ids in a machine-readable line.
+      </p>
+      <pre>build/run_token_ids_smoke \
+  models/TinyLlama-1.1B-Chat-v1.0 \
+  128 \
+  8 \
+  1 15043 29892 ...</pre>
+      <p>
+        Proposed arguments:
+      </p>
+      <ul>
+        <li><code>argv[1]</code>: model directory.</li>
+        <li><code>argv[2]</code>: max sequence length.</li>
+        <li><code>argv[3]</code>: max new tokens.</li>
+        <li><code>argv[4...]</code>: prompt token ids.</li>
+      </ul>
+      <p>
+        Proposed output:
+      </p>
+      <pre>prompt_tokens: 1 15043 29892 ...
+generated_tokens: 29871 13 ...
+all_tokens: 1 15043 29892 ... 29871 13 ...
+elapsed_sec: 42.0</pre>
+
+      <h3>5.5 Script Layers</h3>
+      <pre>./scripts/tinyinfer
+  ↓
+uv run --project reference python scripts/tinyinfer_prompt.py
+  ↓
+build/run_token_ids_smoke</pre>
+    </section>
+
+    <section>
+      <h2>6. Tokenizer Choice</h2>
+      <p>
+        v1 should use <code>tokenizers.Tokenizer.from_file(model_dir / "tokenizer.json")</code>. This avoids requiring <code>transformers</code> and uses the dependency already present in the reference project.
+      </p>
+      <p>
+        If <code>tokenizer.json</code> turns out not to reproduce Hugging Face behavior exactly enough, the fallback is Python <code>sentencepiece</code> with <code>tokenizer.model</code>. That should remain a smoke-tool dependency, not a core C++ runtime dependency.
+      </p>
+      <p>
+        The smoke should explicitly add BOS when needed. TinyLlama config uses <code>bos_token_id = 1</code> and <code>eos_token_id = 2</code>. The script should print whether the encoded prompt already includes BOS.
+      </p>
+    </section>
+
+    <section>
+      <h2>7. Fixed Prompt</h2>
+      <p>
+        Use a short English prompt first, because tokenization and model behavior are easier to inspect:
+      </p>
+      <pre>prompt = "Hello, my name is"</pre>
+      <p>
+        This prompt should produce real tokenizer ids and a readable continuation. Later prompts can test chat formatting, but chat templates are intentionally deferred.
+      </p>
+    </section>
+
+    <section>
+      <h2>8. Algorithm</h2>
+      <h3>8.1 Python Driver</h3>
+      <pre>load tokenizer.json
+encode fixed prompt
+ensure / prepend BOS if required
+run build/run_token_ids_smoke with token ids
+parse generated_tokens line
+decode prompt tokens, generated tokens, and all tokens
+print text output</pre>
+
+      <h3>8.2 C++ Runner</h3>
+      <pre>parse model_dir, max_seq_len, max_new_tokens, prompt token ids
+create CPU backend
+load engine from model_dir
+engine.prefill(prompt, next)
+append next
+repeat max_new_tokens - 1:
+  engine.decode_one(previous, next)
+  append next
+  stop if next == eos_token_id
+print generated token ids</pre>
+    </section>
+
+    <section>
+      <h2>9. Validation</h2>
+      <ul>
+        <li>C++ runner returns non-empty generated token ids.</li>
+        <li>Every generated token id is less than <code>vocab_size</code>.</li>
+        <li>Python tokenizer decodes generated ids without error.</li>
+        <li>Output text is human-readable enough to inspect manually.</li>
+        <li>Default unit tests still run without Python tokenizer dependencies.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>10. Risks And Mitigations</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Risk</th>
+              <th>Mitigation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>tokenizer.json</code> behavior may differ from full Transformers chat formatting.</td>
+              <td>Start with a plain completion prompt. Defer chat template support.</td>
+            </tr>
+            <tr>
+              <td>Scalar CPU inference may be slow for multiple generated tokens.</td>
+              <td>Default to a small max-new-token count and keep this manual.</td>
+            </tr>
+            <tr>
+              <td>Decoded text may be odd even if math is correct.</td>
+              <td>Use deterministic token output now; add Python reference parity next.</td>
+            </tr>
+            <tr>
+              <td>Python smoke dependencies may not be installed.</td>
+              <td>Run through the existing <code>reference</code> uv environment.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>11. Acceptance Criteria</h2>
+      <ul>
+        <li>Design is implemented as a manual smoke path, not default <code>ctest</code>.</li>
+        <li><code>./scripts/tinyinfer "..."</code> is the preferred manual entry.</li>
+        <li>Python encodes a real prompt using the local TinyLlama tokenizer.</li>
+        <li>C++ engine generates at least one token from the real prompt tokens.</li>
+        <li>Python decodes generated token ids back to text.</li>
+        <li>The smoke output includes prompt text, prompt token ids, generated token ids, decoded continuation text, and elapsed time.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>12. Deferred Work</h2>
+      <ul>
+        <li>Native C++ tokenizer API.</li>
+        <li>Chat template support from <code>tokenizer_config.json</code>.</li>
+        <li>Python reference parity for logits or generated token sequence.</li>
+        <li>Sampling controls and EOS/stopping configuration from <code>generation_config.json</code>.</li>
+        <li>Interactive CLI after correctness is established.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

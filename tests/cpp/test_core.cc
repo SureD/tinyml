@@ -1,8 +1,12 @@
-#include "tinyinfer/llama.h"
+#include "tinyinfer/model_loader.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -59,6 +63,7 @@ static_assert(!HasNativeHandle<MemoryArena>);
 class FakeBackend final : public Backend {
 public:
     std::vector<std::string> calls;
+    std::vector<std::vector<float>> copied_f32;
 
     Device device() const override {
         return {DeviceType::cpu, 0};
@@ -72,9 +77,11 @@ public:
 
     Status copy_from_host(const TensorView& dst, const void* src, size_t bytes) override {
         (void)dst;
-        (void)src;
-        (void)bytes;
         calls.push_back("copy_from_host");
+        if (src != nullptr && bytes != 0 && bytes % sizeof(float) == 0) {
+            const float* values = static_cast<const float*>(src);
+            copied_f32.emplace_back(values, values + bytes / sizeof(float));
+        }
         return Status::success();
     }
 
@@ -207,6 +214,205 @@ void expect_f32_tensor_near(
     }
 }
 
+std::filesystem::path temp_test_path(const char* name) {
+    return std::filesystem::temp_directory_path() / name;
+}
+
+void write_text_file(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    EXPECT_TRUE(static_cast<bool>(file));
+    file.write(text.data(), static_cast<std::streamsize>(text.size()));
+    EXPECT_TRUE(static_cast<bool>(file));
+}
+
+std::string config_json_for(const LlamaConfig& config) {
+    return std::string("{\n") +
+        "  \"model_type\": \"llama\",\n" +
+        "  \"hidden_act\": \"silu\",\n" +
+        "  \"attention_bias\": false,\n" +
+        "  \"tie_word_embeddings\": false,\n" +
+        "  \"pretraining_tp\": 1,\n" +
+        "  \"rope_scaling\": null,\n" +
+        "  \"num_hidden_layers\": " + std::to_string(config.n_layers) + ",\n" +
+        "  \"hidden_size\": " + std::to_string(config.hidden_size) + ",\n" +
+        "  \"intermediate_size\": " + std::to_string(config.intermediate_size) + ",\n" +
+        "  \"num_attention_heads\": " + std::to_string(config.n_heads) + ",\n" +
+        "  \"num_key_value_heads\": " + std::to_string(config.n_kv_heads) + ",\n" +
+        "  \"vocab_size\": " + std::to_string(config.vocab_size) + ",\n" +
+        "  \"max_position_embeddings\": " + std::to_string(config.max_seq_len) + ",\n" +
+        "  \"rms_norm_eps\": 0.00001,\n" +
+        "  \"rope_theta\": 10000.0\n" +
+        "}\n";
+}
+
+uint16_t f32_to_bf16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(float));
+    return static_cast<uint16_t>(bits >> 16);
+}
+
+void append_u64_le(std::vector<unsigned char>& out, uint64_t value) {
+    for (uint32_t i = 0; i < 8; ++i) {
+        out.push_back(static_cast<unsigned char>((value >> (8 * i)) & 0xffU));
+    }
+}
+
+uint64_t fixture_numel(const std::vector<int64_t>& shape) {
+    uint64_t total = 1;
+    for (int64_t dim : shape) {
+        total *= static_cast<uint64_t>(dim);
+    }
+    return total;
+}
+
+std::string shape_json(const std::vector<int64_t>& shape) {
+    std::string out = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i != 0) {
+            out += ",";
+        }
+        out += std::to_string(shape[i]);
+    }
+    out += "]";
+    return out;
+}
+
+struct FixtureTensor {
+    std::string key;
+    std::vector<int64_t> shape;
+    std::string dtype = "F32";
+    float base = 0.0f;
+};
+
+enum class FixtureMode {
+    valid,
+    missing_lm_head,
+    wrong_embedding_shape,
+    unsupported_embedding_dtype,
+};
+
+void add_fixture_tensor(
+    std::vector<FixtureTensor>& tensors,
+    const std::string& key,
+    std::vector<int64_t> shape,
+    float base) {
+    tensors.push_back({key, std::move(shape), "F32", base});
+}
+
+std::vector<FixtureTensor> build_fixture_tensors(
+    const LlamaConfig& config,
+    FixtureMode mode) {
+    std::vector<FixtureTensor> tensors;
+    tensors.reserve(3 + static_cast<size_t>(config.n_layers) * 9);
+
+    const int64_t hidden = config.hidden_size;
+    const int64_t inter = config.intermediate_size;
+    const int64_t kv_dim = config.n_kv_heads * config.head_dim();
+
+    FixtureTensor embedding;
+    embedding.key = "model.embed_tokens.weight";
+    embedding.shape = {
+        mode == FixtureMode::wrong_embedding_shape ? 1 : static_cast<int64_t>(config.vocab_size),
+        hidden,
+    };
+    embedding.dtype = mode == FixtureMode::unsupported_embedding_dtype ? "I64" : "BF16";
+    embedding.base = 1.0f;
+    tensors.push_back(std::move(embedding));
+
+    add_fixture_tensor(tensors, "model.norm.weight", {hidden}, 100.0f);
+    if (mode != FixtureMode::missing_lm_head) {
+        add_fixture_tensor(
+            tensors,
+            "lm_head.weight",
+            {static_cast<int64_t>(config.vocab_size), hidden},
+            200.0f);
+    }
+
+    for (uint32_t i = 0; i < config.n_layers; ++i) {
+        const std::string prefix = "model.layers." + std::to_string(i);
+        const float base = 1000.0f + static_cast<float>(i) * 100.0f;
+        add_fixture_tensor(tensors, prefix + ".input_layernorm.weight", {hidden}, base + 1.0f);
+        add_fixture_tensor(tensors, prefix + ".self_attn.q_proj.weight", {hidden, hidden}, base + 2.0f);
+        add_fixture_tensor(tensors, prefix + ".self_attn.k_proj.weight", {kv_dim, hidden}, base + 3.0f);
+        add_fixture_tensor(tensors, prefix + ".self_attn.v_proj.weight", {kv_dim, hidden}, base + 4.0f);
+        add_fixture_tensor(tensors, prefix + ".self_attn.o_proj.weight", {hidden, hidden}, base + 5.0f);
+        add_fixture_tensor(tensors, prefix + ".post_attention_layernorm.weight", {hidden}, base + 6.0f);
+        add_fixture_tensor(tensors, prefix + ".mlp.gate_proj.weight", {inter, hidden}, base + 7.0f);
+        add_fixture_tensor(tensors, prefix + ".mlp.up_proj.weight", {inter, hidden}, base + 8.0f);
+        add_fixture_tensor(tensors, prefix + ".mlp.down_proj.weight", {hidden, inter}, base + 9.0f);
+    }
+
+    return tensors;
+}
+
+std::vector<unsigned char> fixture_tensor_bytes(const FixtureTensor& tensor) {
+    const uint64_t count = fixture_numel(tensor.shape);
+    std::vector<unsigned char> bytes;
+    if (tensor.dtype == "F32") {
+        bytes.resize(static_cast<size_t>(count) * sizeof(float));
+        for (uint64_t i = 0; i < count; ++i) {
+            const float value = tensor.base + static_cast<float>(i);
+            std::memcpy(
+                bytes.data() + static_cast<size_t>(i) * sizeof(float),
+                &value,
+                sizeof(float));
+        }
+    } else if (tensor.dtype == "BF16") {
+        bytes.resize(static_cast<size_t>(count) * sizeof(uint16_t));
+        for (uint64_t i = 0; i < count; ++i) {
+            const float value = tensor.base + static_cast<float>(i);
+            const uint16_t bf16 = f32_to_bf16(value);
+            std::memcpy(
+                bytes.data() + static_cast<size_t>(i) * sizeof(uint16_t),
+                &bf16,
+                sizeof(uint16_t));
+        }
+    } else {
+        bytes.resize(static_cast<size_t>(count) * sizeof(uint64_t), 0);
+    }
+    return bytes;
+}
+
+void write_safetensors_fixture(
+    const std::filesystem::path& path,
+    const LlamaConfig& config,
+    FixtureMode mode) {
+    std::vector<FixtureTensor> tensors = build_fixture_tensors(config, mode);
+
+    std::string header = "{";
+    std::vector<unsigned char> data;
+    uint64_t offset = 0;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const FixtureTensor& tensor = tensors[i];
+        std::vector<unsigned char> bytes = fixture_tensor_bytes(tensor);
+        const uint64_t begin = offset;
+        const uint64_t end = begin + bytes.size();
+
+        if (i != 0) {
+            header += ",";
+        }
+        header += "\n  \"" + tensor.key + "\": {";
+        header += "\"dtype\": \"" + tensor.dtype + "\", ";
+        header += "\"shape\": " + shape_json(tensor.shape) + ", ";
+        header += "\"data_offsets\": [" + std::to_string(begin) + "," + std::to_string(end) + "]";
+        header += "}";
+
+        data.insert(data.end(), bytes.begin(), bytes.end());
+        offset = end;
+    }
+    header += "\n}";
+
+    std::vector<unsigned char> prefix;
+    append_u64_le(prefix, static_cast<uint64_t>(header.size()));
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    EXPECT_TRUE(static_cast<bool>(file));
+    file.write(reinterpret_cast<const char*>(prefix.data()), static_cast<std::streamsize>(prefix.size()));
+    file.write(header.data(), static_cast<std::streamsize>(header.size()));
+    file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    EXPECT_TRUE(static_cast<bool>(file));
+}
+
 void test_config_validation() {
     LlamaConfig config = LlamaConfig::tinyllama_1_1b();
     EXPECT_TRUE(config.validate());
@@ -215,6 +421,38 @@ void test_config_validation() {
 
     config.hidden_size = 2050;
     EXPECT_EQ(config.validate().code, Status::invalid_config);
+}
+
+void test_model_loader_config_json() {
+    const LlamaConfig expected = LlamaConfig::demo();
+    const std::filesystem::path path = temp_test_path("tinyinfer_config_valid.json");
+    write_text_file(path, config_json_for(expected));
+
+    Result<LlamaConfig> loaded = load_llama_config_json(path.c_str());
+    EXPECT_TRUE(loaded.status);
+    EXPECT_EQ(loaded.value.n_layers, expected.n_layers);
+    EXPECT_EQ(loaded.value.hidden_size, expected.hidden_size);
+    EXPECT_EQ(loaded.value.intermediate_size, expected.intermediate_size);
+    EXPECT_EQ(loaded.value.n_heads, expected.n_heads);
+    EXPECT_EQ(loaded.value.n_kv_heads, expected.n_kv_heads);
+    EXPECT_EQ(loaded.value.vocab_size, expected.vocab_size);
+    EXPECT_EQ(loaded.value.max_seq_len, expected.max_seq_len);
+    EXPECT_NEAR(loaded.value.rms_eps, expected.rms_eps, 1e-9f);
+    EXPECT_NEAR(loaded.value.rope_theta, expected.rope_theta, 1e-5f);
+
+    const std::filesystem::path bad_bias_path = temp_test_path("tinyinfer_config_bad_bias.json");
+    std::string bad_bias = config_json_for(expected);
+    const std::string from = "\"attention_bias\": false";
+    const std::string to = "\"attention_bias\": true";
+    const size_t pos = bad_bias.find(from);
+    EXPECT_TRUE(pos != std::string::npos);
+    bad_bias.replace(pos, from.size(), to);
+    write_text_file(bad_bias_path, bad_bias);
+    EXPECT_EQ(load_llama_config_json(bad_bias_path.c_str()).status.code, Status::invalid_config);
+
+    const std::filesystem::path missing_path = temp_test_path("tinyinfer_config_missing.json");
+    write_text_file(missing_path, "{\"model_type\":\"llama\"}\n");
+    EXPECT_EQ(load_llama_config_json(missing_path.c_str()).status.code, Status::invalid_config);
 }
 
 void test_shape_stride_tensor_view_helpers() {
@@ -771,10 +1009,96 @@ void test_engine_flow_with_fake_backend() {
     EXPECT_TRUE(saw_argmax);
 }
 
+void test_model_loader_safetensors_with_fake_backend() {
+    FakeBackend backend;
+    LlamaConfig config;
+    config.n_layers = 1;
+    config.hidden_size = 4;
+    config.intermediate_size = 8;
+    config.n_heads = 2;
+    config.n_kv_heads = 1;
+    config.vocab_size = 8;
+    config.max_seq_len = 8;
+    config.rms_eps = 1e-5f;
+    config.rope_theta = 10000.0f;
+    EXPECT_TRUE(config.validate());
+
+    Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 8);
+    EXPECT_TRUE(engine.status);
+
+    const std::filesystem::path path = temp_test_path("tinyinfer_valid.safetensors");
+    write_safetensors_fixture(path, config, FixtureMode::valid);
+
+    Status status = load_llama_safetensors(engine.value, path.c_str());
+    EXPECT_TRUE(status);
+
+    const size_t expected_copies = 3 + static_cast<size_t>(config.n_layers) * 9;
+    EXPECT_EQ(backend.copied_f32.size(), expected_copies);
+    EXPECT_TRUE(!backend.copied_f32.empty());
+    if (!backend.copied_f32.empty()) {
+        EXPECT_EQ(backend.copied_f32[0].size(), static_cast<size_t>(config.vocab_size * config.hidden_size));
+        EXPECT_NEAR(backend.copied_f32[0][0], 1.0f, 0.0f);
+        EXPECT_NEAR(backend.copied_f32[0][1], 2.0f, 0.0f);
+        EXPECT_NEAR(backend.copied_f32[0][2], 3.0f, 0.0f);
+        EXPECT_NEAR(backend.copied_f32[0][3], 4.0f, 0.0f);
+    }
+
+    bool saw_synchronize = false;
+    for (const std::string& call : backend.calls) {
+        saw_synchronize = saw_synchronize || call == "synchronize";
+    }
+    EXPECT_TRUE(saw_synchronize);
+}
+
+void test_model_loader_rejects_bad_safetensors() {
+    LlamaConfig config;
+    config.n_layers = 1;
+    config.hidden_size = 4;
+    config.intermediate_size = 8;
+    config.n_heads = 2;
+    config.n_kv_heads = 1;
+    config.vocab_size = 8;
+    config.max_seq_len = 8;
+    config.rms_eps = 1e-5f;
+    config.rope_theta = 10000.0f;
+    EXPECT_TRUE(config.validate());
+
+    {
+        FakeBackend backend;
+        Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 8);
+        EXPECT_TRUE(engine.status);
+        const std::filesystem::path path = temp_test_path("tinyinfer_missing.safetensors");
+        write_safetensors_fixture(path, config, FixtureMode::missing_lm_head);
+        EXPECT_EQ(load_llama_safetensors(engine.value, path.c_str()).code, Status::invalid_argument);
+        EXPECT_TRUE(backend.copied_f32.empty());
+    }
+
+    {
+        FakeBackend backend;
+        Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 8);
+        EXPECT_TRUE(engine.status);
+        const std::filesystem::path path = temp_test_path("tinyinfer_wrong_shape.safetensors");
+        write_safetensors_fixture(path, config, FixtureMode::wrong_embedding_shape);
+        EXPECT_EQ(load_llama_safetensors(engine.value, path.c_str()).code, Status::invalid_argument);
+        EXPECT_TRUE(backend.copied_f32.empty());
+    }
+
+    {
+        FakeBackend backend;
+        Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 8);
+        EXPECT_TRUE(engine.status);
+        const std::filesystem::path path = temp_test_path("tinyinfer_unsupported_dtype.safetensors");
+        write_safetensors_fixture(path, config, FixtureMode::unsupported_embedding_dtype);
+        EXPECT_EQ(load_llama_safetensors(engine.value, path.c_str()).code, Status::unimplemented);
+        EXPECT_TRUE(backend.copied_f32.empty());
+    }
+}
+
 }  // namespace
 
 int main() {
     test_config_validation();
+    test_model_loader_config_json();
     test_shape_stride_tensor_view_helpers();
     test_tensor_view_edge_cases();
     test_arena_reset_reuses_memory();
@@ -786,6 +1110,8 @@ int main() {
     test_cpu_backend_rope();
     test_cpu_backend_attention();
     test_engine_flow_with_fake_backend();
+    test_model_loader_safetensors_with_fake_backend();
+    test_model_loader_rejects_bad_safetensors();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " test failure(s)\n";

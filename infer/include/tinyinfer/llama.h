@@ -10,6 +10,9 @@ namespace tinyinfer {
 
 using TokenId = uint32_t;
 
+class LlamaInferEngine;
+struct HfModelFiles;
+
 struct LlamaConfig {
     uint32_t n_layers = 0;
     uint32_t hidden_size = 0;
@@ -61,6 +64,18 @@ public:
     uint32_t max_seq_len() const;
 
 private:
+    friend Status load_llama_safetensors(
+        LlamaInferEngine& engine,
+        const char* path);
+    friend Result<LlamaInferEngine> load_llama_from_hf_dir(
+        Backend& backend,
+        const char* model_dir,
+        uint32_t max_seq_len);
+    friend Result<LlamaInferEngine> load_llama_from_hf_files(
+        Backend& backend,
+        const HfModelFiles& files,
+        uint32_t max_seq_len);
+
     struct LayerWeights {
         TensorView attn_norm;
         TensorView q_proj;

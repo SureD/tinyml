@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer Safetensors Config Loader Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer Safetensors Config Loader Design</h1>
+      <p class="muted">
+        Design doc for loading Hugging Face LLaMA config and single-file safetensors checkpoints into the existing TinyInfer engine. The first target is TinyLlama-1.1B-Chat-v1.0 with f32 runtime weights.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Draft for implementation review.</span></div>
+        <div><strong>Parent design</strong><span><a href="./design.html">TinyInfer Core Runtime Design</a></span></div>
+        <div><strong>Depends on</strong><span><a href="./tensor_view_design.html">TensorView Design</a>, <a href="./backend_design.html">Backend Design</a></span></div>
+        <div><strong>Main decision</strong><span>Load BF16/F32 checkpoint tensors into existing f32 TensorViews.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Context And Scope</h2>
+      <p>
+        TinyInfer can now create a LLaMA-style engine, allocate arenas, bind model weight views, run token-driven prefill/decode, and execute CPU f32 correctness kernels. The remaining blocker for real inference is that the weight arena is empty. We need a loader that reads a Hugging Face model directory and fills the already-bound engine weights.
+      </p>
+      <pre>Hugging Face model directory
+  config.json
+  model.safetensors
+        ↓
+load LlamaConfig
+        ↓
+LlamaInferEngine::create(...)
+  alloc weights / KV cache / workspace
+  bind internal TensorView weight layout
+        ↓
+load safetensors tensors
+  validate key + dtype + shape + byte range
+  convert BF16/F32 to f32
+  backend.copy_from_host(...)
+        ↓
+engine ready for token-level inference</pre>
+      <p>
+        This design covers local file loading only. It does not cover downloading checkpoints, tokenization, sharded checkpoints, quantization, or optimized backend-specific weight packing.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Goals</h2>
+      <ul>
+        <li>Parse Hugging Face <code>config.json</code> into <code>LlamaConfig</code>.</li>
+        <li>Validate that the config is compatible with the current LLaMA runtime path.</li>
+        <li>Parse a single <code>model.safetensors</code> file without loading the whole file into memory.</li>
+        <li>Map expected Hugging Face tensor names to internal engine weight <code>TensorView</code>s.</li>
+        <li>Load <code>BF16</code> and <code>F32</code> checkpoint data into f32 runtime tensors.</li>
+        <li>Keep model memory ownership inside <code>LlamaInferEngine</code>; the loader only fills existing views.</li>
+        <li>Fail closed on missing keys, wrong shapes, unsupported dtypes, malformed files, or out-of-range offsets.</li>
+        <li>Add small deterministic C++ tests that do not require the 2GB TinyLlama checkpoint.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Non-Goals</h2>
+      <ul>
+        <li>No tokenizer implementation.</li>
+        <li>No Hugging Face download logic.</li>
+        <li>No support for sharded safetensors or <code>model.safetensors.index.json</code> in v1.</li>
+        <li>No support for quantized checkpoints.</li>
+        <li>No runtime transpose, implicit layout conversion, or weight packing.</li>
+        <li>No PyTorch, Python, or external safetensors runtime dependency.</li>
+        <li>No custom JSON parser unless the selected third-party library becomes a real build problem.</li>
+        <li>No support for arbitrary transformer architectures beyond the current LLaMA-style decoder path.</li>
+        <li>No change to CPU/Metal operator contracts in this step.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Requirements And Constraints</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Requirement</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Ownership</td>
+              <td>The loader must not allocate model tensors. It fills <code>LlamaInferEngine</code>'s existing weight views.</td>
+              <td>The engine already owns static memory planning and view binding.</td>
+            </tr>
+            <tr>
+              <td>Layout</td>
+              <td>Loader must not transpose Hugging Face linear weights.</td>
+              <td>Current <code>matmul_out</code> consumes weights as <code>[N,K]</code>, matching HF <code>[out_features,in_features]</code>.</td>
+            </tr>
+            <tr>
+              <td>DType</td>
+              <td>Runtime weights are f32 in v1, regardless of checkpoint dtype.</td>
+              <td>Current CPU kernels and weight arena are f32-only correctness paths.</td>
+            </tr>
+            <tr>
+              <td>Memory</td>
+              <td>Read one tensor at a time, not the full safetensors data section.</td>
+              <td>The TinyLlama checkpoint is about 2GB BF16; full-file buffering is unnecessary.</td>
+            </tr>
+            <tr>
+              <td>Validation</td>
+              <td>Validate tensor key, dtype, rank, shape, byte count, and file range before copying.</td>
+              <td>Checkpoint loading bugs otherwise become silent numerical corruption.</td>
+            </tr>
+            <tr>
+              <td>Backend boundary</td>
+              <td>Use <code>backend.copy_from_host</code> for all writes to TensorViews.</td>
+              <td>The loader should not interpret backend-native arena handles.</td>
+            </tr>
+            <tr>
+              <td>Dependencies</td>
+              <td>Use a small pinned header-only JSON library through CMake <code>FetchContent</code>, and keep the rest of the loader in C++20 standard library code.</td>
+              <td>JSON parsing is not the core system problem. A fixed release tag avoids reinventing a parser while keeping dependency choice explicit.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Proposed API</h2>
+      <p>
+        Add a small public loader API. The full-directory helper is the normal path. The split config/weights functions remain available for tests and debugging.
+      </p>
+      <pre>// infer/include/tinyinfer/model_loader.h
+
+#pragma once
+
+#include "tinyinfer/llama.h"
+
+namespace tinyinfer {
+
+struct HfModelFiles {
+    const char* config_json = nullptr;
+    const char* model_safetensors = nullptr;
+};
+
+Result&lt;LlamaConfig&gt; load_llama_config_json(const char* path);
+
+Status load_llama_safetensors(
+    LlamaInferEngine&amp; engine,
+    const char* path);
+
+Result&lt;LlamaInferEngine&gt; load_llama_from_hf_dir(
+    Backend&amp; backend,
+    const char* model_dir,
+    uint32_t max_seq_len);
+
+Result&lt;LlamaInferEngine&gt; load_llama_from_hf_files(
+    Backend&amp; backend,
+    const HfModelFiles&amp; files,
+    uint32_t max_seq_len);
+
+}  // namespace tinyinfer</pre>
+      <h3>5.1 Example</h3>
+      <pre>auto backend = create_cpu_backend();
+auto engine = load_llama_from_hf_dir(
+    *backend.value,
+    "models/TinyLlama-1.1B-Chat-v1.0",
+    2048);</pre>
+      <h3>5.2 Engine Access</h3>
+      <p>
+        <code>LlamaInferEngine::Model</code> should remain private. The loader needs access to internal weight views, but callers should not. The proposed implementation adds a narrow friend declaration:
+      </p>
+      <pre>friend Status load_llama_safetensors(
+    LlamaInferEngine&amp; engine,
+    const char* path);</pre>
+      <p>
+        This keeps the public inference API small and avoids exposing individual weight accessors that would become long-term compatibility baggage.
+      </p>
+    </section>
+
+    <section>
+      <h2>6. Config Loading</h2>
+      <p>
+        The loader reads Hugging Face LLaMA config fields and maps them into <code>LlamaConfig</code>. Unknown fields are ignored unless they imply unsupported behavior.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>HF key</th>
+              <th>TinyInfer field</th>
+              <th>Required</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>num_hidden_layers</code></td><td><code>n_layers</code></td><td>Yes</td></tr>
+            <tr><td><code>hidden_size</code></td><td><code>hidden_size</code></td><td>Yes</td></tr>
+            <tr><td><code>intermediate_size</code></td><td><code>intermediate_size</code></td><td>Yes</td></tr>
+            <tr><td><code>num_attention_heads</code></td><td><code>n_heads</code></td><td>Yes</td></tr>
+            <tr><td><code>num_key_value_heads</code></td><td><code>n_kv_heads</code></td><td>Yes</td></tr>
+            <tr><td><code>vocab_size</code></td><td><code>vocab_size</code></td><td>Yes</td></tr>
+            <tr><td><code>max_position_embeddings</code></td><td><code>max_seq_len</code></td><td>Yes</td></tr>
+            <tr><td><code>rms_norm_eps</code></td><td><code>rms_eps</code></td><td>Default to <code>1e-5</code> if absent</td></tr>
+            <tr><td><code>rope_theta</code></td><td><code>rope_theta</code></td><td>Default to <code>10000.0</code> if absent</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>6.1 Compatibility Checks</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Field</th>
+              <th>Accepted value</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>model_type</code></td><td><code>"llama"</code></td><td>The engine implements a LLaMA-style decoder path.</td></tr>
+            <tr><td><code>hidden_act</code></td><td><code>"silu"</code></td><td>The MLP path uses SwiGLU with SiLU.</td></tr>
+            <tr><td><code>attention_bias</code></td><td><code>false</code></td><td>Current projection kernels have no bias input.</td></tr>
+            <tr><td><code>tie_word_embeddings</code></td><td><code>false</code></td><td>The engine binds embedding and lm_head as separate TensorViews.</td></tr>
+            <tr><td><code>pretraining_tp</code></td><td><code>1</code></td><td>No tensor-parallel checkpoint reconstruction in v1.</td></tr>
+            <tr><td><code>rope_scaling</code></td><td><code>null</code> or absent</td><td>Current RoPE kernel supports base theta only.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        After field mapping, the loader calls <code>LlamaConfig::validate()</code>. This catches internal invariants such as <code>hidden_size % n_heads == 0</code>, <code>n_heads % n_kv_heads == 0</code>, and even <code>head_dim</code> for RoPE.
+      </p>
+    </section>
+
+    <section>
+      <h2>7. Safetensors Header Loading</h2>
+      <p>
+        Safetensors starts with an 8-byte little-endian header length, followed by a JSON header, followed by raw tensor bytes.
+      </p>
+      <pre>byte[0:8]        uint64 little-endian header_len
+byte[8:8+N]      JSON header
+byte[8+N:end]    raw tensor data</pre>
+      <p>
+        Each tensor entry contains <code>dtype</code>, <code>shape</code>, and <code>data_offsets</code>. Offsets are relative to the start of the raw tensor data section, not the start of the file.
+      </p>
+      <pre>"model.embed_tokens.weight": {
+  "dtype": "BF16",
+  "shape": [32000, 2048],
+  "data_offsets": [131072000, 262144000]
+}</pre>
+      <h3>7.1 Header Validation</h3>
+      <ul>
+        <li><code>header_len</code> must fit in memory and must not exceed file size.</li>
+        <li>Header JSON must parse as an object.</li>
+        <li><code>__metadata__</code> is allowed but is not a tensor entry.</li>
+        <li>Every tensor entry must contain <code>dtype</code>, <code>shape</code>, and <code>data_offsets</code>.</li>
+        <li><code>data_offsets</code> must contain two non-negative integers with <code>begin &lt;= end</code>.</li>
+        <li><code>end - begin</code> must equal <code>numel(shape) * safetensors_dtype_size(dtype)</code>.</li>
+        <li><code>8 + header_len + end</code> must not exceed file size.</li>
+        <li>All offset and byte-size arithmetic must check overflow.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>8. Weight Mapping</h2>
+      <p>
+        The mapping is fixed by the engine's internal model layout. For TinyLlama, <code>head_dim = hidden / n_heads</code> and <code>kv_dim = n_kv_heads * head_dim</code>.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Safetensors key</th>
+              <th>Engine TensorView</th>
+              <th>Expected shape</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>model.embed_tokens.weight</code></td><td><code>model_.token_embedding</code></td><td><code>[vocab, hidden]</code></td></tr>
+            <tr><td><code>model.norm.weight</code></td><td><code>model_.final_norm</code></td><td><code>[hidden]</code></td></tr>
+            <tr><td><code>lm_head.weight</code></td><td><code>model_.lm_head</code></td><td><code>[vocab, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.input_layernorm.weight</code></td><td><code>layers[i].attn_norm</code></td><td><code>[hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.self_attn.q_proj.weight</code></td><td><code>layers[i].q_proj</code></td><td><code>[hidden, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.self_attn.k_proj.weight</code></td><td><code>layers[i].k_proj</code></td><td><code>[kv_dim, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.self_attn.v_proj.weight</code></td><td><code>layers[i].v_proj</code></td><td><code>[kv_dim, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.self_attn.o_proj.weight</code></td><td><code>layers[i].o_proj</code></td><td><code>[hidden, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.post_attention_layernorm.weight</code></td><td><code>layers[i].ffn_norm</code></td><td><code>[hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.mlp.gate_proj.weight</code></td><td><code>layers[i].gate_proj</code></td><td><code>[intermediate, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.mlp.up_proj.weight</code></td><td><code>layers[i].up_proj</code></td><td><code>[intermediate, hidden]</code></td></tr>
+            <tr><td><code>model.layers.{i}.mlp.down_proj.weight</code></td><td><code>layers[i].down_proj</code></td><td><code>[hidden, intermediate]</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Loading is strict. All expected keys must exist. Tensor shape must exactly match the destination view. Unexpected keys are errors except explicitly ignored RoPE cache metadata such as <code>*.self_attn.rotary_emb.inv_freq</code>.
+      </p>
+    </section>
+
+    <section>
+      <h2>9. DType Conversion And Memory Behavior</h2>
+      <p>
+        The v1 runtime uses f32 weights. TinyLlama's checkpoint uses BF16. The loader converts supported input dtypes to f32 before copying.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Safetensors dtype</th>
+              <th>v1 behavior</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>F32</code></td><td>Read into f32 staging buffer and copy.</td><td>No numerical conversion.</td></tr>
+            <tr><td><code>BF16</code></td><td>Read uint16 payload, expand to f32 staging buffer, then copy.</td><td>Required for TinyLlama.</td></tr>
+            <tr><td><code>F16</code></td><td>Return <code>unimplemented</code>.</td><td>Can be added after BF16 path is verified.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre>uint16_t bf16 = ...;
+uint32_t bits = static_cast&lt;uint32_t&gt;(bf16) &lt;&lt; 16;
+float out;
+std::memcpy(&amp;out, &amp;bits, sizeof(float));</pre>
+      <p>
+        The first implementation uses one tensor-sized staging buffer. The largest TinyLlama tensor is <code>32000 * 2048</code> elements, which is 256MB as f32. This is acceptable for a correctness-first loader and keeps the implementation simple.
+      </p>
+      <p>
+        If peak host memory becomes a problem, the same design can be extended to row-chunk loading by constructing contiguous subviews and copying smaller ranges.
+      </p>
+    </section>
+
+    <section>
+      <h2>10. Loading Algorithm</h2>
+      <pre>load_llama_from_hf_dir(backend, model_dir, max_seq_len):
+  config = load_llama_config_json(model_dir + "/config.json")
+  engine = LlamaInferEngine::create(backend, config, max_seq_len)
+  load_llama_safetensors(engine, model_dir + "/model.safetensors")
+  return engine
+
+load_llama_safetensors(engine, path):
+  parse safetensors header
+  expected = build_expected_weight_table(engine)
+
+  for each expected tensor:
+    entry = header.find(expected.key)
+    validate dtype, shape, byte range
+    read raw bytes for this tensor
+    convert to f32 staging buffer if needed
+    backend.copy_from_host(expected.view, staging.data(), expected.view.logical_nbytes())
+
+  validate no unexpected tensor keys remain
+  backend.synchronize()
+  return success</pre>
+      <p>
+        The loader never computes model outputs and never mutates KV cache or workspace. Its only side effect is writing the weight arena through the backend copy API.
+      </p>
+    </section>
+
+    <section>
+      <h2>11. JSON Library</h2>
+      <p>
+        JSON parsing is support code, not the interesting part of the inference system. The loader should use a third-party JSON library for correctness and developer speed instead of maintaining a custom parser.
+      </p>
+      <p>
+        The proposed dependency is <code>nlohmann/json</code>. It is header-only, widely used, easy to integrate through CMake, and sufficient for both Hugging Face <code>config.json</code> and safetensors JSON headers.
+      </p>
+      <pre>FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+)
+
+#include &lt;nlohmann/json.hpp&gt;</pre>
+      <p>
+        The implementation should still wrap direct JSON access in small helper functions such as <code>require_u32</code>, <code>optional_f32</code>, <code>require_string</code>, and <code>require_bool</code>. The library handles parsing; TinyInfer code still owns schema validation and error mapping to <code>Status</code>.
+      </p>
+      <p>
+        The dependency should be pinned to a fixed released tag. First configure requires network access unless the CMake dependency cache already has the source; normal rebuilds then use the cached copy under the build directory.
+      </p>
+    </section>
+
+    <section>
+      <h2>12. Error Handling</h2>
+      <p>
+        The implementation continues using the existing <code>Status</code> and <code>Result&lt;T&gt;</code> types.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>File cannot be opened or read</td><td><code>invalid_argument</code></td></tr>
+            <tr><td>Malformed JSON or safetensors header</td><td><code>invalid_argument</code></td></tr>
+            <tr><td>Unsupported config semantics</td><td><code>invalid_config</code></td></tr>
+            <tr><td>Missing key, unexpected key, wrong shape, wrong byte range</td><td><code>invalid_argument</code></td></tr>
+            <tr><td>Unsupported checkpoint dtype</td><td><code>unimplemented</code></td></tr>
+            <tr><td>Backend copy failure</td><td>Return backend status unchanged</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        The current <code>Status</code> stores <code>const char*</code>, so v1 errors use stable fixed messages. If loader debugging becomes painful, upgrading <code>Status</code> to carry owned error text should be a separate change.
+      </p>
+    </section>
+
+    <section>
+      <h2>13. Alternatives Considered</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Alternative</th>
+              <th>Decision</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Expose public weight TensorView accessors on <code>LlamaInferEngine</code></td>
+              <td>Rejected</td>
+              <td>Leaks internal model layout into public API and makes future weight packing harder.</td>
+            </tr>
+            <tr>
+              <td>Loader allocates its own weight tensors</td>
+              <td>Rejected</td>
+              <td>Conflicts with current arena ownership model and static memory planning.</td>
+            </tr>
+            <tr>
+              <td>Transpose weights while loading</td>
+              <td>Rejected</td>
+              <td>Current matmul already matches Hugging Face layout. A transpose would add confusion and memory cost.</td>
+            </tr>
+            <tr>
+              <td>Write a custom JSON parser</td>
+              <td>Rejected</td>
+              <td>JSON parsing is not the point of this runtime. A third-party parser reduces bugs and keeps loader work focused.</td>
+            </tr>
+            <tr>
+              <td>Use <code>nlohmann/json</code> for config and safetensors header JSON</td>
+              <td>Accepted</td>
+              <td>Header-only, convenient, widely used, and not on the inference hot path.</td>
+            </tr>
+            <tr>
+              <td>Use an external safetensors C++ library</td>
+              <td>Rejected for v1</td>
+              <td>The binary container is simple enough to parse directly, and manual byte-range validation is central to this loader.</td>
+            </tr>
+            <tr>
+              <td>Store BF16 weights in runtime arena immediately</td>
+              <td>Deferred</td>
+              <td>Requires kernel and memory-plan changes. Correctness-first f32 loading is simpler.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>14. Risks And Mitigations</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Risk</th>
+              <th>Mitigation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>F32-expanded TinyLlama weights require about 4GB.</td>
+              <td>Accept for v1 correctness. Later add BF16/F16 weight arena and kernels.</td>
+            </tr>
+            <tr>
+              <td>Manual safetensors parsing can mishandle offsets.</td>
+              <td>Strict byte-range validation and small fixture tests for malformed headers.</td>
+            </tr>
+            <tr>
+              <td>Status messages may be too generic for large checkpoints.</td>
+              <td>Start with stable messages; upgrade error type separately if needed.</td>
+            </tr>
+            <tr>
+              <td>Single tensor staging buffer can still be large.</td>
+              <td>Keep implementation simple first; row-chunk loading is a compatible follow-up.</td>
+            </tr>
+            <tr>
+              <td>Config loader may accept unsupported future LLaMA variants.</td>
+              <td>Fail closed on known unsupported semantics such as bias, rope scaling, and tied embeddings.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>15. Test Plan</h2>
+      <ul>
+        <li>Parse a minimal valid <code>config.json</code> and compare every <code>LlamaConfig</code> field.</li>
+        <li>Reject missing required config fields.</li>
+        <li>Reject unsupported config values such as <code>attention_bias=true</code> or <code>rope_scaling</code> object.</li>
+        <li>Parse a tiny safetensors file with <code>F32</code> tensors and load into CPU backend.</li>
+        <li>Parse a tiny safetensors file with <code>BF16</code> tensors and verify f32 expansion values.</li>
+        <li>Reject missing weight keys, unexpected keys, wrong shapes, wrong byte ranges, and unsupported dtypes.</li>
+        <li>Load a complete demo-model safetensors fixture matching <code>LlamaConfig::demo()</code>.</li>
+        <li>Run <code>cmake --build build</code> and <code>ctest --test-dir build --output-on-failure</code>.</li>
+      </ul>
+      <p>
+        The real 2GB TinyLlama checkpoint should be used as a manual or integration test, not as a default unit test dependency.
+      </p>
+    </section>
+
+    <section>
+      <h2>16. Acceptance Criteria</h2>
+      <ul>
+        <li><code>load_llama_config_json</code> loads the local TinyLlama config and matches <code>LlamaConfig::tinyllama_1_1b()</code>.</li>
+        <li><code>load_llama_from_hf_dir</code> creates an engine and fills all expected weights from local <code>models/TinyLlama-1.1B-Chat-v1.0</code>.</li>
+        <li>Small C++ fixture tests cover config parsing, safetensors header parsing, dtype conversion, and strict key/shape validation.</li>
+        <li>No public API exposes raw model weight internals.</li>
+        <li>No operator implementation changes are required for loading.</li>
+        <li>The only third-party dependency is <code>nlohmann/json</code>, fetched by CMake from fixed tag <code>v3.11.3</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>17. Implementation Plan</h2>
+      <ol>
+        <li>Fetch pinned <code>nlohmann/json</code> with CMake <code>FetchContent</code> and link its imported target.</li>
+        <li>Add small JSON schema access helpers for fixed <code>Status</code> error mapping.</li>
+        <li>Add <code>model_loader.h</code> public declarations.</li>
+        <li>Implement <code>load_llama_config_json</code> and config validation.</li>
+        <li>Add safetensors header parser and tensor metadata validation.</li>
+        <li>Add expected weight table builder using engine internal TensorViews.</li>
+        <li>Implement <code>F32</code> and <code>BF16</code> tensor loading into f32 staging buffers.</li>
+        <li>Add CMake entries and C++ tests.</li>
+        <li>Manually load the local TinyLlama checkpoint on CPU.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>18. Deferred Work</h2>
+      <ul>
+        <li>Tokenizer integration.</li>
+        <li>End-to-end prompt text generation.</li>
+        <li>Sharded safetensors support.</li>
+        <li>F16 input conversion.</li>
+        <li>BF16/F16 runtime weight storage.</li>
+        <li>Chunked loading to lower peak staging memory.</li>
+        <li>Metal-specific upload and packed weight layout.</li>
+        <li>Python reference parity tool comparing logits for fixed token inputs.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
