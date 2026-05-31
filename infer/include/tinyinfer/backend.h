@@ -29,28 +29,28 @@ public:
         const TensorView& src,
         size_t bytes) = 0;
 
-    virtual Status matmul_out(
+    virtual void matmul_out(
         const TensorView& out,
         const TensorView& x,
         const TensorView& w) = 0;
-    virtual Status embedding_out(
+    virtual void embedding_out(
         const TensorView& out,
         const TensorView& table,
         std::span<const uint32_t> token_ids) = 0;
-    virtual Status add_inplace(
+    virtual void add_inplace(
         const TensorView& dst,
         const TensorView& src) = 0;
-    virtual Status rms_norm_out(
+    virtual void rms_norm_out(
         const TensorView& out,
         const TensorView& x,
         const TensorView& weight,
         float eps) = 0;
-    virtual Status rope_inplace(
+    virtual void rope_inplace(
         const TensorView& q,
         const TensorView& k,
         uint32_t start_pos,
         float theta) = 0;
-    virtual Status attention_out(
+    virtual void attention_out(
         const TensorView& out,
         const TensorView& q,
         const TensorView& k,
@@ -59,11 +59,11 @@ public:
         const TensorView& v_cache,
         uint32_t start_pos,
         uint32_t kv_len) = 0;
-    virtual Status swiglu_out(
+    virtual void swiglu_out(
         const TensorView& out,
         const TensorView& gate,
         const TensorView& up) = 0;
-    virtual Status argmax(
+    virtual void argmax(
         uint32_t& out_token,
         const TensorView& logits) = 0;
 
@@ -80,7 +80,7 @@ protected:
     bool owns_arena(const MemoryArena& arena) const;
     void* arena_handle(const MemoryArena& arena) const;
 
-    virtual Status release_arena(MemoryArena& arena) = 0;
+    virtual void release_arena(MemoryArena& arena) noexcept = 0;
 };
 
 Result<std::unique_ptr<Backend>> create_cpu_backend();

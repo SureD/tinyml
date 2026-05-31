@@ -67,6 +67,8 @@ struct Result {
     explicit operator bool() const { return static_cast<bool>(status); }
 };
 
+[[noreturn]] void panic(const char* message, const char* file, int line);
+
 size_t dtype_size(DType dtype);
 
 struct Shape {

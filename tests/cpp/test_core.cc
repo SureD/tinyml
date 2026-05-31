@@ -93,15 +93,14 @@ public:
         return Status::success();
     }
 
-    Status matmul_out(const TensorView& out, const TensorView& x, const TensorView& w) override {
+    void matmul_out(const TensorView& out, const TensorView& x, const TensorView& w) override {
         (void)out;
         (void)x;
         (void)w;
         calls.push_back("matmul");
-        return Status::success();
     }
 
-    Status embedding_out(
+    void embedding_out(
         const TensorView& out,
         const TensorView& table,
         std::span<const uint32_t> token_ids) override {
@@ -109,17 +108,15 @@ public:
         (void)table;
         (void)token_ids;
         calls.push_back("embedding");
-        return Status::success();
     }
 
-    Status add_inplace(const TensorView& dst, const TensorView& src) override {
+    void add_inplace(const TensorView& dst, const TensorView& src) override {
         (void)dst;
         (void)src;
         calls.push_back("add");
-        return Status::success();
     }
 
-    Status rms_norm_out(
+    void rms_norm_out(
         const TensorView& out,
         const TensorView& x,
         const TensorView& weight,
@@ -129,10 +126,9 @@ public:
         (void)weight;
         (void)eps;
         calls.push_back("rms_norm");
-        return Status::success();
     }
 
-    Status rope_inplace(
+    void rope_inplace(
         const TensorView& q,
         const TensorView& k,
         uint32_t start_pos,
@@ -142,10 +138,9 @@ public:
         (void)start_pos;
         (void)theta;
         calls.push_back("rope");
-        return Status::success();
     }
 
-    Status attention_out(
+    void attention_out(
         const TensorView& out,
         const TensorView& q,
         const TensorView& k,
@@ -163,10 +158,9 @@ public:
         (void)start_pos;
         (void)kv_len;
         calls.push_back("attention");
-        return Status::success();
     }
 
-    Status swiglu_out(
+    void swiglu_out(
         const TensorView& out,
         const TensorView& gate,
         const TensorView& up) override {
@@ -174,14 +168,12 @@ public:
         (void)gate;
         (void)up;
         calls.push_back("swiglu");
-        return Status::success();
     }
 
-    Status argmax(uint32_t& out_token, const TensorView& logits) override {
+    void argmax(uint32_t& out_token, const TensorView& logits) override {
         (void)logits;
         calls.push_back("argmax");
         out_token = 42;
-        return Status::success();
     }
 
     Status synchronize() override {
@@ -190,10 +182,9 @@ public:
     }
 
 protected:
-    Status release_arena(MemoryArena& arena) override {
+    void release_arena(MemoryArena& arena) noexcept override {
         (void)arena;
         calls.push_back("release_arena");
-        return Status::success();
     }
 };
 
@@ -622,7 +613,7 @@ void test_cpu_backend_argmax() {
     EXPECT_TRUE(backend.value->copy_from_host(logits.value, input, sizeof(input)));
 
     uint32_t token = 99;
-    EXPECT_TRUE(backend.value->argmax(token, logits.value));
+    backend.value->argmax(token, logits.value);
     EXPECT_EQ(token, 1u);
 
     Result<TensorView> batched_logits = arena.alloc(make_shape({1, 4}), DType::f32);
@@ -632,27 +623,8 @@ void test_cpu_backend_argmax() {
         batched_logits.value,
         batched_input,
         sizeof(batched_input)));
-    EXPECT_TRUE(backend.value->argmax(token, batched_logits.value));
+    backend.value->argmax(token, batched_logits.value);
     EXPECT_EQ(token, 2u);
-
-    Result<TensorView> f16_logits = arena.alloc(make_shape({4}), DType::f16);
-    EXPECT_TRUE(f16_logits.status);
-    EXPECT_EQ(backend.value->argmax(token, f16_logits.value).code, Status::unimplemented);
-
-    TensorView non_contiguous = logits.value;
-    non_contiguous.strides.values[0] = 2;
-    EXPECT_EQ(backend.value->argmax(token, non_contiguous).code, Status::invalid_argument);
-
-    Result<TensorView> bad_rank = arena.alloc(make_shape({1, 1, 5}), DType::f32);
-    EXPECT_TRUE(bad_rank.status);
-    EXPECT_EQ(backend.value->argmax(token, bad_rank.value).code, Status::invalid_argument);
-
-    FakeBackend foreign_backend;
-    MemoryArena foreign_arena;
-    EXPECT_TRUE(foreign_backend.alloc_arena(foreign_arena, 256, MemoryKind::workspace));
-    Result<TensorView> foreign_logits = foreign_arena.alloc(make_shape({4}), DType::f32);
-    EXPECT_TRUE(foreign_logits.status);
-    EXPECT_EQ(backend.value->argmax(token, foreign_logits.value).code, Status::invalid_argument);
 }
 
 void test_cpu_backend_matmul() {
@@ -680,20 +652,13 @@ void test_cpu_backend_matmul() {
     copy_f32_to_tensor(*backend.value, x.value, x_values);
     copy_f32_to_tensor(*backend.value, w.value, w_values);
 
-    EXPECT_TRUE(backend.value->matmul_out(out.value, x.value, w.value));
+    backend.value->matmul_out(out.value, x.value, w.value);
     expect_f32_tensor_near(*backend.value, out.value, {140.0f, -2.0f, 320.0f, -2.0f});
 
     Result<TensorView> out3 = arena.alloc(make_shape({2, 1, 2}), DType::f32);
     EXPECT_TRUE(out3.status);
-    EXPECT_TRUE(backend.value->matmul_out(out3.value, x.value, w.value));
+    backend.value->matmul_out(out3.value, x.value, w.value);
     expect_f32_tensor_near(*backend.value, out3.value, {140.0f, -2.0f, 320.0f, -2.0f});
-
-    Result<TensorView> bad_w = arena.alloc(make_shape({3, 2}), DType::f32);
-    Result<TensorView> bad_out = arena.alloc(make_shape({2, 3}), DType::f32);
-    EXPECT_TRUE(bad_w.status);
-    EXPECT_TRUE(bad_out.status);
-    EXPECT_EQ(backend.value->matmul_out(out.value, x.value, bad_w.value).code, Status::invalid_argument);
-    EXPECT_EQ(backend.value->matmul_out(bad_out.value, x.value, w.value).code, Status::invalid_argument);
 }
 
 void test_cpu_backend_embedding_and_add() {
@@ -717,16 +682,11 @@ void test_cpu_backend_embedding_and_add() {
     copy_f32_to_tensor(*backend.value, table.value, table_values);
 
     const uint32_t tokens[] = {2, 0};
-    EXPECT_TRUE(backend.value->embedding_out(out.value, table.value, tokens));
+    backend.value->embedding_out(out.value, table.value, tokens);
     expect_f32_tensor_near(*backend.value, out.value, {
         7.0f, 8.0f, 9.0f,
         1.0f, 2.0f, 3.0f,
     });
-
-    const uint32_t bad_tokens[] = {4};
-    EXPECT_EQ(
-        backend.value->embedding_out(out.value, table.value, bad_tokens).code,
-        Status::invalid_argument);
 
     Result<TensorView> add_src = arena.alloc(make_shape({2, 3}), DType::f32);
     EXPECT_TRUE(add_src.status);
@@ -736,17 +696,11 @@ void test_cpu_backend_embedding_and_add() {
     };
     copy_f32_to_tensor(*backend.value, add_src.value, add_values);
 
-    EXPECT_TRUE(backend.value->add_inplace(out.value, add_src.value));
+    backend.value->add_inplace(out.value, add_src.value);
     expect_f32_tensor_near(*backend.value, out.value, {
         7.5f, 7.0f, 11.0f,
         4.0f, 6.0f, -2.0f,
     });
-
-    Result<TensorView> bad_add = arena.alloc(make_shape({3}), DType::f32);
-    EXPECT_TRUE(bad_add.status);
-    EXPECT_EQ(
-        backend.value->add_inplace(out.value, bad_add.value).code,
-        Status::invalid_argument);
 }
 
 void test_cpu_backend_rms_norm_and_swiglu() {
@@ -772,7 +726,7 @@ void test_cpu_backend_rms_norm_and_swiglu() {
     copy_f32_to_tensor(*backend.value, weight.value, weight_values);
 
     constexpr float eps = 1e-5f;
-    EXPECT_TRUE(backend.value->rms_norm_out(out.value, x.value, weight.value, eps));
+    backend.value->rms_norm_out(out.value, x.value, weight.value, eps);
 
     std::vector<float> expected_rms;
     for (int row = 0; row < 2; ++row) {
@@ -788,9 +742,6 @@ void test_cpu_backend_rms_norm_and_swiglu() {
         }
     }
     expect_f32_tensor_near(*backend.value, out.value, expected_rms);
-    EXPECT_EQ(
-        backend.value->rms_norm_out(out.value, x.value, weight.value, 0.0f).code,
-        Status::invalid_argument);
 
     Result<TensorView> gate = arena.alloc(make_shape({3}), DType::f32);
     Result<TensorView> up = arena.alloc(make_shape({3}), DType::f32);
@@ -804,7 +755,7 @@ void test_cpu_backend_rms_norm_and_swiglu() {
     copy_f32_to_tensor(*backend.value, gate.value, gate_values);
     copy_f32_to_tensor(*backend.value, up.value, up_values);
 
-    EXPECT_TRUE(backend.value->swiglu_out(swiglu.value, gate.value, up.value));
+    backend.value->swiglu_out(swiglu.value, gate.value, up.value);
     expect_f32_tensor_near(
         *backend.value,
         swiglu.value,
@@ -833,7 +784,7 @@ void test_cpu_backend_rope() {
     copy_f32_to_tensor(*backend.value, k.value, k_values);
 
     constexpr float theta = 10000.0f;
-    EXPECT_TRUE(backend.value->rope_inplace(q.value, k.value, 1, theta));
+    backend.value->rope_inplace(q.value, k.value, 1, theta);
 
     auto expected_rope = [](const float* values) {
         std::vector<float> expected(values, values + 4);
@@ -852,7 +803,6 @@ void test_cpu_backend_rope() {
 
     expect_f32_tensor_near(*backend.value, q.value, expected_rope(q_values));
     expect_f32_tensor_near(*backend.value, k.value, expected_rope(k_values));
-    EXPECT_EQ(backend.value->rope_inplace(q.value, k.value, 0, 0.0f).code, Status::invalid_argument);
 }
 
 void test_cpu_backend_attention() {
@@ -901,7 +851,7 @@ void test_cpu_backend_attention() {
     copy_f32_to_tensor(*backend.value, k_cache.value, zero_cache);
     copy_f32_to_tensor(*backend.value, v_cache.value, zero_cache);
 
-    EXPECT_TRUE(backend.value->attention_out(
+    backend.value->attention_out(
         out.value,
         q.value,
         k.value,
@@ -909,7 +859,7 @@ void test_cpu_backend_attention() {
         k_cache.value,
         v_cache.value,
         0,
-        2));
+        2);
 
     const float a = 1.0f / std::sqrt(2.0f);
     const float exp_a = std::exp(a);
@@ -947,18 +897,6 @@ void test_cpu_backend_attention() {
             0.0f, 0.0f,
             0.0f, 0.0f,
         });
-    EXPECT_EQ(
-        backend.value->attention_out(
-            out.value,
-            q.value,
-            k.value,
-            v.value,
-            k_cache.value,
-            v_cache.value,
-            0,
-            1)
-            .code,
-        Status::invalid_argument);
 }
 
 void test_engine_flow_with_fake_backend() {
@@ -989,6 +927,18 @@ void test_engine_flow_with_fake_backend() {
     EXPECT_EQ(output[2], 3u);
     EXPECT_EQ(output[3], 42u);
     EXPECT_EQ(output[4], 42u);
+
+    const TokenId bad_prompt[] = {config.vocab_size};
+    TokenId bad_output[2] = {};
+    uint32_t bad_output_count = 0;
+    EXPECT_EQ(
+        engine.value.generate(
+            bad_prompt,
+            bad_output,
+            GenerateConfig{1, 2, true},
+            bad_output_count)
+            .code,
+        Status::invalid_argument);
 
     bool saw_attention = false;
     bool saw_argmax = false;

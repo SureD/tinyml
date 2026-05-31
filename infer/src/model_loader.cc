@@ -642,11 +642,6 @@ Result<LlamaConfig> load_llama_config_json(const char* path) {
 Status load_llama_safetensors(
     LlamaInferEngine& engine,
     const char* path) {
-    Status status = engine.check_ready();
-    if (!status) {
-        return status;
-    }
-
     Result<SafeTensorsHeader> header = parse_safetensors_header(path);
     if (!header.status) {
         return header.status;
@@ -677,7 +672,7 @@ Status load_llama_safetensors(
         expected_keys.insert(item.key);
     }
 
-    status = validate_no_unexpected_tensors(header.value, expected_keys);
+    Status status = validate_no_unexpected_tensors(header.value, expected_keys);
     if (!status) {
         return status;
     }

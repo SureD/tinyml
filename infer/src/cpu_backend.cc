@@ -78,39 +78,13 @@ public:
         return Status::success();
     }
 
-    Status matmul_out(
+    void matmul_out(
         const TensorView& out,
         const TensorView& x,
         const TensorView& w) override {
-        Status status = validate_f32_contiguous(out);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(x);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(w);
-        if (!status) {
-            return status;
-        }
-        if (x.shape.ndim != 2 || w.shape.ndim != 2) {
-            return Status::invalid_argument_status("matmul expects x=[M,K] and w=[N,K]");
-        }
-        if (out.shape.ndim != 2 && out.shape.ndim != 3) {
-            return Status::invalid_argument_status("matmul output expects rank 2 or rank 3");
-        }
-
         const int64_t m = x.dim(0);
         const int64_t k = x.dim(1);
         const int64_t n = w.dim(0);
-        if (m <= 0 || k <= 0 || n <= 0 || w.dim(1) != k) {
-            return Status::invalid_argument_status("matmul shape mismatch");
-        }
-        if (out.dim(0) != m || out.numel() != m * n) {
-            return Status::invalid_argument_status("matmul output shape mismatch");
-        }
-
         const float* x_data = f32_data(x);
         const float* w_data = f32_data(w);
         float* out_data = f32_data(out);
@@ -123,99 +97,39 @@ public:
                 out_data[row * n + col] = sum;
             }
         }
-        return Status::success();
     }
 
-    Status embedding_out(
+    void embedding_out(
         const TensorView& out,
         const TensorView& table,
         std::span<const uint32_t> token_ids) override {
-        Status status = validate_f32_contiguous(out);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(table);
-        if (!status) {
-            return status;
-        }
-        if (token_ids.empty()) {
-            return Status::invalid_argument_status("embedding token_ids must not be empty");
-        }
-        if (out.shape.ndim != 2 || table.shape.ndim != 2) {
-            return Status::invalid_argument_status("embedding expects out=[T,H], table=[V,H]");
-        }
-        if (out.dim(0) != static_cast<int64_t>(token_ids.size()) ||
-            out.dim(1) != table.dim(1)) {
-            return Status::invalid_argument_status("embedding output shape mismatch");
-        }
-
-        const int64_t vocab = table.dim(0);
         const int64_t hidden = table.dim(1);
         const float* table_data = f32_data(table);
         float* out_data = f32_data(out);
         for (size_t t = 0; t < token_ids.size(); ++t) {
             const uint32_t token = token_ids[t];
-            if (static_cast<int64_t>(token) >= vocab) {
-                return Status::invalid_argument_status("embedding token id exceeds vocab size");
-            }
             const float* src = table_data + static_cast<int64_t>(token) * hidden;
             float* dst = out_data + static_cast<int64_t>(t) * hidden;
             std::memcpy(dst, src, static_cast<size_t>(hidden) * sizeof(float));
         }
-        return Status::success();
     }
 
-    Status add_inplace(
+    void add_inplace(
         const TensorView& dst,
         const TensorView& src) override {
-        Status status = validate_f32_contiguous(dst);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(src);
-        if (!status) {
-            return status;
-        }
-        if (!same_shape(dst, src)) {
-            return Status::invalid_argument_status("add shape mismatch");
-        }
-
         float* dst_data = f32_data(dst);
         const float* src_data = f32_data(src);
         const int64_t count = dst.numel();
         for (int64_t i = 0; i < count; ++i) {
             dst_data[i] += src_data[i];
         }
-        return Status::success();
     }
 
-    Status rms_norm_out(
+    void rms_norm_out(
         const TensorView& out,
         const TensorView& x,
         const TensorView& weight,
         float eps) override {
-        Status status = validate_f32_contiguous(out);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(x);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(weight);
-        if (!status) {
-            return status;
-        }
-        if (eps <= 0.0f) {
-            return Status::invalid_argument_status("RMSNorm eps must be positive");
-        }
-        if (x.shape.ndim != 2 || weight.shape.ndim != 1) {
-            return Status::invalid_argument_status("RMSNorm expects x=[T,H] and weight=[H]");
-        }
-        if (!same_shape(out, x) || weight.dim(0) != x.dim(1)) {
-            return Status::invalid_argument_status("RMSNorm shape mismatch");
-        }
-
         const int64_t rows = x.dim(0);
         const int64_t hidden = x.dim(1);
         const float* x_data = f32_data(x);
@@ -235,41 +149,18 @@ public:
                 out_row[i] = x_row[i] * scale * weight_data[i];
             }
         }
-        return Status::success();
     }
 
-    Status rope_inplace(
+    void rope_inplace(
         const TensorView& q,
         const TensorView& k,
         uint32_t start_pos,
         float theta) override {
-        Status status = validate_f32_contiguous(q);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(k);
-        if (!status) {
-            return status;
-        }
-        if (theta <= 0.0f) {
-            return Status::invalid_argument_status("RoPE theta must be positive");
-        }
-        if (q.shape.ndim != 3 || k.shape.ndim != 3) {
-            return Status::invalid_argument_status("RoPE expects q=[T,H,D] and k=[T,KVH,D]");
-        }
-        if (q.dim(0) != k.dim(0) || q.dim(2) != k.dim(2)) {
-            return Status::invalid_argument_status("RoPE q/k shape mismatch");
-        }
-        if ((q.dim(2) % 2) != 0) {
-            return Status::invalid_argument_status("RoPE head dimension must be even");
-        }
-
         apply_rope(f32_data(q), q.dim(0), q.dim(1), q.dim(2), start_pos, theta);
         apply_rope(f32_data(k), k.dim(0), k.dim(1), k.dim(2), start_pos, theta);
-        return Status::success();
     }
 
-    Status attention_out(
+    void attention_out(
         const TensorView& out,
         const TensorView& q,
         const TensorView& k,
@@ -278,71 +169,10 @@ public:
         const TensorView& v_cache,
         uint32_t start_pos,
         uint32_t kv_len) override {
-        Status status = validate_f32_contiguous(out);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(q);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(k);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(v);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(k_cache);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(v_cache);
-        if (!status) {
-            return status;
-        }
-        if (q.shape.ndim != 3 || k.shape.ndim != 3 || v.shape.ndim != 3) {
-            return Status::invalid_argument_status(
-                "attention expects q=[T,H,D], k=[T,KVH,D], v=[T,KVH,D]");
-        }
-        if (k_cache.shape.ndim != 3 || v_cache.shape.ndim != 3) {
-            return Status::invalid_argument_status(
-                "attention cache expects [KVH,S,D] per layer");
-        }
-        if (out.shape.ndim != 2 && out.shape.ndim != 3) {
-            return Status::invalid_argument_status("attention output expects rank 2 or rank 3");
-        }
-
         const int64_t seq_len = q.dim(0);
         const int64_t n_heads = q.dim(1);
         const int64_t n_kv_heads = k.dim(1);
         const int64_t head_dim = q.dim(2);
-        if (seq_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0) {
-            return Status::invalid_argument_status("attention dimensions must be positive");
-        }
-        if (k.dim(0) != seq_len || v.dim(0) != seq_len ||
-            v.dim(1) != n_kv_heads || k.dim(2) != head_dim || v.dim(2) != head_dim) {
-            return Status::invalid_argument_status("attention q/k/v shape mismatch");
-        }
-        if (k_cache.dim(0) != n_kv_heads || v_cache.dim(0) != n_kv_heads ||
-            k_cache.dim(2) != head_dim || v_cache.dim(2) != head_dim ||
-            k_cache.dim(1) != v_cache.dim(1)) {
-            return Status::invalid_argument_status("attention cache shape mismatch");
-        }
-        if ((n_heads % n_kv_heads) != 0) {
-            return Status::invalid_argument_status("attention heads must be divisible by KV heads");
-        }
-        if (out.dim(0) != seq_len || out.numel() != seq_len * n_heads * head_dim) {
-            return Status::invalid_argument_status("attention output shape mismatch");
-        }
-        if (kv_len == 0 || kv_len > static_cast<uint32_t>(k_cache.dim(1))) {
-            return Status::invalid_argument_status("attention kv_len exceeds cache capacity");
-        }
-        if (start_pos > kv_len ||
-            static_cast<uint32_t>(seq_len) > kv_len - start_pos) {
-            return Status::invalid_argument_status("attention current tokens exceed kv_len");
-        }
 
         write_kv_cache(
             f32_data(k_cache),
@@ -366,29 +196,12 @@ public:
             head_dim,
             start_pos,
             kv_len);
-        return Status::success();
     }
 
-    Status swiglu_out(
+    void swiglu_out(
         const TensorView& out,
         const TensorView& gate,
         const TensorView& up) override {
-        Status status = validate_f32_contiguous(out);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(gate);
-        if (!status) {
-            return status;
-        }
-        status = validate_f32_contiguous(up);
-        if (!status) {
-            return status;
-        }
-        if (!same_shape(out, gate) || !same_shape(out, up)) {
-            return Status::invalid_argument_status("SwiGLU shape mismatch");
-        }
-
         const int64_t count = out.numel();
         float* out_data = f32_data(out);
         const float* gate_data = f32_data(gate);
@@ -397,27 +210,12 @@ public:
             const float g = gate_data[i];
             out_data[i] = (g / (1.0f + std::exp(-g))) * up_data[i];
         }
-        return Status::success();
     }
 
-    Status argmax(
+    void argmax(
         uint32_t& out_token,
         const TensorView& logits) override {
-        Status status = validate_f32_contiguous(logits);
-        if (!status) {
-            return status;
-        }
-        if (logits.shape.ndim != 1 &&
-            !(logits.shape.ndim == 2 && logits.dim(0) == 1)) {
-            return Status::invalid_argument_status("argmax expects logits shape [V] or [1,V]");
-        }
-
         const int64_t count = logits.numel();
-        if (count <= 0 ||
-            static_cast<uint64_t>(count) > std::numeric_limits<uint32_t>::max()) {
-            return Status::invalid_argument_status("argmax logits size is invalid");
-        }
-
         const float* values = f32_data(logits);
         uint32_t best_index = 0;
         float best_value = values[0];
@@ -429,7 +227,6 @@ public:
         }
 
         out_token = best_index;
-        return Status::success();
     }
 
     Status synchronize() override {
@@ -437,12 +234,11 @@ public:
     }
 
 protected:
-    Status release_arena(MemoryArena& arena) override {
+    void release_arena(MemoryArena& arena) noexcept override {
         void* handle = arena_handle(arena);
         if (handle != nullptr) {
             ::operator delete(handle, std::align_val_t(kArenaAlignment));
         }
-        return Status::success();
     }
 
 private:
@@ -471,29 +267,6 @@ private:
             return Status::invalid_argument_status("tensor view must be contiguous");
         }
         return Status::success();
-    }
-
-    Status validate_f32_contiguous(const TensorView& view) const {
-        Status status = validate_cpu_contiguous(view);
-        if (!status) {
-            return status;
-        }
-        if (view.dtype != DType::f32) {
-            return Status::unimplemented_status("CPU math only supports f32 tensors");
-        }
-        return Status::success();
-    }
-
-    bool same_shape(const TensorView& a, const TensorView& b) const {
-        if (a.shape.ndim != b.shape.ndim) {
-            return false;
-        }
-        for (uint32_t i = 0; i < a.shape.ndim; ++i) {
-            if (a.shape.dims[i] != b.shape.dims[i]) {
-                return false;
-            }
-        }
-        return true;
     }
 
     void apply_rope(

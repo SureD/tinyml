@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 #include "tinyinfer/backend.h"
@@ -41,6 +43,11 @@ bool checked_align_up(size_t value, size_t alignment, size_t& out) {
 }
 
 }  // namespace
+
+[[noreturn]] void panic(const char* message, const char* file, int line) {
+    std::fprintf(stderr, "tinyinfer panic: %s:%d: %s\n", file, line, message);
+    std::abort();
+}
 
 size_t dtype_size(DType dtype) {
     switch (dtype) {
@@ -233,7 +240,7 @@ size_t MemoryArena::capacity() const {
 
 void MemoryArena::release() noexcept {
     if (backend_ != nullptr) {
-        (void)backend_->release_arena(*this);
+        backend_->release_arena(*this);
     }
 
     backend_ = nullptr;

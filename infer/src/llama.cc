@@ -98,6 +98,11 @@ Status validate_prompt(
     if (prompt.size() > config.max_seq_len - start_pos) {
         return Status::invalid_argument_status("sequence exceeds model max sequence length");
     }
+    for (TokenId token : prompt) {
+        if (token >= config.vocab_size) {
+            return Status::invalid_argument_status("token id exceeds vocab size");
+        }
+    }
     return Status::success();
 }
 
@@ -110,17 +115,7 @@ Status alloc_view(MemoryArena& arena, const Shape& shape, TensorView& out) {
     return Status::success();
 }
 
-Result<TensorView> layer_cache_view(const TensorView& cache, uint32_t layer) {
-    if (!cache.defined()) {
-        return {Status::invalid_argument_status("cache tensor is not defined"), {}};
-    }
-    if (cache.shape.ndim != 4) {
-        return {Status::invalid_argument_status("cache tensor must have shape [L,KVH,S,D]"), {}};
-    }
-    if (layer >= static_cast<uint32_t>(cache.dim(0))) {
-        return {Status::invalid_argument_status("cache layer index is out of range"), {}};
-    }
-
+TensorView layer_cache_view(const TensorView& cache, uint32_t layer) {
     TensorView view = cache;
     view.byte_offset +=
         static_cast<size_t>(layer) *
@@ -131,24 +126,10 @@ Result<TensorView> layer_cache_view(const TensorView& cache, uint32_t layer) {
     view.strides.values[0] = cache.strides.stride(1);
     view.strides.values[1] = cache.strides.stride(2);
     view.strides.values[2] = cache.strides.stride(3);
-
-    if (!view.defined() || !view.contiguous()) {
-        return {Status::invalid_argument_status("cache layer view is invalid"), {}};
-    }
-    return {Status::success(), view};
+    return view;
 }
 
-Result<TensorView> last_token_view(const TensorView& values, uint32_t token_index) {
-    if (!values.defined()) {
-        return {Status::invalid_argument_status("last token source is not defined"), {}};
-    }
-    if (values.shape.ndim != 2) {
-        return {Status::invalid_argument_status("last token source must have shape [T,H]"), {}};
-    }
-    if (token_index >= static_cast<uint32_t>(values.dim(0))) {
-        return {Status::invalid_argument_status("last token index is out of range"), {}};
-    }
-
+TensorView last_token_view(const TensorView& values, uint32_t token_index) {
     TensorView view = values;
     view.byte_offset +=
         static_cast<size_t>(token_index) *
@@ -158,11 +139,7 @@ Result<TensorView> last_token_view(const TensorView& values, uint32_t token_inde
     view.strides.ndim = 2;
     view.strides.values[0] = values.strides.stride(0);
     view.strides.values[1] = values.strides.stride(1);
-
-    if (!view.defined() || !view.contiguous()) {
-        return {Status::invalid_argument_status("last token view is invalid"), {}};
-    }
-    return {Status::success(), view};
+    return view;
 }
 
 }  // namespace
@@ -336,10 +313,6 @@ Status LlamaInferEngine::init() {
 }
 
 Status LlamaInferEngine::bind_model() {
-    if (!weights_.defined()) {
-        return Status::invalid_argument_status("weights arena is not allocated");
-    }
-
     weights_.reset();
     model_.layers.resize(config_.n_layers);
 
@@ -418,10 +391,6 @@ Status LlamaInferEngine::bind_model() {
 }
 
 Status LlamaInferEngine::init_kv_cache() {
-    if (!kv_cache_arena_.defined()) {
-        return Status::invalid_argument_status("KV arena is not allocated");
-    }
-
     kv_cache_arena_.reset();
     const Shape shape = make_shape({
         static_cast<int64_t>(config_.n_layers),
@@ -444,41 +413,24 @@ Status LlamaInferEngine::init_kv_cache() {
     return Status::success();
 }
 
-Status LlamaInferEngine::reset() {
-    Status status = check_ready();
-    if (!status) {
-        return status;
-    }
+void LlamaInferEngine::reset() {
     workspace_.reset();
     logits_ = {};
-    return init_kv_cache();
+    kv_cache_arena_.reset();
+    const Shape shape = make_shape({
+        static_cast<int64_t>(config_.n_layers),
+        static_cast<int64_t>(config_.n_kv_heads),
+        static_cast<int64_t>(max_seq_len_),
+        static_cast<int64_t>(config_.head_dim()),
+    });
+    cache_.keys = kv_cache_arena_.alloc(shape, DType::f32).value;
+    cache_.values = kv_cache_arena_.alloc(shape, DType::f32).value;
+    cache_.seq_len = 0;
+    cache_.max_seq_len = max_seq_len_;
 }
 
-Status LlamaInferEngine::check_ready() const {
-    if (backend_ == nullptr) {
-        return Status::invalid_argument_status("engine is not initialized");
-    }
-    Status status = config_.validate();
-    if (!status) {
-        return status;
-    }
-    if (!weights_.defined()) {
-        return Status::invalid_argument_status("weights arena is not allocated");
-    }
-    if (!kv_cache_arena_.defined()) {
-        return Status::invalid_argument_status("KV arena is not allocated");
-    }
-    if (!workspace_.defined()) {
-        return Status::invalid_argument_status("workspace arena is not allocated");
-    }
-    if (model_.layers.size() != config_.n_layers) {
-        return Status::invalid_config_status("model layer count does not match config");
-    }
-    return Status::success();
-}
-
-Result<TensorView> LlamaInferEngine::workspace_tensor(const Shape& shape) {
-    return workspace_.alloc(shape, DType::f32);
+TensorView LlamaInferEngine::workspace_tensor(const Shape& shape) {
+    return workspace_.alloc(shape, DType::f32).value;
 }
 
 void LlamaInferEngine::rebind_view_after_move(
@@ -516,11 +468,7 @@ void LlamaInferEngine::rebind_views_after_move(const LlamaInferEngine& source) {
 }
 
 Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_token) {
-    Status status = check_ready();
-    if (!status) {
-        return status;
-    }
-    status = validate_prompt(prompt, config_, cache_.max_seq_len, 0);
+    Status status = validate_prompt(prompt, config_, cache_.max_seq_len, 0);
     if (!status) {
         return status;
     }
@@ -529,41 +477,25 @@ Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_
     }
 
     workspace_.reset();
-    status = run_layers(prompt, 0, logits_);
-    if (!status) {
-        return status;
-    }
+    run_layers(prompt, 0, logits_);
 
-    status = backend_->argmax(next_token, logits_);
-    if (!status) {
-        return status;
-    }
+    backend_->argmax(next_token, logits_);
 
     cache_.seq_len = static_cast<uint32_t>(prompt.size());
     return Status::success();
 }
 
 Status LlamaInferEngine::decode_one(TokenId token, TokenId& next_token) {
-    Status status = check_ready();
-    if (!status) {
-        return status;
-    }
     const std::array<TokenId, 1> one_token = {token};
-    status = validate_prompt(one_token, config_, cache_.max_seq_len, cache_.seq_len);
+    Status status = validate_prompt(one_token, config_, cache_.max_seq_len, cache_.seq_len);
     if (!status) {
         return status;
     }
 
     workspace_.reset();
-    status = run_layers(one_token, cache_.seq_len, logits_);
-    if (!status) {
-        return status;
-    }
+    run_layers(one_token, cache_.seq_len, logits_);
 
-    status = backend_->argmax(next_token, logits_);
-    if (!status) {
-        return status;
-    }
+    backend_->argmax(next_token, logits_);
 
     ++cache_.seq_len;
     return Status::success();
@@ -575,21 +507,24 @@ Status LlamaInferEngine::generate(
     const GenerateConfig& config,
     uint32_t& output_count) {
     output_count = 0;
-    Status status = check_ready();
-    if (!status) {
-        return status;
-    }
     if (config.max_new_tokens == 0) {
         return Status::invalid_argument_status("max_new_tokens must be non-zero");
     }
     if (output.size() < prompt.size() + config.max_new_tokens) {
         return Status::invalid_argument_status("output buffer is too small");
     }
-
-    status = reset();
+    Status status = validate_prompt(prompt, config_, cache_.max_seq_len, 0);
     if (!status) {
         return status;
     }
+    if (prompt.size() + config.max_new_tokens > cache_.max_seq_len) {
+        return Status::invalid_argument_status("generation exceeds KV cache capacity");
+    }
+    if (prompt.size() + config.max_new_tokens > config_.max_seq_len) {
+        return Status::invalid_argument_status("generation exceeds model max sequence length");
+    }
+
+    reset();
 
     for (size_t i = 0; i < prompt.size(); ++i) {
         output[i] = prompt[i];
@@ -636,176 +571,97 @@ uint32_t LlamaInferEngine::max_seq_len() const {
     return max_seq_len_;
 }
 
-Status LlamaInferEngine::run_layers(
+void LlamaInferEngine::run_layers(
     std::span<const TokenId> tokens,
     uint32_t start_pos,
     TensorView& logits) {
     const uint32_t seq_len = static_cast<uint32_t>(tokens.size());
-    Result<TensorView> hidden = workspace_tensor(make_shape({
+    TensorView hidden = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.hidden_size),
     }));
-    Result<TensorView> normed = workspace_tensor(make_shape({
+    TensorView normed = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.hidden_size),
     }));
-    Result<TensorView> q = workspace_tensor(make_shape({
+    TensorView q = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.n_heads),
         static_cast<int64_t>(config_.head_dim()),
     }));
-    Result<TensorView> k = workspace_tensor(make_shape({
+    TensorView k = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.n_kv_heads),
         static_cast<int64_t>(config_.head_dim()),
     }));
-    Result<TensorView> v = workspace_tensor(make_shape({
+    TensorView v = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.n_kv_heads),
         static_cast<int64_t>(config_.head_dim()),
     }));
-    Result<TensorView> attn_out = workspace_tensor(make_shape({
+    TensorView attn_out = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.hidden_size),
     }));
-    Result<TensorView> gate = workspace_tensor(make_shape({
+    TensorView gate = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.intermediate_size),
     }));
-    Result<TensorView> up = workspace_tensor(make_shape({
+    TensorView up = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.intermediate_size),
     }));
-    Result<TensorView> swiglu = workspace_tensor(make_shape({
+    TensorView swiglu = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.intermediate_size),
     }));
-    Result<TensorView> ffn_out = workspace_tensor(make_shape({
+    TensorView ffn_out = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
         static_cast<int64_t>(config_.hidden_size),
     }));
 
-    Result<TensorView>* scratch[] = {
-        &hidden,
-        &normed,
-        &q,
-        &k,
-        &v,
-        &attn_out,
-        &gate,
-        &up,
-        &swiglu,
-        &ffn_out,
-    };
-    for (Result<TensorView>* item : scratch) {
-        if (!item->status) {
-            return item->status;
-        }
-    }
-
-    Status status = backend_->embedding_out(
-        hidden.value,
+    backend_->embedding_out(
+        hidden,
         model_.token_embedding,
         tokens);
-    if (!status) {
-        return status;
-    }
 
     for (uint32_t i = 0; i < config_.n_layers; ++i) {
         LayerWeights& layer = model_.layers[i];
 
-        status = backend_->rms_norm_out(normed.value, hidden.value, layer.attn_norm, config_.rms_eps);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(q.value, normed.value, layer.q_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(k.value, normed.value, layer.k_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(v.value, normed.value, layer.v_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->rope_inplace(q.value, k.value, start_pos, config_.rope_theta);
-        if (!status) {
-            return status;
-        }
-        Result<TensorView> layer_k_cache = layer_cache_view(cache_.keys, i);
-        if (!layer_k_cache.status) {
-            return layer_k_cache.status;
-        }
-        Result<TensorView> layer_v_cache = layer_cache_view(cache_.values, i);
-        if (!layer_v_cache.status) {
-            return layer_v_cache.status;
-        }
-        status = backend_->attention_out(
-            attn_out.value,
-            q.value,
-            k.value,
-            v.value,
-            layer_k_cache.value,
-            layer_v_cache.value,
+        backend_->rms_norm_out(normed, hidden, layer.attn_norm, config_.rms_eps);
+        backend_->matmul_out(q, normed, layer.q_proj);
+        backend_->matmul_out(k, normed, layer.k_proj);
+        backend_->matmul_out(v, normed, layer.v_proj);
+        backend_->rope_inplace(q, k, start_pos, config_.rope_theta);
+        TensorView layer_k_cache = layer_cache_view(cache_.keys, i);
+        TensorView layer_v_cache = layer_cache_view(cache_.values, i);
+        backend_->attention_out(
+            attn_out,
+            q,
+            k,
+            v,
+            layer_k_cache,
+            layer_v_cache,
             start_pos,
             start_pos + seq_len);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(ffn_out.value, attn_out.value, layer.o_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->add_inplace(ffn_out.value, hidden.value);
-        if (!status) {
-            return status;
-        }
-        status = backend_->rms_norm_out(normed.value, ffn_out.value, layer.ffn_norm, config_.rms_eps);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(gate.value, normed.value, layer.gate_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(up.value, normed.value, layer.up_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->swiglu_out(swiglu.value, gate.value, up.value);
-        if (!status) {
-            return status;
-        }
-        status = backend_->matmul_out(hidden.value, swiglu.value, layer.down_proj);
-        if (!status) {
-            return status;
-        }
-        status = backend_->add_inplace(hidden.value, ffn_out.value);
-        if (!status) {
-            return status;
-        }
+        backend_->matmul_out(ffn_out, attn_out, layer.o_proj);
+        backend_->add_inplace(ffn_out, hidden);
+        backend_->rms_norm_out(normed, ffn_out, layer.ffn_norm, config_.rms_eps);
+        backend_->matmul_out(gate, normed, layer.gate_proj);
+        backend_->matmul_out(up, normed, layer.up_proj);
+        backend_->swiglu_out(swiglu, gate, up);
+        backend_->matmul_out(hidden, swiglu, layer.down_proj);
+        backend_->add_inplace(hidden, ffn_out);
     }
 
-    Result<TensorView> logits_view = workspace_tensor(make_shape({
+    logits = workspace_tensor(make_shape({
         1,
         static_cast<int64_t>(config_.vocab_size),
     }));
-    if (!logits_view.status) {
-        return logits_view.status;
-    }
-    logits = logits_view.value;
 
-    status = backend_->rms_norm_out(hidden.value, hidden.value, model_.final_norm, config_.rms_eps);
-    if (!status) {
-        return status;
-    }
-    Result<TensorView> last_hidden = last_token_view(hidden.value, seq_len - 1);
-    if (!last_hidden.status) {
-        return last_hidden.status;
-    }
-    return backend_->matmul_out(logits, last_hidden.value, model_.lm_head);
+    backend_->rms_norm_out(hidden, hidden, model_.final_norm, config_.rms_eps);
+    TensorView last_hidden = last_token_view(hidden, seq_len - 1);
+    backend_->matmul_out(logits, last_hidden, model_.lm_head);
 }
 
 }  // namespace tinyinfer
