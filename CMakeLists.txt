@@ -58,5 +58,12 @@ add_executable(run_token_ids_smoke
 target_link_libraries(run_token_ids_smoke PRIVATE tinyinfer)
 target_compile_options(run_token_ids_smoke PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(bench_infer
+    tests/cpp/bench_infer.cc
+)
+
+target_link_libraries(bench_infer PRIVATE tinyinfer)
+target_compile_options(bench_infer PRIVATE -Wall -Wextra -Wpedantic)
+
 enable_testing()
 add_test(NAME tinyinfer_tests COMMAND tinyinfer_tests)

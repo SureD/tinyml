@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyInfer Benchmark Design</title>
+  <style>
+    :root {
+      --bg: #fbfbf9;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d8dee4;
+      --panel: #ffffff;
+      --code: #f1f4f7;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      color: #111418;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 36px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 8px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    code {
+      border-radius: 4px;
+      background: var(--code);
+      padding: 2px 5px;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111418;
+      color: #f6f8fa;
+      padding: 14px 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f4;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .summary div,
+    .panel,
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .summary div {
+      padding: 12px 14px;
+    }
+
+    .summary strong {
+      display: block;
+      margin-bottom: 3px;
+      color: #111418;
+    }
+
+    .summary span,
+    .muted {
+      color: var(--muted);
+    }
+
+    .panel {
+      margin-top: 12px;
+      padding: 14px 16px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TinyInfer Benchmark Design</h1>
+      <p class="muted">
+        Design doc for a small phase-level benchmark used to measure TinyInfer prefill and decode latency before and after future Metal backend work.
+      </p>
+      <div class="summary">
+        <div><strong>Status</strong><span>Draft; implementation should follow after review.</span></div>
+        <div><strong>Parent design</strong><span><a href="./design.html">TinyInfer Core Runtime Design</a></span></div>
+        <div><strong>Main decision</strong><span>Start with phase-level benchmark metrics, not operator profiling.</span></div>
+        <div><strong>Output</strong><span>CSV row for simple manual comparison and scripting.</span></div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Context And Scope</h2>
+      <p>
+        TinyInfer now has a CPU f32 correctness backend and a LLaMA-style inference path. The next major learning target is Metal optimization. Before optimizing kernels, the project needs a repeatable way to measure whether a backend change improves real inference behavior.
+      </p>
+      <p>
+        The first benchmark should be intentionally small. It should measure model phases, not individual operators. This keeps the benchmark easy to maintain while still answering the questions that matter during early Metal bring-up:
+      </p>
+      <ul>
+        <li>How long does prefill take?</li>
+        <li>How long does decode take per generated token?</li>
+        <li>Does a backend change improve end-to-end inference time?</li>
+        <li>Does decode latency grow as KV cache length grows?</li>
+      </ul>
+      <pre>fixed token ids
+        |
+load model once
+        |
+warmup prefill + decode
+        |
+reset engine KV cache + workspace
+        |
+measured prefill
+        |
+measured decode_one loop
+        |
+CSV metrics</pre>
+    </section>
+
+    <section>
+      <h2>2. Goals</h2>
+      <ul>
+        <li>Provide a simple CPU backend baseline for inference latency.</li>
+        <li>Use the same benchmark shape for future Metal backend comparisons.</li>
+        <li>Measure <code>prefill</code> and repeated <code>decode_one</code> separately.</li>
+        <li>Keep tokenizer and model loading outside inference timing.</li>
+        <li>Use fixed token ids so runs are deterministic and independent from Python.</li>
+        <li>Print compact CSV output suitable for manual comparison and shell scripts.</li>
+        <li>Avoid new dependencies and avoid a benchmark framework in v1.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Non-Goals</h2>
+      <ul>
+        <li>No per-operator benchmark in v1.</li>
+        <li>No flamegraph, timeline trace, or UI.</li>
+        <li>No tokenizer performance measurement.</li>
+        <li>No model loading time mixed into inference metrics.</li>
+        <li>No multi-batch, request scheduling, or serving benchmark.</li>
+        <li>No statistical benchmark dependency such as Google Benchmark.</li>
+        <li>No new core runtime profiling API in the first implementation.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Proposed Interface</h2>
+      <p>
+        Add one developer executable:
+      </p>
+      <pre>build/bench_infer &lt;model_dir&gt; &lt;backend&gt; &lt;max_seq_len&gt; &lt;max_new_tokens&gt; &lt;token_id&gt; [token_id...]</pre>
+      <p>
+        Example:
+      </p>
+      <pre>build/bench_infer models/TinyLlama-1.1B-Chat-v1.0 cpu 128 8 1 15043 29892 590 1024 338</pre>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Argument</th>
+              <th>Meaning</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>model_dir</code></td>
+              <td>Local Hugging Face model directory.</td>
+              <td>Reuses the existing safetensors/config loader path.</td>
+            </tr>
+            <tr>
+              <td><code>backend</code></td>
+              <td><code>cpu</code> in v1, <code>metal</code> later.</td>
+              <td>Keeps backend comparison explicit at the command line.</td>
+            </tr>
+            <tr>
+              <td><code>max_seq_len</code></td>
+              <td>KV cache capacity for this run.</td>
+              <td>Controls memory plan and decode cache length limit.</td>
+            </tr>
+            <tr>
+              <td><code>max_new_tokens</code></td>
+              <td>Number of measured decode tokens.</td>
+              <td>Controls the measured decode loop length.</td>
+            </tr>
+            <tr>
+              <td><code>token_id...</code></td>
+              <td>Fixed prompt tokens.</td>
+              <td>Avoids tokenizer dependency and makes benchmark inputs reproducible.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Fixed Case Runner</h2>
+      <p>
+        <code>bench_infer</code> is a manual measurement harness. The project-level benchmark entry should be a fixed case runner:
+      </p>
+      <pre>python3 scripts/bench_infer_cases.py --backend cpu</pre>
+      <p>
+        The case runner owns the official benchmark inputs. It should use fixed prompt lengths, fixed decode lengths, and fixed seeds to generate legal token ids. Token semantics are not important for TinyInfer performance because the model executes the same kernel shapes regardless of the actual token values.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Case</th>
+              <th>Prompt length</th>
+              <th>Max seq len</th>
+              <th>Decode tokens</th>
+              <th>Seed</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>p16_d8</code></td>
+              <td><code>16</code></td>
+              <td><code>128</code></td>
+              <td><code>8</code></td>
+              <td><code>0xC0FFEE10</code></td>
+            </tr>
+            <tr>
+              <td><code>p64_d8</code></td>
+              <td><code>64</code></td>
+              <td><code>128</code></td>
+              <td><code>8</code></td>
+              <td><code>0xC0FFEE40</code></td>
+            </tr>
+            <tr>
+              <td><code>p128_d8</code></td>
+              <td><code>128</code></td>
+              <td><code>256</code></td>
+              <td><code>8</code></td>
+              <td><code>0xC0FFEE80</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        The runner should print one CSV row per case and include the case name and seed. Progress messages go to <code>stderr</code> so <code>stdout</code> remains machine-readable CSV.
+      </p>
+    </section>
+
+    <section>
+      <h2>6. Benchmark Flow</h2>
+      <p>
+        The executable should load the model once, run a short untimed warmup, reset engine state, then run one measured inference case.
+      </p>
+      <pre>create backend
+load model
+run warmup:
+  prefill(prompt)
+  decode_one(...) for a small number of tokens
+
+engine.reset()
+time prefill(prompt)
+time decode_one(...) for max_new_tokens
+print CSV</pre>
+      <p>
+        A reset measured state keeps the KV cache simple: every measured run starts from an empty cache, then advances through prefill and decode exactly once.
+      </p>
+      <p>
+        <code>LlamaInferEngine::reset()</code> clears workspace and KV cache state while preserving loaded weights, so warmup does not require reloading the checkpoint.
+      </p>
+    </section>
+
+    <section>
+      <h2>7. Metrics</h2>
+      <p>
+        The fixed case runner should print one CSV header and one CSV row per case.
+      </p>
+      <pre>case,seed,backend,prompt_len,max_seq_len,max_new_tokens,prefill_ms,decode_total_ms,decode_ms_per_token,tokens_per_sec
+p16_d8,0xc0ffee10,cpu,16,128,8,1200.412,9400.733,1175.092,0.851</pre>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Definition</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>prefill_ms</code></td>
+              <td>Wall-clock time for one <code>prefill(prompt)</code>.</td>
+              <td>Measures prompt processing and KV cache initialization.</td>
+            </tr>
+            <tr>
+              <td><code>decode_total_ms</code></td>
+              <td>Total time for all measured <code>decode_one</code> calls.</td>
+              <td>Includes the growing KV cache scan during generation.</td>
+            </tr>
+            <tr>
+              <td><code>decode_ms_per_token</code></td>
+              <td><code>decode_total_ms / max_new_tokens</code>.</td>
+              <td>Main decode latency number for simple comparisons.</td>
+            </tr>
+            <tr>
+              <td><code>tokens_per_sec</code></td>
+              <td><code>max_new_tokens / (decode_total_ms / 1000)</code>.</td>
+              <td>Useful for quick throughput intuition.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>8. Timing And Synchronization</h2>
+      <p>
+        Use <code>std::chrono::steady_clock</code> for wall-clock timing. The benchmark should time only inference calls, not argument parsing, tokenizer work, model loading, or printing.
+      </p>
+      <pre>start timer
+engine.prefill(prompt, next_token)
+backend.synchronize()
+stop timer
+
+start timer
+for each generated token:
+  engine.decode_one(previous_token, next_token)
+backend.synchronize()
+stop timer</pre>
+      <p>
+        On CPU, <code>synchronize()</code> is a no-op. On Metal, it must wait for queued GPU work to finish. This is important because timing only command submission would make Metal numbers look faster than real execution.
+      </p>
+      <p>
+        v1 should run one short warmup before measuring. Multiple repeats and percentile reporting can wait until the simple benchmark stops being enough.
+      </p>
+    </section>
+
+    <section>
+      <h2>9. Input Cases</h2>
+      <p>
+        The C++ benchmark accepts token ids directly. The fixed case runner generates deterministic legal token ids from each case seed and the model vocabulary size. A Python tokenizer may still be used for manual smoke tests, but tokenizer work should not be part of timed inference.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Case</th>
+              <th>Values</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Official v1 prompt length</td>
+              <td><code>16</code>, <code>64</code>, <code>128</code></td>
+              <td>Small enough to run on scalar CPU while still showing prefill scaling.</td>
+            </tr>
+            <tr>
+              <td>Official v1 decode length</td>
+              <td><code>8</code></td>
+              <td>Enough to average several decode steps without making CPU runs too painful.</td>
+            </tr>
+            <tr>
+              <td>Deferred larger cases</td>
+              <td><code>prompt_len=512</code>, <code>max_new_tokens=32</code></td>
+              <td>Add after Metal kernels exist or when long-context behavior becomes the target.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>10. Implementation Plan</h2>
+      <p>
+        Add one source file and one CMake target:
+      </p>
+      <pre>tests/cpp/bench_infer.cc</pre>
+      <pre>add_executable(bench_infer tests/cpp/bench_infer.cc)
+target_link_libraries(bench_infer PRIVATE tinyinfer)
+target_compile_options(bench_infer PRIVATE -Wall -Wextra -Wpedantic)</pre>
+      <p>
+        Add one fixed case runner:
+      </p>
+      <pre>scripts/bench_infer_cases.py</pre>
+      <p>
+        Keep helper code local to the executable:
+      </p>
+      <ul>
+        <li><code>parse_u32</code></li>
+        <li><code>create_backend</code></li>
+        <li><code>validate_prompt</code></li>
+        <li><code>run_warmup</code></li>
+        <li><code>run_measured</code></li>
+        <li><code>print_csv</code></li>
+      </ul>
+      <p>
+        The benchmark result can stay as a small local struct:
+      </p>
+      <pre>struct BenchResult {
+    const char* backend = nullptr;
+    uint32_t prompt_len = 0;
+    uint32_t max_seq_len = 0;
+    uint32_t max_new_tokens = 0;
+    double prefill_ms = 0.0;
+    double decode_total_ms = 0.0;
+};</pre>
+    </section>
+
+    <section>
+      <h2>11. Validation And Errors</h2>
+      <p>
+        The benchmark should fail early and loudly for invalid setup.
+      </p>
+      <ul>
+        <li>Reject empty prompts.</li>
+        <li>Reject prompt length plus generated tokens greater than <code>max_seq_len</code>.</li>
+        <li>Reject token ids greater than or equal to <code>vocab_size</code>.</li>
+        <li>Reject unsupported backend names.</li>
+        <li>Print backend or loader failures directly to <code>stderr</code>.</li>
+      </ul>
+      <p>
+        Verification for the benchmark itself should be lightweight: build the target, run it on a small prompt, and confirm that the CSV row is printed and decode produces valid token ids.
+      </p>
+    </section>
+
+    <section>
+      <h2>12. Alternatives Considered</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Alternative</th>
+              <th>Decision</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Start with per-operator profiler.</td>
+              <td>Defer.</td>
+              <td>Useful later, but too much machinery before whole-model Metal impact is visible.</td>
+            </tr>
+            <tr>
+              <td>Use Google Benchmark.</td>
+              <td>Defer.</td>
+              <td>The first benchmark needs one executable and CSV output, not a new dependency.</td>
+            </tr>
+            <tr>
+              <td>Benchmark text prompts through Python tokenizer.</td>
+              <td>Reject for timed path.</td>
+              <td>Tokenizer overhead is not part of backend inference performance.</td>
+            </tr>
+            <tr>
+              <td>Add runtime profiling callbacks.</td>
+              <td>Defer.</td>
+              <td>The core runtime should stay simple until phase-level numbers are insufficient.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>13. Risks</h2>
+      <ul>
+        <li>Single-run numbers may be noisy. This is acceptable for v1; repeat/median can be added later.</li>
+        <li>Reloading the model for warmup and measurement is slow. It is outside timed inference and keeps state management simple.</li>
+        <li>Metal numbers will be wrong if <code>synchronize()</code> does not wait for GPU completion.</li>
+        <li>Whole-model timing will not explain every bottleneck. Operator microbenchmarks should be added when that becomes a real blocker.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>14. Future Work</h2>
+      <ul>
+        <li>Multiple repeats with min, median, and p90.</li>
+        <li>JSON output in addition to CSV.</li>
+        <li>Separate prefill-only and decode-only modes.</li>
+        <li>Per-operator microbenchmarks for matmul and attention.</li>
+        <li>Optional Metal command-buffer GPU timestamps.</li>
+        <li>Larger optional case matrix for long-context decode.</li>
+      </ul>
+      <p>
+        These should be added only after the simple phase-level benchmark stops being enough.
+      </p>
+    </section>
+  </main>
+</body>
+</html>
