@@ -31,6 +31,9 @@ target_include_directories(tinyinfer
 )
 
 target_link_libraries(tinyinfer PRIVATE nlohmann_json::nlohmann_json)
+if(APPLE)
+    target_link_libraries(tinyinfer PRIVATE "-framework Metal" "-framework Foundation")
+endif()
 
 target_compile_options(tinyinfer PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>

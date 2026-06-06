@@ -14,4 +14,7 @@ Phase 2 focuses on GPU acceleration:
 - profiling
 - decode-path optimization
 
+Validation records:
+- [Metal backend correctness and performance](docs/metal_backend_validation.md)
+
 ----

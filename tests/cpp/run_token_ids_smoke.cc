@@ -15,6 +15,7 @@ namespace {
 void usage(const char* program) {
     std::cerr
         << "usage: " << program
+        << " [--backend cpu|metal]"
         << " <model_dir> <max_seq_len> <max_new_tokens> <token_id> [token_id...]\n";
 }
 
@@ -44,19 +45,39 @@ void print_token_line(const char* label, const std::vector<TokenId>& tokens) {
     std::cout << "\n";
 }
 
+Result<std::unique_ptr<Backend>> create_backend(const std::string& name) {
+    if (name == "cpu") {
+        return create_cpu_backend();
+    }
+    if (name == "metal") {
+        return create_metal_backend();
+    }
+    return {
+        Status::invalid_argument_status("unsupported backend"),
+        nullptr,
+    };
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 5) {
+    int arg_index = 1;
+    std::string backend_name = "cpu";
+    if (argc >= 3 && std::string(argv[1]) == "--backend") {
+        backend_name = argv[2];
+        arg_index = 3;
+    }
+
+    if (argc - arg_index < 4) {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
 
-    const char* model_dir = argv[1];
+    const char* model_dir = argv[arg_index];
     uint32_t max_seq_len = 0;
     uint32_t max_new_tokens = 0;
-    if (!parse_u32(argv[2], max_seq_len) ||
-        !parse_u32(argv[3], max_new_tokens) ||
+    if (!parse_u32(argv[arg_index + 1], max_seq_len) ||
+        !parse_u32(argv[arg_index + 2], max_new_tokens) ||
         max_seq_len == 0 ||
         max_new_tokens == 0) {
         usage(argv[0]);
@@ -64,8 +85,8 @@ int main(int argc, char** argv) {
     }
 
     std::vector<TokenId> prompt;
-    prompt.reserve(static_cast<size_t>(argc - 4));
-    for (int i = 4; i < argc; ++i) {
+    prompt.reserve(static_cast<size_t>(argc - arg_index - 3));
+    for (int i = arg_index + 3; i < argc; ++i) {
         uint32_t token = 0;
         if (!parse_u32(argv[i], token)) {
             std::cerr << "invalid token id: " << argv[i] << "\n";
@@ -82,9 +103,9 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    Result<std::unique_ptr<Backend>> backend = create_backend(backend_name);
     if (!backend.status) {
-        std::cerr << "create_cpu_backend failed: " << backend.status.message << "\n";
+        std::cerr << "create_backend failed: " << backend.status.message << "\n";
         return EXIT_FAILURE;
     }
 
@@ -143,6 +164,7 @@ int main(int argc, char** argv) {
     const std::chrono::duration<double> infer_elapsed = infer_end - infer_start;
 
     std::cout << "token-id smoke passed\n";
+    std::cout << "backend: " << backend_name << "\n";
     std::cout << "model_dir: " << model_dir << "\n";
     std::cout << "layers: " << config.n_layers << "\n";
     std::cout << "hidden_size: " << config.hidden_size << "\n";

@@ -336,13 +336,15 @@ std::vector<FixtureTensor> build_fixture_tensors(
     return tensors;
 }
 
-std::vector<unsigned char> fixture_tensor_bytes(const FixtureTensor& tensor) {
+std::vector<unsigned char> fixture_tensor_bytes(
+    const FixtureTensor& tensor,
+    float value_scale = 1.0f) {
     const uint64_t count = fixture_numel(tensor.shape);
     std::vector<unsigned char> bytes;
     if (tensor.dtype == "F32") {
         bytes.resize(static_cast<size_t>(count) * sizeof(float));
         for (uint64_t i = 0; i < count; ++i) {
-            const float value = tensor.base + static_cast<float>(i);
+            const float value = (tensor.base + static_cast<float>(i)) * value_scale;
             std::memcpy(
                 bytes.data() + static_cast<size_t>(i) * sizeof(float),
                 &value,
@@ -351,7 +353,7 @@ std::vector<unsigned char> fixture_tensor_bytes(const FixtureTensor& tensor) {
     } else if (tensor.dtype == "BF16") {
         bytes.resize(static_cast<size_t>(count) * sizeof(uint16_t));
         for (uint64_t i = 0; i < count; ++i) {
-            const float value = tensor.base + static_cast<float>(i);
+            const float value = (tensor.base + static_cast<float>(i)) * value_scale;
             const uint16_t bf16 = f32_to_bf16(value);
             std::memcpy(
                 bytes.data() + static_cast<size_t>(i) * sizeof(uint16_t),
@@ -367,7 +369,8 @@ std::vector<unsigned char> fixture_tensor_bytes(const FixtureTensor& tensor) {
 void write_safetensors_fixture(
     const std::filesystem::path& path,
     const LlamaConfig& config,
-    FixtureMode mode) {
+    FixtureMode mode,
+    float value_scale = 1.0f) {
     std::vector<FixtureTensor> tensors = build_fixture_tensors(config, mode);
 
     std::string header = "{";
@@ -375,7 +378,7 @@ void write_safetensors_fixture(
     uint64_t offset = 0;
     for (size_t i = 0; i < tensors.size(); ++i) {
         const FixtureTensor& tensor = tensors[i];
-        std::vector<unsigned char> bytes = fixture_tensor_bytes(tensor);
+        std::vector<unsigned char> bytes = fixture_tensor_bytes(tensor, value_scale);
         const uint64_t begin = offset;
         const uint64_t end = begin + bytes.size();
 
@@ -402,6 +405,40 @@ void write_safetensors_fixture(
     file.write(header.data(), static_cast<std::streamsize>(header.size()));
     file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     EXPECT_TRUE(static_cast<bool>(file));
+}
+
+bool generate_fixture_output(
+    Backend& backend,
+    const std::filesystem::path& path,
+    const LlamaConfig& config,
+    std::vector<TokenId>& output) {
+    Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 8);
+    EXPECT_TRUE(engine.status);
+    if (!engine.status) {
+        return false;
+    }
+
+    Status status = load_llama_safetensors(engine.value, path.c_str());
+    EXPECT_TRUE(status);
+    if (!status) {
+        return false;
+    }
+
+    const TokenId prompt[] = {1, 2};
+    output.assign(4, 0);
+    uint32_t output_count = 0;
+    GenerateConfig generate_config;
+    generate_config.max_new_tokens = 2;
+    generate_config.stop_on_eos = false;
+
+    status = engine.value.generate(prompt, output, generate_config, output_count);
+    EXPECT_TRUE(status);
+    if (!status) {
+        return false;
+    }
+
+    output.resize(output_count);
+    return true;
 }
 
 void test_config_validation() {
@@ -899,6 +936,305 @@ void test_cpu_backend_attention() {
         });
 }
 
+void run_reference_operator_checks(Backend& backend) {
+    MemoryArena arena;
+    EXPECT_TRUE(backend.alloc_arena(arena, 32768, MemoryKind::workspace));
+
+    {
+        Result<TensorView> tensor = arena.alloc(make_shape({4}), DType::f32);
+        EXPECT_TRUE(tensor.status);
+        const float input[] = {1.0f, -2.0f, 3.5f, 4.0f};
+        float output[] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        EXPECT_TRUE(backend.copy_from_host(tensor.value, input, sizeof(input)));
+        EXPECT_TRUE(backend.copy_to_host(output, tensor.value, sizeof(output)));
+        for (size_t i = 0; i < 4; ++i) {
+            EXPECT_EQ(output[i], input[i]);
+        }
+        EXPECT_TRUE(backend.copy_from_host(tensor.value, nullptr, 0));
+        EXPECT_EQ(
+            backend.copy_from_host(tensor.value, input, sizeof(input) + 1).code,
+            Status::invalid_argument);
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> logits = arena.alloc(make_shape({5}), DType::f32);
+        EXPECT_TRUE(logits.status);
+        const float input[] = {1.0f, 3.0f, 3.0f, -1.0f, 2.0f};
+        EXPECT_TRUE(backend.copy_from_host(logits.value, input, sizeof(input)));
+
+        uint32_t token = 99;
+        backend.argmax(token, logits.value);
+        EXPECT_EQ(token, 1u);
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> x = arena.alloc(make_shape({2, 3}), DType::f32);
+        Result<TensorView> w = arena.alloc(make_shape({2, 3}), DType::f32);
+        Result<TensorView> out = arena.alloc(make_shape({2, 2}), DType::f32);
+        EXPECT_TRUE(x.status);
+        EXPECT_TRUE(w.status);
+        EXPECT_TRUE(out.status);
+
+        const float x_values[] = {
+            1.0f, 2.0f, 3.0f,
+            4.0f, 5.0f, 6.0f,
+        };
+        const float w_values[] = {
+            10.0f, 20.0f, 30.0f,
+            1.0f, 0.0f, -1.0f,
+        };
+        copy_f32_to_tensor(backend, x.value, x_values);
+        copy_f32_to_tensor(backend, w.value, w_values);
+
+        backend.matmul_out(out.value, x.value, w.value);
+        expect_f32_tensor_near(backend, out.value, {140.0f, -2.0f, 320.0f, -2.0f});
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> table = arena.alloc(make_shape({4, 3}), DType::f32);
+        Result<TensorView> out = arena.alloc(make_shape({2, 3}), DType::f32);
+        EXPECT_TRUE(table.status);
+        EXPECT_TRUE(out.status);
+
+        const float table_values[] = {
+            1.0f, 2.0f, 3.0f,
+            4.0f, 5.0f, 6.0f,
+            7.0f, 8.0f, 9.0f,
+            10.0f, 11.0f, 12.0f,
+        };
+        copy_f32_to_tensor(backend, table.value, table_values);
+
+        const uint32_t tokens[] = {2, 0};
+        backend.embedding_out(out.value, table.value, tokens);
+        expect_f32_tensor_near(backend, out.value, {
+            7.0f, 8.0f, 9.0f,
+            1.0f, 2.0f, 3.0f,
+        });
+
+        Result<TensorView> add_src = arena.alloc(make_shape({2, 3}), DType::f32);
+        EXPECT_TRUE(add_src.status);
+        const float add_values[] = {
+            0.5f, -1.0f, 2.0f,
+            3.0f, 4.0f, -5.0f,
+        };
+        copy_f32_to_tensor(backend, add_src.value, add_values);
+
+        backend.add_inplace(out.value, add_src.value);
+        expect_f32_tensor_near(backend, out.value, {
+            7.5f, 7.0f, 11.0f,
+            4.0f, 6.0f, -2.0f,
+        });
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> x = arena.alloc(make_shape({2, 3}), DType::f32);
+        Result<TensorView> weight = arena.alloc(make_shape({3}), DType::f32);
+        Result<TensorView> out = arena.alloc(make_shape({2, 3}), DType::f32);
+        EXPECT_TRUE(x.status);
+        EXPECT_TRUE(weight.status);
+        EXPECT_TRUE(out.status);
+
+        const float x_values[] = {
+            1.0f, 2.0f, 2.0f,
+            3.0f, 0.0f, 4.0f,
+        };
+        const float weight_values[] = {1.0f, 0.5f, -1.0f};
+        copy_f32_to_tensor(backend, x.value, x_values);
+        copy_f32_to_tensor(backend, weight.value, weight_values);
+
+        constexpr float eps = 1e-5f;
+        backend.rms_norm_out(out.value, x.value, weight.value, eps);
+
+        std::vector<float> expected_rms;
+        for (int row = 0; row < 2; ++row) {
+            const float* x_row = x_values + row * 3;
+            float mean_sq = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                mean_sq += x_row[i] * x_row[i];
+            }
+            mean_sq /= 3.0f;
+            const float scale = 1.0f / std::sqrt(mean_sq + eps);
+            for (int i = 0; i < 3; ++i) {
+                expected_rms.push_back(x_row[i] * scale * weight_values[i]);
+            }
+        }
+        expect_f32_tensor_near(backend, out.value, expected_rms);
+
+        Result<TensorView> gate = arena.alloc(make_shape({3}), DType::f32);
+        Result<TensorView> up = arena.alloc(make_shape({3}), DType::f32);
+        Result<TensorView> swiglu = arena.alloc(make_shape({3}), DType::f32);
+        EXPECT_TRUE(gate.status);
+        EXPECT_TRUE(up.status);
+        EXPECT_TRUE(swiglu.status);
+
+        const float gate_values[] = {0.0f, 1.0f, -1.0f};
+        const float up_values[] = {2.0f, 3.0f, 4.0f};
+        copy_f32_to_tensor(backend, gate.value, gate_values);
+        copy_f32_to_tensor(backend, up.value, up_values);
+
+        backend.swiglu_out(swiglu.value, gate.value, up.value);
+        expect_f32_tensor_near(
+            backend,
+            swiglu.value,
+            {
+                0.0f,
+                (1.0f / (1.0f + std::exp(-1.0f))) * 3.0f,
+                (-1.0f / (1.0f + std::exp(1.0f))) * 4.0f,
+            });
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> q = arena.alloc(make_shape({1, 1, 4}), DType::f32);
+        Result<TensorView> k = arena.alloc(make_shape({1, 1, 4}), DType::f32);
+        EXPECT_TRUE(q.status);
+        EXPECT_TRUE(k.status);
+
+        const float q_values[] = {1.0f, 2.0f, 3.0f, 4.0f};
+        const float k_values[] = {-1.0f, 0.5f, 2.0f, -0.25f};
+        copy_f32_to_tensor(backend, q.value, q_values);
+        copy_f32_to_tensor(backend, k.value, k_values);
+
+        constexpr float theta = 10000.0f;
+        backend.rope_inplace(q.value, k.value, 1, theta);
+
+        auto expected_rope = [](const float* values) {
+            std::vector<float> expected(values, values + 4);
+            for (int i = 0; i < 2; ++i) {
+                const float exponent = static_cast<float>(2 * i) / 4.0f;
+                const float angle = 1.0f / std::pow(10000.0f, exponent);
+                const float c = std::cos(angle);
+                const float s = std::sin(angle);
+                const float x0 = values[i];
+                const float x1 = values[i + 2];
+                expected[i] = x0 * c - x1 * s;
+                expected[i + 2] = x1 * c + x0 * s;
+            }
+            return expected;
+        };
+
+        expect_f32_tensor_near(backend, q.value, expected_rope(q_values));
+        expect_f32_tensor_near(backend, k.value, expected_rope(k_values));
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> q = arena.alloc(make_shape({2, 2, 2}), DType::f32);
+        Result<TensorView> k = arena.alloc(make_shape({2, 1, 2}), DType::f32);
+        Result<TensorView> v = arena.alloc(make_shape({2, 1, 2}), DType::f32);
+        Result<TensorView> k_cache = arena.alloc(make_shape({1, 4, 2}), DType::f32);
+        Result<TensorView> v_cache = arena.alloc(make_shape({1, 4, 2}), DType::f32);
+        Result<TensorView> out = arena.alloc(make_shape({2, 4}), DType::f32);
+        EXPECT_TRUE(q.status);
+        EXPECT_TRUE(k.status);
+        EXPECT_TRUE(v.status);
+        EXPECT_TRUE(k_cache.status);
+        EXPECT_TRUE(v_cache.status);
+        EXPECT_TRUE(out.status);
+
+        const float q_values[] = {
+            1.0f, 0.0f,
+            0.0f, 1.0f,
+            1.0f, 0.0f,
+            0.0f, 1.0f,
+        };
+        const float k_values[] = {
+            1.0f, 0.0f,
+            0.0f, 1.0f,
+        };
+        const float v_values[] = {
+            10.0f, 100.0f,
+            20.0f, 200.0f,
+        };
+        const float zero_cache[] = {
+            0.0f, 0.0f,
+            0.0f, 0.0f,
+            0.0f, 0.0f,
+            0.0f, 0.0f,
+        };
+        copy_f32_to_tensor(backend, q.value, q_values);
+        copy_f32_to_tensor(backend, k.value, k_values);
+        copy_f32_to_tensor(backend, v.value, v_values);
+        copy_f32_to_tensor(backend, k_cache.value, zero_cache);
+        copy_f32_to_tensor(backend, v_cache.value, zero_cache);
+
+        backend.attention_out(
+            out.value,
+            q.value,
+            k.value,
+            v.value,
+            k_cache.value,
+            v_cache.value,
+            0,
+            2);
+
+        const float a = 1.0f / std::sqrt(2.0f);
+        const float exp_a = std::exp(a);
+        const float head0_w0 = exp_a / (exp_a + 1.0f);
+        const float head0_w1 = 1.0f / (exp_a + 1.0f);
+        const float head1_w0 = 1.0f / (1.0f + exp_a);
+        const float head1_w1 = exp_a / (1.0f + exp_a);
+        expect_f32_tensor_near(
+            backend,
+            out.value,
+            {
+                10.0f, 100.0f,
+                10.0f, 100.0f,
+                head0_w0 * 10.0f + head0_w1 * 20.0f,
+                head0_w0 * 100.0f + head0_w1 * 200.0f,
+                head1_w0 * 10.0f + head1_w1 * 20.0f,
+                head1_w0 * 100.0f + head1_w1 * 200.0f,
+            },
+            1e-4f);
+    }
+
+    EXPECT_TRUE(backend.synchronize());
+}
+
+void test_metal_backend_correctness() {
+    Result<std::unique_ptr<Backend>> backend = create_metal_backend();
+    if (!backend.status) {
+        std::cout << "metal backend skipped: " << backend.status.message << "\n";
+        return;
+    }
+    EXPECT_TRUE(backend.value != nullptr);
+    EXPECT_TRUE(backend.value->device().type == DeviceType::metal);
+
+    run_reference_operator_checks(*backend.value);
+
+    LlamaConfig config;
+    config.n_layers = 1;
+    config.hidden_size = 4;
+    config.intermediate_size = 8;
+    config.n_heads = 2;
+    config.n_kv_heads = 1;
+    config.vocab_size = 8;
+    config.max_seq_len = 8;
+    config.rms_eps = 1e-5f;
+    config.rope_theta = 10000.0f;
+    EXPECT_TRUE(config.validate());
+
+    const std::filesystem::path path = temp_test_path("tinyinfer_metal_valid.safetensors");
+    write_safetensors_fixture(path, config, FixtureMode::valid, 1e-4f);
+
+    Result<std::unique_ptr<Backend>> cpu_backend = create_cpu_backend();
+    EXPECT_TRUE(cpu_backend.status);
+
+    std::vector<TokenId> cpu_output;
+    std::vector<TokenId> metal_output;
+    EXPECT_TRUE(generate_fixture_output(*cpu_backend.value, path, config, cpu_output));
+    EXPECT_TRUE(generate_fixture_output(*backend.value, path, config, metal_output));
+    EXPECT_EQ(metal_output.size(), cpu_output.size());
+    for (size_t i = 0; i < cpu_output.size() && i < metal_output.size(); ++i) {
+        EXPECT_EQ(metal_output[i], cpu_output[i]);
+    }
+}
+
 void test_engine_flow_with_fake_backend() {
     FakeBackend backend;
     LlamaConfig config = LlamaConfig::demo();
@@ -1059,6 +1395,7 @@ int main() {
     test_cpu_backend_rms_norm_and_swiglu();
     test_cpu_backend_rope();
     test_cpu_backend_attention();
+    test_metal_backend_correctness();
     test_engine_flow_with_fake_backend();
     test_model_loader_safetensors_with_fake_backend();
     test_model_loader_rejects_bad_safetensors();
