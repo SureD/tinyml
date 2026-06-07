@@ -149,6 +149,38 @@ public:
         }
     }
 
+    void add_rms_norm_out(
+        const TensorView& norm_out,
+        const TensorView& residual_out,
+        const TensorView& residual,
+        const TensorView& weight,
+        float eps) override {
+        const int64_t rows = residual_out.dim(0);
+        const int64_t hidden = residual_out.dim(1);
+        float* residual_out_data = f32_data(residual_out);
+        const float* residual_data = f32_data(residual);
+        const float* weight_data = f32_data(weight);
+        float* norm_out_data = f32_data(norm_out);
+
+        for (int64_t row = 0; row < rows; ++row) {
+            const int64_t base = row * hidden;
+            float sum_sq = 0.0f;
+            for (int64_t i = 0; i < hidden; ++i) {
+                const float value =
+                    residual_out_data[base + i] + residual_data[base + i];
+                residual_out_data[base + i] = value;
+                sum_sq += value * value;
+            }
+
+            const float mean_sq = sum_sq / static_cast<float>(hidden);
+            const float scale = 1.0f / std::sqrt(mean_sq + eps);
+            for (int64_t i = 0; i < hidden; ++i) {
+                norm_out_data[base + i] =
+                    residual_out_data[base + i] * scale * weight_data[i];
+            }
+        }
+    }
+
     void rms_norm_out(
         const TensorView& out,
         const TensorView& x,

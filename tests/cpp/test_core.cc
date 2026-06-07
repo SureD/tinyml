@@ -126,6 +126,20 @@ public:
         calls.push_back("add");
     }
 
+    void add_rms_norm_out(
+        const TensorView& norm_out,
+        const TensorView& residual_out,
+        const TensorView& residual,
+        const TensorView& weight,
+        float eps) override {
+        (void)norm_out;
+        (void)residual_out;
+        (void)residual;
+        (void)weight;
+        (void)eps;
+        calls.push_back("add_rms_norm");
+    }
+
     void rms_norm_out(
         const TensorView& out,
         const TensorView& x,
@@ -1172,6 +1186,62 @@ void run_reference_operator_checks(Backend& backend) {
 
     arena.reset();
     {
+        Result<TensorView> residual_out =
+            arena.alloc(make_shape({2, 3}), DType::f32);
+        Result<TensorView> residual =
+            arena.alloc(make_shape({2, 3}), DType::f32);
+        Result<TensorView> weight = arena.alloc(make_shape({3}), DType::f32);
+        Result<TensorView> norm_out =
+            arena.alloc(make_shape({2, 3}), DType::f32);
+        EXPECT_TRUE(residual_out.status);
+        EXPECT_TRUE(residual.status);
+        EXPECT_TRUE(weight.status);
+        EXPECT_TRUE(norm_out.status);
+
+        const float residual_out_values[] = {
+            1.0f, 2.0f, 2.0f,
+            3.0f, 0.0f, 4.0f,
+        };
+        const float residual_values[] = {
+            1.0f, -1.0f, 0.0f,
+            -1.0f, 2.0f, 0.0f,
+        };
+        const float weight_values[] = {1.0f, 0.5f, -1.0f};
+        const std::vector<float> expected_residual = {
+            2.0f, 1.0f, 2.0f,
+            2.0f, 2.0f, 4.0f,
+        };
+        copy_f32_to_tensor(backend, residual_out.value, residual_out_values);
+        copy_f32_to_tensor(backend, residual.value, residual_values);
+        copy_f32_to_tensor(backend, weight.value, weight_values);
+
+        constexpr float eps = 1e-5f;
+        backend.add_rms_norm_out(
+            norm_out.value,
+            residual_out.value,
+            residual.value,
+            weight.value,
+            eps);
+
+        std::vector<float> expected_norm;
+        for (int row = 0; row < 2; ++row) {
+            const float* values = expected_residual.data() + row * 3;
+            float mean_sq = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                mean_sq += values[i] * values[i];
+            }
+            const float scale = 1.0f / std::sqrt(mean_sq / 3.0f + eps);
+            for (int i = 0; i < 3; ++i) {
+                expected_norm.push_back(values[i] * scale * weight_values[i]);
+            }
+        }
+
+        expect_f32_tensor_near(backend, residual_out.value, expected_residual);
+        expect_f32_tensor_near(backend, norm_out.value, expected_norm);
+    }
+
+    arena.reset();
+    {
         Result<TensorView> x = arena.alloc(make_shape({2, 3}), DType::f32);
         Result<TensorView> weight = arena.alloc(make_shape({3}), DType::f32);
         Result<TensorView> out = arena.alloc(make_shape({2, 3}), DType::f32);
@@ -1418,12 +1488,14 @@ void test_engine_flow_with_fake_backend() {
 
     bool saw_attention = false;
     bool saw_matmul_argmax = false;
+    bool saw_add_rms_norm = false;
     bool saw_embedding = false;
     bool saw_add = false;
     uint32_t arena_allocs = 0;
     for (const std::string& call : backend.calls) {
         saw_attention = saw_attention || call == "attention";
         saw_matmul_argmax = saw_matmul_argmax || call == "matmul_argmax";
+        saw_add_rms_norm = saw_add_rms_norm || call == "add_rms_norm";
         saw_embedding = saw_embedding || call == "embedding";
         saw_add = saw_add || call == "add";
         arena_allocs += call == "alloc_arena" ? 1u : 0u;
@@ -1431,7 +1503,8 @@ void test_engine_flow_with_fake_backend() {
     EXPECT_EQ(arena_allocs, 3u);
     EXPECT_TRUE(saw_embedding);
     EXPECT_TRUE(saw_attention);
-    EXPECT_TRUE(saw_add);
+    EXPECT_TRUE(saw_add_rms_norm);
+    EXPECT_TRUE(!saw_add);
     EXPECT_TRUE(saw_matmul_argmax);
 }
 

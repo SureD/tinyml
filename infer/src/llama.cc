@@ -614,10 +614,15 @@ void LlamaInferEngine::run_layers(
         model_.token_embedding,
         tokens);
 
+    backend_->rms_norm_out(
+        normed,
+        hidden,
+        model_.layers[0].attn_norm,
+        config_.rms_eps);
+
     for (uint32_t i = 0; i < config_.n_layers; ++i) {
         LayerWeights& layer = model_.layers[i];
 
-        backend_->rms_norm_out(normed, hidden, layer.attn_norm, config_.rms_eps);
         backend_->matmul_out(q, normed, layer.q_proj);
         backend_->matmul_out(k, normed, layer.k_proj);
         backend_->matmul_out(v, normed, layer.v_proj);
@@ -634,22 +639,35 @@ void LlamaInferEngine::run_layers(
             start_pos,
             start_pos + seq_len);
         backend_->matmul_out(ffn_out, attn_out, layer.o_proj);
-        backend_->add_inplace(ffn_out, hidden);
-        backend_->rms_norm_out(normed, ffn_out, layer.ffn_norm, config_.rms_eps);
+        backend_->add_rms_norm_out(
+            normed,
+            ffn_out,
+            hidden,
+            layer.ffn_norm,
+            config_.rms_eps);
         backend_->matmul_out(gate, normed, layer.gate_proj);
         backend_->matmul_out(up, normed, layer.up_proj);
         backend_->swiglu_out(swiglu, gate, up);
         backend_->matmul_out(hidden, swiglu, layer.down_proj);
-        backend_->add_inplace(hidden, ffn_out);
+        if (i + 1 < config_.n_layers) {
+            backend_->add_rms_norm_out(
+                normed,
+                hidden,
+                ffn_out,
+                model_.layers[i + 1].attn_norm,
+                config_.rms_eps);
+        } else {
+            TensorView last_hidden = last_token_view(hidden, seq_len - 1);
+            TensorView last_residual = last_token_view(ffn_out, seq_len - 1);
+            backend_->add_rms_norm_out(
+                last_hidden,
+                last_hidden,
+                last_residual,
+                model_.final_norm,
+                config_.rms_eps);
+            backend_->matmul_argmax(next_token, last_hidden, model_.lm_head);
+        }
     }
-
-    TensorView last_hidden = last_token_view(hidden, seq_len - 1);
-    backend_->rms_norm_out(
-        last_hidden,
-        last_hidden,
-        model_.final_norm,
-        config_.rms_eps);
-    backend_->matmul_argmax(next_token, last_hidden, model_.lm_head);
 }
 
 }  // namespace tinyinfer

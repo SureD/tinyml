@@ -365,6 +365,59 @@ kernel void rms_norm_f32(
     }
 }
 
+kernel void add_rms_norm_f32(
+    device float* norm_out [[buffer(0)]],
+    device float* residual_out [[buffer(1)]],
+    const device float* residual [[buffer(2)]],
+    const device float* weight [[buffer(3)]],
+    constant RmsNormParams& p [[buffer(4)]],
+    threadgroup float* row_values [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint simd_width = 32;
+    constexpr uint threads_per_threadgroup = 256;
+    constexpr uint simdgroups_per_threadgroup =
+        threads_per_threadgroup / simd_width;
+
+    if (row >= p.rows) {
+        return;
+    }
+
+    const uint base = row * p.hidden;
+    float partial_sum_sq = 0.0f;
+    for (uint i = thread_id; i < p.hidden; i += threads_per_threadgroup) {
+        const float value = residual_out[base + i] + residual[base + i];
+        residual_out[base + i] = value;
+        row_values[i] = value;
+        partial_sum_sq += value * value;
+    }
+
+    partial_sum_sq = simd_sum(partial_sum_sq);
+    threadgroup float simd_sums[simdgroups_per_threadgroup];
+    if (lane_id == 0) {
+        simd_sums[simdgroup_id] = partial_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_id == 0) {
+        float sum_sq =
+            lane_id < simdgroups_per_threadgroup ? simd_sums[lane_id] : 0.0f;
+        sum_sq = simd_sum(sum_sq);
+        if (lane_id == 0) {
+            const float mean_sq = sum_sq / float(p.hidden);
+            simd_sums[0] = rsqrt(mean_sq + p.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = simd_sums[0];
+    for (uint i = thread_id; i < p.hidden; i += threads_per_threadgroup) {
+        norm_out[base + i] = row_values[i] * scale * weight[i];
+    }
+}
+
 kernel void rope_f32(
     device float* values [[buffer(0)]],
     constant RopeParams& p [[buffer(1)]],
@@ -671,6 +724,7 @@ struct Pipelines {
     id<MTLComputePipelineState> small_m_gemm_tiled = nil;
     id<MTLComputePipelineState> embedding = nil;
     id<MTLComputePipelineState> add = nil;
+    id<MTLComputePipelineState> add_rms_norm = nil;
     id<MTLComputePipelineState> rms_norm = nil;
     id<MTLComputePipelineState> rope = nil;
     id<MTLComputePipelineState> write_kv_cache = nil;
@@ -695,6 +749,7 @@ void release_pipelines(Pipelines& pipelines) {
     release_pipeline(pipelines.small_m_gemm_tiled);
     release_pipeline(pipelines.embedding);
     release_pipeline(pipelines.add);
+    release_pipeline(pipelines.add_rms_norm);
     release_pipeline(pipelines.rms_norm);
     release_pipeline(pipelines.rope);
     release_pipeline(pipelines.write_kv_cache);
@@ -758,6 +813,13 @@ Status build_pipelines(id<MTLDevice> device, Pipelines& pipelines) {
     }
     if (status) {
         status = build_pipeline(device, library, "add_inplace_f32", pipelines.add);
+    }
+    if (status) {
+        status = build_pipeline(
+            device,
+            library,
+            "add_rms_norm_f32",
+            pipelines.add_rms_norm);
     }
     if (status) {
         status = build_pipeline(device, library, "rms_norm_f32", pipelines.rms_norm);
@@ -1052,6 +1114,42 @@ public:
         set_tensor(encoder, src, 1);
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_1d(encoder, pipelines_.add, params.count);
+    }
+
+    void add_rms_norm_out(
+        const TensorView& norm_out,
+        const TensorView& residual_out,
+        const TensorView& residual,
+        const TensorView& weight,
+        float eps) override {
+        const NSUInteger row_bytes =
+            static_cast<NSUInteger>(residual_out.dim(1)) * sizeof(float);
+        if (row_bytes > [device_ maxThreadgroupMemoryLength]) {
+            add_inplace(residual_out, residual);
+            rms_norm_out(norm_out, residual_out, weight, eps);
+            return;
+        }
+
+        RmsNormParams params;
+        params.rows = checked_u32(
+            residual_out.dim(0),
+            "Metal fused add RMSNorm rows exceeds uint32");
+        params.hidden = checked_u32(
+            residual_out.dim(1),
+            "Metal fused add RMSNorm hidden exceeds uint32");
+        params.eps = eps;
+
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        [encoder setComputePipelineState:pipelines_.add_rms_norm];
+        set_tensor(encoder, norm_out, 0);
+        set_tensor(encoder, residual_out, 1);
+        set_tensor(encoder, residual, 2);
+        set_tensor(encoder, weight, 3);
+        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        [encoder setThreadgroupMemoryLength:row_bytes atIndex:0];
+        constexpr NSUInteger threads_per_threadgroup = 256;
+        [encoder dispatchThreadgroups:MTLSizeMake(params.rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
     }
 
     void rms_norm_out(

@@ -44,6 +44,12 @@ public:
     virtual void add_inplace(
         const TensorView& dst,
         const TensorView& src) = 0;
+    virtual void add_rms_norm_out(
+        const TensorView& norm_out,
+        const TensorView& residual_out,
+        const TensorView& residual,
+        const TensorView& weight,
+        float eps) = 0;
     virtual void rms_norm_out(
         const TensorView& out,
         const TensorView& x,
