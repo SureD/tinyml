@@ -99,6 +99,30 @@ public:
         }
     }
 
+    void matmul_argmax(
+        uint32_t& out_index,
+        const TensorView& x,
+        const TensorView& w) override {
+        const int64_t k = x.dim(1);
+        const int64_t n = w.dim(0);
+        const float* x_data = f32_data(x);
+        const float* w_data = f32_data(w);
+
+        uint32_t best_index = 0;
+        float best_value = -std::numeric_limits<float>::max();
+        for (int64_t col = 0; col < n; ++col) {
+            float value = 0.0f;
+            for (int64_t inner = 0; inner < k; ++inner) {
+                value += x_data[inner] * w_data[col * k + inner];
+            }
+            if (value > best_value) {
+                best_value = value;
+                best_index = static_cast<uint32_t>(col);
+            }
+        }
+        out_index = best_index;
+    }
+
     void embedding_out(
         const TensorView& out,
         const TensorView& table,

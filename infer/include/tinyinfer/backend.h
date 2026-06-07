@@ -33,6 +33,10 @@ public:
         const TensorView& out,
         const TensorView& x,
         const TensorView& w) = 0;
+    virtual void matmul_argmax(
+        uint32_t& out_index,
+        const TensorView& x,
+        const TensorView& w) = 0;
     virtual void embedding_out(
         const TensorView& out,
         const TensorView& table,

@@ -71,8 +71,7 @@ MemoryPlan build_memory_plan(const LlamaConfig& config, uint32_t max_seq_len) {
 
     const size_t workspace_elems =
         7ULL * max_seq_len * hidden +
-        3ULL * max_seq_len * inter +
-        max_seq_len * vocab;
+        3ULL * max_seq_len * inter;
     plan.workspace_bytes = f32_bytes(workspace_elems) + 16 * kTensorAlignmentSlack;
 
     return plan;
@@ -236,14 +235,12 @@ LlamaInferEngine::LlamaInferEngine(LlamaInferEngine&& other) noexcept
       kv_cache_arena_(std::move(other.kv_cache_arena_)),
       workspace_(std::move(other.workspace_)),
       model_(std::move(other.model_)),
-      cache_(other.cache_),
-      logits_(other.logits_) {
+      cache_(other.cache_) {
     rebind_views_after_move(other);
 
     other.backend_ = nullptr;
     other.max_seq_len_ = 0;
     other.cache_ = {};
-    other.logits_ = {};
 }
 
 LlamaInferEngine& LlamaInferEngine::operator=(LlamaInferEngine&& other) noexcept {
@@ -259,13 +256,11 @@ LlamaInferEngine& LlamaInferEngine::operator=(LlamaInferEngine&& other) noexcept
     workspace_ = std::move(other.workspace_);
     model_ = std::move(other.model_);
     cache_ = other.cache_;
-    logits_ = other.logits_;
     rebind_views_after_move(other);
 
     other.backend_ = nullptr;
     other.max_seq_len_ = 0;
     other.cache_ = {};
-    other.logits_ = {};
     return *this;
 }
 
@@ -415,7 +410,6 @@ Status LlamaInferEngine::init_kv_cache() {
 
 void LlamaInferEngine::reset() {
     workspace_.reset();
-    logits_ = {};
     kv_cache_arena_.reset();
     const Shape shape = make_shape({
         static_cast<int64_t>(config_.n_layers),
@@ -464,7 +458,6 @@ void LlamaInferEngine::rebind_views_after_move(const LlamaInferEngine& source) {
 
     rebind_view_after_move(cache_.keys, source);
     rebind_view_after_move(cache_.values, source);
-    rebind_view_after_move(logits_, source);
 }
 
 Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_token) {
@@ -477,9 +470,7 @@ Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_
     }
 
     workspace_.reset();
-    run_layers(prompt, 0, logits_);
-
-    backend_->argmax(next_token, logits_);
+    run_layers(prompt, 0, next_token);
 
     cache_.seq_len = static_cast<uint32_t>(prompt.size());
     return Status::success();
@@ -493,9 +484,7 @@ Status LlamaInferEngine::decode_one(TokenId token, TokenId& next_token) {
     }
 
     workspace_.reset();
-    run_layers(one_token, cache_.seq_len, logits_);
-
-    backend_->argmax(next_token, logits_);
+    run_layers(one_token, cache_.seq_len, next_token);
 
     ++cache_.seq_len;
     return Status::success();
@@ -574,7 +563,7 @@ uint32_t LlamaInferEngine::max_seq_len() const {
 void LlamaInferEngine::run_layers(
     std::span<const TokenId> tokens,
     uint32_t start_pos,
-    TensorView& logits) {
+    TokenId& next_token) {
     const uint32_t seq_len = static_cast<uint32_t>(tokens.size());
     TensorView hidden = workspace_tensor(make_shape({
         static_cast<int64_t>(seq_len),
@@ -654,14 +643,13 @@ void LlamaInferEngine::run_layers(
         backend_->add_inplace(hidden, ffn_out);
     }
 
-    logits = workspace_tensor(make_shape({
-        1,
-        static_cast<int64_t>(config_.vocab_size),
-    }));
-
-    backend_->rms_norm_out(hidden, hidden, model_.final_norm, config_.rms_eps);
     TensorView last_hidden = last_token_view(hidden, seq_len - 1);
-    backend_->matmul_out(logits, last_hidden, model_.lm_head);
+    backend_->rms_norm_out(
+        last_hidden,
+        last_hidden,
+        model_.final_norm,
+        config_.rms_eps);
+    backend_->matmul_argmax(next_token, last_hidden, model_.lm_head);
 }
 
 }  // namespace tinyinfer

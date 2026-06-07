@@ -79,6 +79,11 @@ struct ArgmaxParams {
     uint count;
 };
 
+struct ArgmaxPair {
+    float value;
+    uint index;
+};
+
 kernel void matmul_f32(
     device float* out [[buffer(0)]],
     const device float* x [[buffer(1)]],
@@ -316,21 +321,46 @@ kernel void rms_norm_f32(
     const device float* x [[buffer(1)]],
     const device float* weight [[buffer(2)]],
     constant RmsNormParams& p [[buffer(3)]],
-    uint row [[thread_position_in_grid]]) {
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint simd_width = 32;
+    constexpr uint threads_per_threadgroup = 256;
+    constexpr uint simdgroups_per_threadgroup =
+        threads_per_threadgroup / simd_width;
+
     if (row >= p.rows) {
         return;
     }
 
     const uint base = row * p.hidden;
-    float sum_sq = 0.0f;
-    for (uint i = 0; i < p.hidden; ++i) {
+    float partial_sum_sq = 0.0f;
+    for (uint i = thread_id; i < p.hidden; i += threads_per_threadgroup) {
         const float value = x[base + i];
-        sum_sq += value * value;
+        partial_sum_sq += value * value;
     }
 
-    const float mean_sq = sum_sq / float(p.hidden);
-    const float scale = rsqrt(mean_sq + p.eps);
-    for (uint i = 0; i < p.hidden; ++i) {
+    partial_sum_sq = simd_sum(partial_sum_sq);
+    threadgroup float simd_sums[simdgroups_per_threadgroup];
+    if (lane_id == 0) {
+        simd_sums[simdgroup_id] = partial_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_id == 0) {
+        float sum_sq =
+            lane_id < simdgroups_per_threadgroup ? simd_sums[lane_id] : 0.0f;
+        sum_sq = simd_sum(sum_sq);
+        if (lane_id == 0) {
+            const float mean_sq = sum_sq / float(p.hidden);
+            simd_sums[0] = rsqrt(mean_sq + p.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = simd_sums[0];
+    for (uint i = thread_id; i < p.hidden; i += threads_per_threadgroup) {
         out[base + i] = x[base + i] * scale * weight[i];
     }
 }
@@ -460,6 +490,98 @@ kernel void swiglu_f32(
     out[gid] = (g / (1.0f + exp(-g))) * up[gid];
 }
 
+static inline ArgmaxPair better_argmax(ArgmaxPair lhs, ArgmaxPair rhs) {
+    if (rhs.value > lhs.value ||
+        (rhs.value == lhs.value && rhs.index < lhs.index)) {
+        return rhs;
+    }
+    return lhs;
+}
+
+kernel void matvec_argmax_partial_f32(
+    device ArgmaxPair* partials [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    const device float* w [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint output_in_threadgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint simd_width = 32;
+    constexpr uint outputs_per_threadgroup = 4;
+
+    const uint output_index =
+        threadgroup_id * outputs_per_threadgroup + output_in_threadgroup;
+    float partial_sum = 0.0f;
+    if (output_index < p.n) {
+        if ((p.k & 3u) == 0) {
+            const uint k_vector_count = p.k / 4;
+            const device float4* x_vectors = (const device float4*)x;
+            const device float4* weight_row =
+                (const device float4*)(w + output_index * p.k);
+            for (uint k_vector = lane_id;
+                 k_vector < k_vector_count;
+                 k_vector += simd_width) {
+                partial_sum += dot(x_vectors[k_vector], weight_row[k_vector]);
+            }
+        } else {
+            const device float* weight_row = w + output_index * p.k;
+            for (uint k = lane_id; k < p.k; k += simd_width) {
+                partial_sum += x[k] * weight_row[k];
+            }
+        }
+    }
+
+    const float output_value = simd_sum(partial_sum);
+    threadgroup ArgmaxPair output_candidates[outputs_per_threadgroup];
+    if (lane_id == 0) {
+        output_candidates[output_in_threadgroup] = {
+            output_index < p.n ? output_value : -3.402823466e+38f,
+            output_index < p.n ? output_index : 0xffffffffu,
+        };
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (thread_id == 0) {
+        ArgmaxPair best = output_candidates[0];
+        for (uint i = 1; i < outputs_per_threadgroup; ++i) {
+            best = better_argmax(best, output_candidates[i]);
+        }
+        partials[threadgroup_id] = best;
+    }
+}
+
+kernel void argmax_reduce_pairs_f32(
+    device uint* out_index [[buffer(0)]],
+    const device ArgmaxPair* partials [[buffer(1)]],
+    constant ArgmaxParams& p [[buffer(2)]],
+    uint thread_id [[thread_index_in_threadgroup]]) {
+    constexpr uint threads_per_threadgroup = 256;
+    ArgmaxPair best = {-3.402823466e+38f, 0xffffffffu};
+    for (uint i = thread_id; i < p.count; i += threads_per_threadgroup) {
+        best = better_argmax(best, partials[i]);
+    }
+
+    threadgroup ArgmaxPair candidates[threads_per_threadgroup];
+    candidates[thread_id] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_threadgroup / 2;
+         stride != 0;
+         stride /= 2) {
+        if (thread_id < stride) {
+            candidates[thread_id] = better_argmax(
+                candidates[thread_id],
+                candidates[thread_id + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_id == 0) {
+        out_index[0] = candidates[0].index;
+    }
+}
+
 kernel void argmax_f32(
     device uint* out_token [[buffer(0)]],
     const device float* logits [[buffer(1)]],
@@ -537,6 +659,11 @@ struct ArgmaxParams {
     uint32_t count;
 };
 
+struct ArgmaxPair {
+    float value;
+    uint32_t index;
+};
+
 struct Pipelines {
     id<MTLComputePipelineState> matmul = nil;
     id<MTLComputePipelineState> matvec = nil;
@@ -549,6 +676,8 @@ struct Pipelines {
     id<MTLComputePipelineState> write_kv_cache = nil;
     id<MTLComputePipelineState> attention = nil;
     id<MTLComputePipelineState> swiglu = nil;
+    id<MTLComputePipelineState> matvec_argmax_partial = nil;
+    id<MTLComputePipelineState> argmax_reduce_pairs = nil;
     id<MTLComputePipelineState> argmax = nil;
 };
 
@@ -571,6 +700,8 @@ void release_pipelines(Pipelines& pipelines) {
     release_pipeline(pipelines.write_kv_cache);
     release_pipeline(pipelines.attention);
     release_pipeline(pipelines.swiglu);
+    release_pipeline(pipelines.matvec_argmax_partial);
+    release_pipeline(pipelines.argmax_reduce_pairs);
     release_pipeline(pipelines.argmax);
 }
 
@@ -644,6 +775,20 @@ Status build_pipelines(id<MTLDevice> device, Pipelines& pipelines) {
         status = build_pipeline(device, library, "swiglu_f32", pipelines.swiglu);
     }
     if (status) {
+        status = build_pipeline(
+            device,
+            library,
+            "matvec_argmax_partial_f32",
+            pipelines.matvec_argmax_partial);
+    }
+    if (status) {
+        status = build_pipeline(
+            device,
+            library,
+            "argmax_reduce_pairs_f32",
+            pipelines.argmax_reduce_pairs);
+    }
+    if (status) {
         status = build_pipeline(device, library, "argmax_f32", pipelines.argmax);
     }
 
@@ -677,6 +822,9 @@ public:
         release_pipelines(pipelines_);
         if (argmax_buffer_ != nil) {
             [argmax_buffer_ release];
+        }
+        if (argmax_partial_buffer_ != nil) {
+            [argmax_partial_buffer_ release];
         }
         [queue_ release];
         [device_ release];
@@ -810,6 +958,53 @@ public:
         }
     }
 
+    void matmul_argmax(
+        uint32_t& out_index,
+        const TensorView& x,
+        const TensorView& w) override {
+        constexpr NSUInteger outputs_per_threadgroup = 4;
+        constexpr NSUInteger matvec_threads_per_threadgroup = 128;
+        constexpr NSUInteger reduce_threads_per_threadgroup = 256;
+
+        MatmulParams matmul_params;
+        matmul_params.m = checked_u32(x.dim(0), "Metal matmul_argmax m exceeds uint32");
+        matmul_params.k = checked_u32(x.dim(1), "Metal matmul_argmax k exceeds uint32");
+        matmul_params.n = checked_u32(w.dim(0), "Metal matmul_argmax n exceeds uint32");
+        const NSUInteger partial_count =
+            (static_cast<NSUInteger>(matmul_params.n) +
+             outputs_per_threadgroup - 1) /
+            outputs_per_threadgroup;
+
+        ensure_argmax_buffer();
+        ensure_argmax_partial_buffer(partial_count);
+
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        [encoder setComputePipelineState:pipelines_.matvec_argmax_partial];
+        [encoder setBuffer:argmax_partial_buffer_ offset:0 atIndex:0];
+        set_tensor(encoder, x, 1);
+        set_tensor(encoder, w, 2);
+        [encoder setBytes:&matmul_params length:sizeof(matmul_params) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(partial_count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(matvec_threads_per_threadgroup, 1, 1)];
+
+        ArgmaxParams argmax_params;
+        argmax_params.count = checked_u32(
+            static_cast<int64_t>(partial_count),
+            "Metal argmax partial count exceeds uint32");
+        [encoder setComputePipelineState:pipelines_.argmax_reduce_pairs];
+        [encoder setBuffer:argmax_buffer_ offset:0 atIndex:0];
+        [encoder setBuffer:argmax_partial_buffer_ offset:0 atIndex:1];
+        [encoder setBytes:&argmax_params length:sizeof(argmax_params) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(reduce_threads_per_threadgroup, 1, 1)];
+
+        Status status = flush();
+        if (!status) {
+            panic("Metal fused matmul argmax failed", __FILE__, __LINE__);
+        }
+        out_index = *static_cast<uint32_t*>([argmax_buffer_ contents]);
+    }
+
     void embedding_out(
         const TensorView& out,
         const TensorView& table,
@@ -875,7 +1070,9 @@ public:
         set_tensor(encoder, x, 1);
         set_tensor(encoder, weight, 2);
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        dispatch_1d(encoder, pipelines_.rms_norm, params.rows);
+        constexpr NSUInteger threads_per_threadgroup = 256;
+        [encoder dispatchThreadgroups:MTLSizeMake(params.rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
     }
 
     void rope_inplace(
@@ -1131,6 +1328,23 @@ private:
         }
     }
 
+    void ensure_argmax_partial_buffer(NSUInteger count) {
+        const NSUInteger bytes = count * sizeof(ArgmaxPair);
+        if (argmax_partial_buffer_ != nil &&
+            [argmax_partial_buffer_ length] >= bytes) {
+            return;
+        }
+        if (argmax_partial_buffer_ != nil) {
+            [argmax_partial_buffer_ release];
+        }
+        argmax_partial_buffer_ =
+            [device_ newBufferWithLength:bytes
+                                 options:MTLResourceStorageModePrivate];
+        if (argmax_partial_buffer_ == nil) {
+            panic("Metal argmax partial buffer allocation failed", __FILE__, __LINE__);
+        }
+    }
+
     id<MTLBuffer> metal_buffer(const MemoryArena& arena) const {
         return (id<MTLBuffer>)arena_handle(arena);
     }
@@ -1149,6 +1363,7 @@ private:
     id<MTLCommandQueue> queue_ = nil;
     Pipelines pipelines_;
     id<MTLBuffer> argmax_buffer_ = nil;
+    id<MTLBuffer> argmax_partial_buffer_ = nil;
     id<MTLCommandBuffer> pending_command_buffer_ = nil;
     id<MTLComputeCommandEncoder> pending_encoder_ = nil;
     std::vector<id<MTLBuffer>> transient_buffers_;

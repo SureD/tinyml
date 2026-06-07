@@ -100,6 +100,16 @@ public:
         calls.push_back("matmul");
     }
 
+    void matmul_argmax(
+        uint32_t& out_index,
+        const TensorView& x,
+        const TensorView& w) override {
+        (void)x;
+        (void)w;
+        calls.push_back("matmul_argmax");
+        out_index = 42;
+    }
+
     void embedding_out(
         const TensorView& out,
         const TensorView& table,
@@ -993,6 +1003,33 @@ void run_reference_operator_checks(Backend& backend) {
 
         backend.matmul_out(out.value, x.value, w.value);
         expect_f32_tensor_near(backend, out.value, {-4.0f, 1.0f, -2.0f, 204.0f, 0.0f});
+
+        uint32_t best_index = 99;
+        backend.matmul_argmax(best_index, x.value, w.value);
+        EXPECT_EQ(best_index, 3u);
+    }
+
+    arena.reset();
+    {
+        Result<TensorView> x = arena.alloc(make_shape({1, 4}), DType::f32);
+        Result<TensorView> w = arena.alloc(make_shape({5, 4}), DType::f32);
+        EXPECT_TRUE(x.status);
+        EXPECT_TRUE(w.status);
+
+        const float x_values[] = {1.0f, 1.0f, 1.0f, 1.0f};
+        const float w_values[] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f,
+            -1.0f, -1.0f, -1.0f, -1.0f,
+            0.5f, 0.5f, 0.5f, 0.5f,
+        };
+        copy_f32_to_tensor(backend, x.value, x_values);
+        copy_f32_to_tensor(backend, w.value, w_values);
+
+        uint32_t best_index = 99;
+        backend.matmul_argmax(best_index, x.value, w.value);
+        EXPECT_EQ(best_index, 1u);
     }
 
     arena.reset();
@@ -1380,13 +1417,13 @@ void test_engine_flow_with_fake_backend() {
         Status::invalid_argument);
 
     bool saw_attention = false;
-    bool saw_argmax = false;
+    bool saw_matmul_argmax = false;
     bool saw_embedding = false;
     bool saw_add = false;
     uint32_t arena_allocs = 0;
     for (const std::string& call : backend.calls) {
         saw_attention = saw_attention || call == "attention";
-        saw_argmax = saw_argmax || call == "argmax";
+        saw_matmul_argmax = saw_matmul_argmax || call == "matmul_argmax";
         saw_embedding = saw_embedding || call == "embedding";
         saw_add = saw_add || call == "add";
         arena_allocs += call == "alloc_arena" ? 1u : 0u;
@@ -1395,7 +1432,7 @@ void test_engine_flow_with_fake_backend() {
     EXPECT_TRUE(saw_embedding);
     EXPECT_TRUE(saw_attention);
     EXPECT_TRUE(saw_add);
-    EXPECT_TRUE(saw_argmax);
+    EXPECT_TRUE(saw_matmul_argmax);
 }
 
 void test_model_loader_safetensors_with_fake_backend() {
