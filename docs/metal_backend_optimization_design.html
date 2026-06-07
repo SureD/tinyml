@@ -1,0 +1,1207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Metal Backend Optimization Design</title>
+  <style>
+    :root {
+      --page: #f5f5f7;
+      --paper: #ffffff;
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --line: #d2d2d7;
+      --blue: #06c;
+      --blue-soft: #f0f7ff;
+      --green: #18794e;
+      --green-soft: #edf9f2;
+      --orange: #9a4f00;
+      --orange-soft: #fff7ed;
+      --code: #f5f5f7;
+      --shadow: 0 16px 48px rgba(0, 0, 0, 0.07);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--page);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+        "PingFang SC", "Hiragino Sans GB", sans-serif;
+      font-size: 16px;
+      line-height: 1.7;
+    }
+
+    main {
+      width: min(980px, calc(100% - 40px));
+      margin: 48px auto 80px;
+      padding: 64px 72px;
+      background: var(--paper);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    h1,
+    h2,
+    h3 {
+      letter-spacing: -0.025em;
+      line-height: 1.2;
+    }
+
+    h1 {
+      margin: 8px 0 16px;
+      font-size: clamp(38px, 6vw, 62px);
+      font-weight: 720;
+    }
+
+    h2 {
+      margin: 72px 0 20px;
+      padding-top: 4px;
+      font-size: 30px;
+      font-weight: 700;
+    }
+
+    h3 {
+      margin: 34px 0 12px;
+      font-size: 21px;
+      font-weight: 670;
+    }
+
+    p {
+      margin: 10px 0 18px;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code {
+      padding: 0.15em 0.35em;
+      border-radius: 5px;
+      background: var(--code);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 0.9em;
+    }
+
+    pre {
+      margin: 18px 0 24px;
+      padding: 20px 22px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--code);
+      line-height: 1.55;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+    }
+
+    table {
+      width: 100%;
+      margin: 20px 0 28px;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    ul,
+    ol {
+      margin: 12px 0 24px;
+      padding-left: 24px;
+    }
+
+    li {
+      margin: 8px 0;
+    }
+
+    .eyebrow {
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      max-width: 720px;
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.5;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 22px;
+      margin-top: 26px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .rule {
+      height: 1px;
+      margin: 36px 0 0;
+      background: var(--line);
+    }
+
+    .decision-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 22px 0;
+    }
+
+    .decision {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fbfbfd;
+    }
+
+    .decision strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 18px;
+    }
+
+    .decision p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .callout {
+      margin: 24px 0;
+      padding: 18px 20px;
+      border-left: 4px solid var(--blue);
+      border-radius: 8px 14px 14px 8px;
+      background: var(--blue-soft);
+    }
+
+    .callout.green {
+      border-left-color: var(--green);
+      background: var(--green-soft);
+    }
+
+    .callout.orange {
+      border-left-color: var(--orange);
+      background: var(--orange-soft);
+    }
+
+    .callout p:last-child {
+      margin-bottom: 0;
+    }
+
+    .formula {
+      margin: 24px 0;
+      padding: 22px;
+      border-radius: 16px;
+      color: #fff;
+      background: #1d1d1f;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 15px;
+      line-height: 1.65;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 18px;
+      align-items: center;
+      margin: 26px 0;
+    }
+
+    .flow-card {
+      min-height: 160px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    .flow-card.bad {
+      background: var(--orange-soft);
+    }
+
+    .flow-card.good {
+      background: var(--green-soft);
+    }
+
+    .flow-card strong {
+      display: block;
+      margin-bottom: 10px;
+    }
+
+    .flow-card code {
+      display: block;
+      margin: 5px 0;
+      background: rgba(255, 255, 255, 0.65);
+    }
+
+    .arrow {
+      color: var(--muted);
+      font-size: 26px;
+    }
+
+    .priority {
+      display: grid;
+      grid-template-columns: 48px 1fr;
+      gap: 16px;
+      margin: 18px 0;
+      align-items: start;
+    }
+
+    .priority-number {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--text);
+      font-weight: 700;
+    }
+
+    .priority h3 {
+      margin: 2px 0 7px;
+    }
+
+    .priority p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    footer {
+      margin-top: 72px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 720px) {
+      main {
+        width: 100%;
+        margin: 0;
+        padding: 40px 22px 64px;
+        border-radius: 0;
+      }
+
+      .decision-grid,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .arrow {
+        display: none;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">Implementation Proposal</div>
+      <h1>Metal Backend Optimization</h1>
+      <p class="subtitle">
+        目标不是先做一轮大而全的 profiling，而是先从 Metal 执行模型、
+        M5 硬件约束和 TinyLlama 的实际矩阵形状，推导出当前实现中确定存在的问题。
+      </p>
+      <div class="meta">
+        <span><strong>Status:</strong> Proposed</span>
+        <span><strong>Target:</strong> Apple M5 / Metal 4</span>
+        <span><strong>Model:</strong> TinyLlama 1.1B</span>
+        <span><strong>Scope:</strong> <code>infer/src/metal_backend.mm</code></span>
+      </div>
+      <div class="rule"></div>
+    </header>
+
+    <section id="decisions">
+      <h2>结论先行</h2>
+      <div class="decision-grid">
+        <article class="decision">
+          <strong>1. 不应每个 op 都等待 GPU</strong>
+          <p>
+            同一 serial compute pass 内的 dispatch 已按顺序处理依赖。
+            每个 op 调用 <code>waitUntilCompleted</code> 是 CPU 等待，不是算子依赖所必需的同步。
+          </p>
+        </article>
+        <article class="decision">
+          <strong>2. Matmul 至少分成三条路径</strong>
+          <p>
+            <code>M=1</code> 用带宽型 GEMV，<code>M=2..8</code> 用 small-batch
+            GEMV，较大的 M 才进入 tiled GEMM / Metal 4 MPP。
+          </p>
+        </article>
+        <article class="decision">
+          <strong>3. 先合并提交，再融合 kernel</strong>
+          <p>
+            第一层收益来自一次提交多个 dispatch。随后再做 QKV、gate/up、
+            matmul epilogue 和 decode attention 的数据流融合。
+          </p>
+        </article>
+        <article class="decision">
+          <strong>4. 精度是最后一层优化</strong>
+          <p>
+            FP16 能把权重流量减半，但不能修复错误的同步、跨行访存和多余中间张量。
+            先把执行结构做对，再切 FP16。
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="model">
+      <h2>0. 推导起点：M 决定复用，M5 决定映射</h2>
+      <p>
+        所有优化都从同一个矩阵乘法开始。TinyLlama 的线性层执行：
+      </p>
+      <div class="formula">
+        X[M,K] × W[N,K]ᵀ → Y[M,N]<br><br>
+        M = 本次同时处理的 token 数<br>
+        K = 输入 hidden dimension<br>
+        N = 输出 dimension
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>M 的范围</th>
+            <th>硬件行为</th>
+            <th>kernel 目标</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>M=1</code></td>
+            <td>每个权重只服务一个 token，几乎没有层内复用</td>
+            <td>减少字节数，保证连续/向量化 load，用足内存带宽</td>
+          </tr>
+          <tr>
+            <td><code>M=2..8</code></td>
+            <td>已有少量权重复用，但不足以摊薄完整 GEMM tile 的固定成本</td>
+            <td>一次权重 load 同时累积多个 token 的 small-batch GEMV</td>
+          </tr>
+          <tr>
+            <td><code>M&gt;8</code></td>
+            <td>权重可被多个 token 重复使用，arithmetic intensity 上升</td>
+            <td>二维 tiled GEMM；对齐且 <code>M≥32</code> 时进入 Metal 4 MPP</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout green">
+        <strong>统一原则：</strong>
+        Decode 优化的是“每字节完成更多有效工作之前，先把字节连续地送进来”；
+        Prefill 优化的是“同一份权重送进来一次，尽量服务多个 token”。
+        cache 和 threadgroup memory 都只是实现复用的手段，不是目标本身。
+      </div>
+
+      <pre><code>if (M == 1)                 → GEMV
+else if (M &lt;= 8)            → small-batch GEMV
+else if (M &gt;= 32 &amp;&amp; aligned
+         &amp;&amp; fp16_mpp)      → Metal 4 matmul2d
+else                        → tiled GEMM fallback</code></pre>
+
+      <h3>这台 M5 的可用硬件参数</h3>
+      <p>
+        下表不是产品宣传参数的拼接，而是本机 <code>system_profiler</code> 与 Metal
+        runtime 查询结果。数值只对当前 MacBook Air 配置负责。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>参数</th>
+            <th>本机值</th>
+            <th>对 kernel 的含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>GPU</td>
+            <td>Apple M5，8 GPU cores</td>
+            <td>threadgroup 会由硬件调度到 8 个 core；不是只启动 8 个 group</td>
+          </tr>
+          <tr>
+            <td>Metal capability</td>
+            <td>Metal 4，Apple family 10</td>
+            <td>可使用 Metal 4 Tensor / MPP 路径，并保留普通 compute fallback</td>
+          </tr>
+          <tr>
+            <td>GPU AI hardware</td>
+            <td>每个 GPU core 一个 Neural Accelerator</td>
+            <td>普通 scalar loop 不应假设自动利用它；矩阵路径使用 Metal 4 Tensor / MPP</td>
+          </tr>
+          <tr>
+            <td>Unified memory</td>
+            <td>16 GB，峰值 153 GB/s</td>
+            <td>Decode 的主要 roofline；CPU/GPU 共享 DRAM，不是 PCIe 上传速度</td>
+          </tr>
+          <tr>
+            <td><code>threadExecutionWidth</code></td>
+            <td>32 threads</td>
+            <td>一个 SIMD group 固定按 32 lanes 设计；reduction 以 32 为基本单位</td>
+          </tr>
+          <tr>
+            <td>Max threads / threadgroup</td>
+            <td>1024 = 32 SIMD groups</td>
+            <td>这是 API 上限，不是推荐值，也不代表 32 groups 能同时高效驻留</td>
+          </tr>
+          <tr>
+            <td>Threadgroup memory</td>
+            <td>32 KiB</td>
+            <td>tile、reduction scratch 和双缓冲总和必须低于此值</td>
+          </tr>
+          <tr>
+            <td>Max single buffer</td>
+            <td>8.88 GiB</td>
+            <td>4.098 GiB FP32 权重 arena 可放入一个 <code>MTLBuffer</code></td>
+          </tr>
+          <tr>
+            <td>Recommended working set</td>
+            <td>11.84 GiB</td>
+            <td>当前约 4.67 GiB 的 weights + KV + workspace 在预算内</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>“多少个 group”要分三层回答</h3>
+      <pre><code>8 个 GPU core                         // 物理执行资源
+  └─ threadgroup                     // 软件发出，硬件动态调度
+       └─ simdgroup = 32 threads     // 锁步执行的基本单位
+            └─ lane                  // 一个 Metal thread</code></pre>
+      <ul>
+        <li>
+          <strong>SIMD group 大小：</strong>本机确定为 32 threads。
+        </li>
+        <li>
+          <strong>每个 threadgroup 放多少 SIMD groups：</strong>由 kernel 决定。
+          本设计以 decode 的 8 groups / 256 threads，以及 MPP prefill 的
+          4 groups / 128 threads 作为起点。
+        </li>
+        <li>
+          <strong>每个 GPU core 同时驻留多少 threadgroups：</strong>Apple 没有通过
+          Metal API 公布固定值；它取决于线程数、寄存器和 threadgroup memory，
+          必须用 GPU capture/counters 验证。
+        </li>
+      </ul>
+
+      <p>
+        Decode GEMV 若让一个 256-thread group 协作计算 2 个输出行，则每个 projection
+        启动的 threadgroup 数为 <code>ceil(N/2)</code>：
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Projection</th>
+            <th>N</th>
+            <th>Threadgroups / dispatch</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Q / O / Down</td><td>2048</td><td>1024</td></tr>
+          <tr><td>K / V</td><td>256</td><td>128</td></tr>
+          <tr><td>Gate / Up</td><td>5632</td><td>2816</td></tr>
+          <tr><td>LM head</td><td>32000</td><td>16000</td></tr>
+        </tbody>
+      </table>
+      <p class="small">
+        这是可解释的首个配置，不是预先宣布的最优值。启动数远大于 8，
+        才能让调度器持续给 8 个 GPU cores 分配工作。
+      </p>
+
+      <p>
+        Prefill 若采用候选的 64×64 threadgroup 输出 tile，则
+        <code>groups = ceil(M/64) × ceil(N/64)</code>。以 <code>M=128</code> 为例：
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Projection</th>
+            <th>Threadgroups</th>
+            <th>调度含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Q</td><td>64</td><td>8 个 core 有多轮工作</td></tr>
+          <tr><td>K 或 V</td><td>8 each</td><td>单独 dispatch 只有一轮，容易被固定开销放大</td></tr>
+          <tr><td>Packed QKV</td><td>80</td><td>合成一个较饱满的 dispatch，并只读取一次 X</td></tr>
+          <tr><td>Gate 或 Up</td><td>176 each</td><td>并行度充分</td></tr>
+          <tr><td>Packed Gate+Up</td><td>352</td><td>总计算量不变，但删除一个 dispatch 和一次 X 读取</td></tr>
+        </tbody>
+      </table>
+
+      <h3>M5 仍未公开的参数</h3>
+      <p>
+        Apple 没有公开本机每个 GPU core 的 SIMD 单元数、寄存器文件容量、片上 cache
+        容量、固定 resident-threadgroup 数和精确 FP32/FP16 峰值。文档不为这些参数填入
+        猜测值；tile 候选由已知限制生成，最终 occupancy 与吞吐由 profiler 决定。
+      </p>
+    </section>
+
+    <section id="sync">
+      <h2>1. 同步：一个 op 不等于一个提交</h2>
+      <p>
+        当前每个 backend op 都创建 command buffer 和 encoder，编码一个 dispatch，
+        然后在 <code>commit_and_wait()</code> 中执行
+        <code>commit</code> + <code>waitUntilCompleted</code>。这会把一层模型切成很多个
+        CPU/GPU 往返，并使 CPU 无法提前编码后续工作。
+      </p>
+
+      <div class="flow">
+        <div class="flow-card bad">
+          <strong>当前</strong>
+          <code>encode RMSNorm</code>
+          <code>commit + CPU wait</code>
+          <code>encode Q matmul</code>
+          <code>commit + CPU wait</code>
+          <code>...</code>
+        </div>
+        <div class="arrow">→</div>
+        <div class="flow-card good">
+          <strong>目标</strong>
+          <code>begin decode step</code>
+          <code>encode all layer ops</code>
+          <code>encode final argmax</code>
+          <code>commit once + wait for token id</code>
+        </div>
+      </div>
+
+      <h3>Metal 已经提供哪些同步</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>机制</th>
+            <th>作用范围</th>
+            <th>本项目何时使用</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Serial compute dispatch</td>
+            <td>同一 compute pass 中，前一 dispatch 的写入对后一 dispatch 可见</td>
+            <td>默认路径；模型算子按顺序编码，不需要每 op CPU wait</td>
+          </tr>
+          <tr>
+            <td><code>memoryBarrier</code></td>
+            <td>同一 compute encoder 内的显式内存屏障</td>
+            <td>只有切换 concurrent dispatch 或手工管理特殊 hazard 时使用</td>
+          </tr>
+          <tr>
+            <td><code>MTLFence</code></td>
+            <td>同一 queue 上，不同 encoder/pass 之间</td>
+            <td>拆分 encoder 且资源使用 untracked hazard mode 时使用</td>
+          </tr>
+          <tr>
+            <td><code>MTLSharedEvent</code></td>
+            <td>跨 queue、跨 command buffer 或 CPU/GPU</td>
+            <td>未来多 queue 或异步流水线；当前单 queue 不需要</td>
+          </tr>
+          <tr>
+            <td><code>waitUntilCompleted</code></td>
+            <td>阻塞 CPU，直到整个 command buffer 完成</td>
+            <td>CPU 真正需要结果时：当前 greedy decode 中每个 token 的最终 token id</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout green">
+        <strong>设计决定：</strong>
+        第一版保持 tracked resources 和 serial dispatch。每个 prefill 或 decode step
+        使用一个 command buffer；只在 CPU 读取 argmax 结果时等待。不要提前引入
+        concurrent dispatch、untracked resources 或多 queue。
+      </div>
+
+      <pre><code>// Execution API: op 只编码，不提交，不等待。
+metal_begin_step(ctx);
+
+for (int layer = 0; layer &lt; n_layers; ++layer) {
+    metal_encode_rmsnorm(ctx, ...);
+    metal_encode_matmul(ctx, ...);
+    metal_encode_attention(ctx, ...);
+    metal_encode_mlp(ctx, ...);
+}
+
+metal_encode_argmax(ctx, ...);
+int token = metal_end_step_and_read_token(ctx); // 唯一 CPU wait</code></pre>
+    </section>
+
+    <section id="matmul">
+      <h2>2. Matmul：从 M5 和矩阵形状推导</h2>
+      <p>
+        TinyLlama 的线性层权重以 <code>W[N,K]</code> row-major 存储。
+        结合上一节的 M5 限制，核心 shape 如下。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Projection</th>
+            <th>N × K</th>
+            <th>FP32 / layer</th>
+            <th>关键特征</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Q / O</td>
+            <td>2048 × 2048</td>
+            <td>16 MiB each</td>
+            <td>方阵，decode 和 prefill 都是主路径</td>
+          </tr>
+          <tr>
+            <td>K / V</td>
+            <td>256 × 2048</td>
+            <td>2 MiB each</td>
+            <td>GQA 小输出维度</td>
+          </tr>
+          <tr>
+            <td>Gate / Up</td>
+            <td>5632 × 2048</td>
+            <td>44 MiB each</td>
+            <td>MLP 最大的两次输入投影</td>
+          </tr>
+          <tr>
+            <td>Down</td>
+            <td>2048 × 5632</td>
+            <td>44 MiB</td>
+            <td>K 更大，decode reduction 更长</td>
+          </tr>
+          <tr>
+            <td>LM head</td>
+            <td>32000 × 2048</td>
+            <td>250 MiB</td>
+            <td>每个 token 最大的单次权重读取</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>4.098 GiB 是怎么得到的</h3>
+      <p>
+        设层数 <code>L=22</code>、hidden <code>H=2048</code>、FFN
+        <code>I=5632</code>、词表 <code>V=32000</code>。由于
+        <code>head_dim=2048/32=64</code>、KV heads 为 4，所以
+        <code>KV=4×64=256</code>。这与
+        <code>infer/src/llama.cc::build_memory_plan()</code> 的实际分配公式一致。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>部分</th>
+            <th>参数量公式</th>
+            <th>参数量</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>每层 attention + 2 个 norm</td>
+            <td><code>2H + 2H² + 2(KV×H)</code></td>
+            <td>9,441,280</td>
+          </tr>
+          <tr>
+            <td>每层 MLP</td>
+            <td><code>3(I×H)</code></td>
+            <td>34,603,008</td>
+          </tr>
+          <tr>
+            <td>22 层合计</td>
+            <td><code>22 × 44,044,288</code></td>
+            <td>968,974,336</td>
+          </tr>
+          <tr>
+            <td>Embedding + final norm + LM head</td>
+            <td><code>V×H + H + V×H</code></td>
+            <td>131,074,048</td>
+          </tr>
+          <tr>
+            <td><strong>全部常驻权重</strong></td>
+            <td><code>1,100,048,384 × 4 bytes</code></td>
+            <td><strong>4.400 GB = 4.098 GiB</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>但单个 decode token 不读取全部 4.098 GiB</h3>
+      <p>
+        Decode 会遍历 22 层全部权重和整个 LM head，但 embedding lookup 只读取当前
+        token 的一行 <code>H=2048</code>，不会扫描 250 MiB embedding table。
+        在“跨 token 几乎没有 cache 复用”的 streaming 模型中，每个 token 的权重流量
+        可按下面的式子估算：
+      </p>
+
+      <div class="formula">
+        decode elements<br>
+        = 22-layer weights + LM head + final norm + one embedding row<br>
+        = 968,974,336 + 65,536,000 + 2,048 + 2,048<br>
+        = 1,034,514,432 FP32 values<br><br>
+        bytes = 1,034,514,432 × 4 = 4,138,057,728 bytes<br>
+        = 4.138 GB = 3.854 GiB<br><br>
+        DRAM streaming time ≈ 4.138 GB / 153 GB/s = 27.0 ms/token<br>
+        corresponding roofline ≈ 153 GB/s / 4.138 GB = 37.0 token/s
+      </div>
+
+      <h3>这不是每个 token 都把 4.138 GB 上传到 GPU</h3>
+      <p>
+        Apple Silicon 使用 unified memory，CPU 和 GPU 访问同一块物理内存，不存在独立显存，
+        也没有每个 token 经 PCIe 从 RAM 复制到 VRAM 的过程。当前 backend 在
+        <code>alloc_arena()</code> 中用 <code>MTLResourceStorageModeShared</code>
+        创建权重 buffer；checkpoint 加载时 CPU 通过 <code>memcpy</code> 写入一次，
+        此后权重一直驻留在 unified DRAM 中。
+      </p>
+
+      <pre><code>模型加载一次：
+SSD → CPU staging buffer → shared MTLBuffer in unified DRAM
+
+每个 decode token：
+同一个 MTLBuffer → memory controller / on-chip caches → GPU registers → FMA
+                    ↑
+              这里消耗 unified-memory bandwidth</code></pre>
+
+      <p>
+        第二条路径不是软件显式执行的“大复制”。matmul shader 发出普通 load，
+        硬件按 cache line 将需要的权重从 unified DRAM 拉入片上 cache，随后送到寄存器。
+        cache 的填充和淘汰由硬件完成，Metal 程序不能把 4 GB 权重手工放进“离 GPU
+        最近的缓存”，片上 cache 也容纳不下整个模型。
+      </p>
+
+      <div class="callout">
+        <strong><code>153 GB/s</code> 指什么：</strong>
+        它是 unified DRAM 通过内存控制器向 SoC 中 CPU、GPU 等单元提供数据的峰值带宽，
+        不是 GPU cache 的内部带宽，也不是 CPU 到独立 GPU 的上传带宽。多个硬件单元会共享它。
+      </div>
+
+      <p>
+        这里必须用十进制 <code>GB</code> 与厂商标注的 <code>153 GB/s</code> 相除，
+        不能直接把 GiB 当成 GB。上面的 27.0 ms 不是严格的物理下界，而是一个带假设的
+        <strong>DRAM streaming roofline</strong>：假设跨 token 几乎没有权重 cache 命中、
+        每个相关权重从 DRAM 读取一次，并且 GPU 能持续获得 100% 峰值带宽。若 cache
+        命中，DRAM 流量会下降；若考虑 activation、KV cache、attention、重复读取和调度，
+        实际时间会增加。
+      </p>
+      <p>
+        对本模型，这个估算仍然有工程意义：单 token 权重工作集约 3.854 GiB，远大于片上
+        cache；而 <code>M=1</code> 时每个矩阵权重只参与一次乘加，层内没有权重复用。
+        因此 decode 通常接近“顺序流过整套权重”，首先受 unified-memory bandwidth 限制。
+      </p>
+
+      <h3>Decode：专用 GEMV，lane 沿 K 读取</h3>
+      <p>
+        当前 matmul 让相邻 SIMD lane 计算不同输出行。对固定 <code>k</code>，
+        lane 读取地址相隔一个完整的 <code>K</code>，形成跨行 stride，无法得到理想的
+        合并访存。正确映射应当是：
+      </p>
+      <ul>
+        <li>一个 threadgroup 协作计算少量输出行，首个候选为 <code>NR=2</code>。</li>
+        <li>32 个 lane 沿连续的 K 维读取，使用 <code>float4</code> / <code>half4</code> 向量 load。</li>
+        <li>每个 lane 累积局部和，先做 SIMD reduction，再跨 SIMD groups 合并。</li>
+        <li>
+          对 TinyLlama 的 <code>K=2048/5632</code>，从 8 SIMD groups、256 threads
+          每 threadgroup 起步，以隐藏统一内存延迟。
+        </li>
+        <li><code>W[N,K]</code> 已适合 GEMV，不为 decode 盲目转置权重。</li>
+      </ul>
+
+      <div class="callout">
+        <strong>Shape dispatch：</strong>
+        <code>M == 1</code> 直接进入 GEMV kernel。不要让 decode 走带
+        threadgroup tile 装载和二维输出映射的通用 GEMM。
+      </div>
+
+      <h3>Small batch：M=2..8 不能直接当大 GEMM</h3>
+      <p>
+        这一区间已经能让一次权重读取服务多个 token，但 token 数太少，完整的
+        64×64 GEMM tile 会产生大量空位和固定开销。使用 small-batch GEMV：
+        每个 lane 读取一段连续权重，同时维护 2 到 8 个 token 的 accumulator。
+      </p>
+
+      <h3>Prefill：二维 tiled GEMM，复用权重</h3>
+      <p>
+        当 <code>M&gt;8</code> 时，同一个权重 tile 被多个 token 使用，arithmetic
+        intensity 随 M 增长。实现分两步：
+      </p>
+      <ol>
+        <li>
+          FP32 基线先实现 128-thread 的二维 tiled GEMM，保持结果可对照。
+        </li>
+        <li>
+          执行图稳定后，使用 FP16 operands + FP32 accumulation 接入 Metal 4
+          <code>matmul2d</code> / cooperative tensor。
+        </li>
+      </ol>
+
+      <table>
+        <thead>
+          <tr>
+            <th>M5 MPP 起点</th>
+            <th>值</th>
+            <th>含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>SIMD tile</td>
+            <td>32 × 32</td>
+            <td>每个 SIMD group 负责一个输出 tile</td>
+          </tr>
+          <tr>
+            <td>SIMD groups / threadgroup</td>
+            <td>2 × 2 = 4</td>
+            <td>128 threads；组合成约 64 × 64 threadgroup 输出 tile</td>
+          </tr>
+          <tr>
+            <td>K tile</td>
+            <td>128</td>
+            <td>Apple 针对 M5 16-bit GEMM 给出的起始建议</td>
+          </tr>
+          <tr>
+            <td>Operand source</td>
+            <td>Direct device memory</td>
+            <td>先让硬件 cache 工作，不默认复制 A/B 到 threadgroup memory</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        这一点修正了“prefill 必须把 A、W 都手工搬进 threadgroup memory”的过度概括。
+        Apple 的 M5 MPP 指南明确建议，优化 GEMM 可以先直接从 device memory 读取并依赖
+        cache；只有格式转换、量化解码或 profiler 证明有收益时才显式 staging。
+      </p>
+      <p class="small">
+        <code>M=9..31</code> 使用普通 tiled GEMM；<code>M≥32</code> 且维度对齐时尝试
+        MPP。LM head 在当前 <code>run_layers()</code> 中只计算最后一个 token，
+        即使刚完成 prefill，它仍走 <code>M=1</code> GEMV。
+      </p>
+    </section>
+
+    <section id="ds4">
+      <h2>3. ds4：可迁移的是方法，不是模型特例</h2>
+      <p>
+        本节对照
+        <a href="https://github.com/antirez/ds4/tree/c463029c205c2ec8d7ab6c0df4a3f52979091286">
+          antirez/ds4@c463029
+        </a>
+        的 Metal 实现。ds4 面向 DeepSeek V4 的 MoE 图，规模和算子都不同；
+        但它对提交边界、M 分段和数据流融合的处理，可以直接验证本文的主线。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>ds4 做法</th>
+            <th>源码证据</th>
+            <th>TinyLlama 迁移</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>批量复用一个 command buffer 和 compute encoder</td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/ds4_metal.m#L517-L543">
+                <code>g_batch_cb / g_batch_enc</code>
+              </a>
+            </td>
+            <td>实现 <code>begin_step / encode / end_step</code>；op wrapper 不自行等待</td>
+          </tr>
+          <tr>
+            <td>
+              <code>M=1</code>、<code>M=2..8</code>、大 M 分别走 matvec、
+              small-batch matvec、matmul
+            </td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/ds4_metal.m#L11679-L11810">
+                shape dispatch
+              </a>
+            </td>
+            <td>采用同样的三段 dispatcher，不再只判断 <code>M==1</code></td>
+          </tr>
+          <tr>
+            <td>Decode 用 4–8 SIMD groups 协作 2 个输出行</td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/ds4_metal.m#L3368-L3405">
+                matvec dispatch
+              </a>
+            </td>
+            <td>FP32 TinyLlama 从 8 groups、256 threads、<code>NR=2</code> 起步</td>
+          </tr>
+          <tr>
+            <td>
+              大 prefill 使用 Metal 4 <code>matmul2d</code>，128 threads /
+              4 SIMD groups，并按 32/64/128 token tile 选择 pipeline
+            </td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/metal/dense.metal#L1040-L1153">
+                direct-RHS MPP
+              </a>
+            </td>
+            <td>在 FP16 阶段增加 MPP 快路径；FP32 和非对齐 shape 保留 fallback</td>
+          </tr>
+          <tr>
+            <td>Gate/up dot product 后直接计算 SwiGLU</td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/metal/dense.metal#L193-L220">
+                fused gate/up/SwiGLU
+              </a>
+            </td>
+            <td>保留两股权重读取，但删除独立 SwiGLU pass 和 gate/up reread</td>
+          </tr>
+          <tr>
+            <td>RMSNorm+weight、Q/KV norm、FlashAttention 使用专用融合 kernel</td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/metal/norm.metal#L16-L159">
+                norm
+              </a>
+              /
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/metal/flash_attn.metal#L861-L928">
+                attention
+              </a>
+            </td>
+            <td>融合 reduction 后自然相邻的逐元素操作；attention 不落完整 score matrix</td>
+          </tr>
+          <tr>
+            <td>M5 的 GPU-only scratch 使用 <code>StorageModePrivate</code></td>
+            <td>
+              <a href="https://github.com/antirez/ds4/blob/c463029c205c2ec8d7ab6c0df4a3f52979091286/ds4_metal.m#L665-L715">
+                private scratch
+              </a>
+            </td>
+            <td>workspace/KV 在无需 CPU 访问时可评估 private；readback buffer 保持 shared</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        ds4 最值得复制的不是某个 tile 常量，而是它把 shape 当作 dispatch contract：
+        每条路径都有明确适用范围、function constants、pipeline cache 和 fallback。
+      </div>
+
+      <h3>不直接复制的部分</h3>
+      <p>
+        ds4 的 routed MoE、SSD expert streaming、压缩 KV、Q2/Q4/IQ2 格式和模型专用
+        attention 不属于 TinyLlama。它们证明了“量化解码应融入消费权重的 kernel”，
+        但不能成为本轮引入复杂度的理由。
+      </p>
+    </section>
+
+    <section id="fusion">
+      <h2>4. 融合：先消除边界，再消除中间数据</h2>
+
+      <h3>第一层：提交合并</h3>
+      <p>
+        把所有 op 编码进同一个 command buffer/serial compute pass，即使 kernel 一个都不改，
+        也能立即删除每个 op 的 command buffer 创建、提交和 CPU wait。这是第一优先级。
+      </p>
+
+      <h3>第二层：kernel 与数据流融合</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>候选</th>
+            <th>具体设计</th>
+            <th>决定</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Q + K + V</td>
+            <td>
+              加载时打包为 <code>[2560,2048]</code>，一次 matmul 读取 normed input，
+              输出使用 view 分成 Q/K/V；后续可在 epilogue 做 RoPE 和 KV write。
+            </td>
+            <td><strong>做</strong></td>
+          </tr>
+          <tr>
+            <td>Gate + Up + SwiGLU</td>
+            <td>
+              打包为 <code>[11264,2048]</code>，一次 matmul 生成成对结果，
+              epilogue 直接计算 <code>silu(gate) * up</code>。
+            </td>
+            <td><strong>做</strong></td>
+          </tr>
+          <tr>
+            <td>O / Down + residual</td>
+            <td>在 matmul epilogue 中加 residual，删除独立 add dispatch 和中间写回。</td>
+            <td><strong>做</strong></td>
+          </tr>
+          <tr>
+            <td>Decode attention</td>
+            <td>
+              将 KV write、QK、online softmax、PV 合并为 decode 专用 kernel，
+              避免 materialize attention scores。
+            </td>
+            <td><strong>做，排在 matmul 之后</strong></td>
+          </tr>
+          <tr>
+            <td>Final RMSNorm + LM head</td>
+            <td>
+              单独计算每行 RMS scale；LM-head GEMV 在读取 input 时乘 scale，
+              不写 normalized hidden buffer。
+            </td>
+            <td><strong>做</strong></td>
+          </tr>
+          <tr>
+            <td>RMSNorm + 整个 projection</td>
+            <td>
+              每个 projection output group 若重复计算 RMS reduction，会放大工作量；
+              跨 threadgroup 共享 scale 又需要额外阶段。
+            </td>
+            <td><strong>不直接融合</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout orange">
+        融合不是 dispatch 越少越好。若融合导致寄存器压力过高、occupancy 降低，
+        或在每个输出 group 重复 reduction，就应保留一个小 kernel 和明确的中间边界。
+      </div>
+    </section>
+
+    <section id="precision">
+      <h2>5. 精度：为什么放在最后</h2>
+      <p>
+        FP16 会把常驻权重从 4.098 GiB 降到约 2.049 GiB，并把 decode 的最低权重流量
+        从 3.854 GiB/token 降到约 1.927 GiB/token，
+        所以它最终一定重要。但如果先切 FP16：
+      </p>
+      <ul>
+        <li>每 op wait 和大量 command buffer 仍然存在。</li>
+        <li>decode GEMV 的跨行 stride 访存仍然存在。</li>
+        <li>Q/K/V、gate/up 和 residual 的重复读写仍然存在。</li>
+        <li>数值误差会让 kernel 重构更难调试。</li>
+      </ul>
+      <p>
+        因此精度策略是：先保持 FP32 建立正确基线；执行结构和 kernel mapping 稳定后，
+        再采用 <strong>FP16 weights/activations + FP32 accumulation/reduction</strong>。
+        量化是下一份独立设计，不混入本轮。
+      </p>
+    </section>
+
+    <section id="plan">
+      <h2>实施顺序</h2>
+
+      <div class="priority">
+        <div class="priority-number">1</div>
+        <div>
+          <h3>重做 execution lifetime</h3>
+          <p>
+            增加 <code>begin_step / encode_op / end_step</code>，删除 op 内
+            <code>commit_and_wait</code>；复用 command buffer 相关状态和临时 buffer。
+          </p>
+        </div>
+      </div>
+
+      <div class="priority">
+        <div class="priority-number">2</div>
+        <div>
+          <h3>建立三路 matmul dispatcher</h3>
+          <p>
+            <code>M=1</code> 使用 SIMD32 K-reduction GEMV；<code>M=2..8</code>
+            使用 small-batch GEMV；更大的 M 使用 FP32 tiled GEMM。
+          </p>
+        </div>
+      </div>
+
+      <div class="priority">
+        <div class="priority-number">3</div>
+        <div>
+          <h3>打包 projection 并加入 epilogue</h3>
+          <p>
+            依次完成 QKV、gate/up+SwiGLU、O/down+residual、final norm scale+LM head。
+          </p>
+        </div>
+      </div>
+
+      <div class="priority">
+        <div class="priority-number">4</div>
+        <div>
+          <h3>重写 decode attention</h3>
+          <p>
+            单 kernel 完成 KV append、online softmax 和 value reduction；保持 KV cache
+            布局对 head 维连续读取。
+          </p>
+        </div>
+      </div>
+
+      <div class="priority">
+        <div class="priority-number">5</div>
+        <div>
+          <h3>切换 FP16 并接入 Metal 4 MPP</h3>
+          <p>
+            在相同执行图上切 FP16 storage、保留 FP32 accumulation，并为对齐 prefill
+            shape 增加 <code>matmul2d</code> 快路径。最后再讨论 INT8/INT4。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="acceptance">
+      <h2>验收标准</h2>
+      <p>
+        Benchmark 在这里是验证工具，不是发现上述结构问题的前提。每一步只回答四个问题：
+      </p>
+      <ol>
+        <li>输出是否与 FP32 CPU/reference 在误差范围内一致。</li>
+        <li>一个 decode token 是否只发生一次 command buffer 提交和一次必要的 CPU wait。</li>
+        <li>GPU capture 中是否消除了目标中间 buffer 和独立 dispatch。</li>
+        <li>真实模型 shape 的 prefill latency 与 decode token/s 是否改善，且无回退。</li>
+      </ol>
+    </section>
+
+    <footer>
+      <strong>Primary references:</strong>
+      <a href="https://www.apple.com/newsroom/2025/10/apple-unleashes-m5-the-next-big-leap-in-ai-performance-for-apple-silicon/">
+        Apple M5
+      </a>,
+      <a href="https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf">
+        Metal Performance Primitives guide
+      </a>,
+      <a href="https://developer.apple.com/documentation/metal/mtldispatchtype/serial">serial dispatch</a>,
+      <a href="https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/memorybarrier(scope:)">memory barriers</a>,
+      <a href="https://developer.apple.com/documentation/metal/mtlfence">MTLFence</a>,
+      <a href="https://developer.apple.com/documentation/metal/mtlsharedevent">MTLSharedEvent</a>,
+      <a href="https://github.com/antirez/ds4/tree/c463029c205c2ec8d7ab6c0df4a3f52979091286">
+        antirez/ds4@c463029
+      </a>.
+      Hardware limits are taken from the local Metal device query and Apple's M5 platform specification.
+    </footer>
+  </main>
+</body>
+</html>

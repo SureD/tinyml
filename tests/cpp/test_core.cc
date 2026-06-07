@@ -971,6 +971,32 @@ void run_reference_operator_checks(Backend& backend) {
 
     arena.reset();
     {
+        Result<TensorView> x = arena.alloc(make_shape({1, 8}), DType::f32);
+        Result<TensorView> w = arena.alloc(make_shape({5, 8}), DType::f32);
+        Result<TensorView> out = arena.alloc(make_shape({1, 5}), DType::f32);
+        EXPECT_TRUE(x.status);
+        EXPECT_TRUE(w.status);
+        EXPECT_TRUE(out.status);
+
+        const float x_values[] = {
+            1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f, 7.0f, -8.0f,
+        };
+        const float w_values[] = {
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+            1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f, 7.0f, -8.0f,
+            -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        };
+        copy_f32_to_tensor(backend, x.value, x_values);
+        copy_f32_to_tensor(backend, w.value, w_values);
+
+        backend.matmul_out(out.value, x.value, w.value);
+        expect_f32_tensor_near(backend, out.value, {-4.0f, 1.0f, -2.0f, 204.0f, 0.0f});
+    }
+
+    arena.reset();
+    {
         Result<TensorView> x = arena.alloc(make_shape({2, 3}), DType::f32);
         Result<TensorView> w = arena.alloc(make_shape({2, 3}), DType::f32);
         Result<TensorView> out = arena.alloc(make_shape({2, 2}), DType::f32);

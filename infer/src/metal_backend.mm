@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 #if defined(__APPLE__) && __has_include(<Metal/Metal.h>)
 #import <Metal/Metal.h>
@@ -96,6 +97,49 @@ kernel void matmul_f32(
         sum += x[row * p.k + inner] * w[col * p.k + inner];
     }
     out[gid] = sum;
+}
+
+kernel void matvec_f32(
+    device float* out [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    const device float* w [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint output_in_threadgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint simd_width = 32;
+    constexpr uint outputs_per_threadgroup = 4;
+
+    // Split the N outputs across SIMD groups. Each SIMD group computes one output.
+    const uint output_index =
+        threadgroup_id * outputs_per_threadgroup + output_in_threadgroup;
+    if (output_index >= p.n) {
+        return;
+    }
+
+    // The 32 lanes cooperate on the K dimension of this output's dot product.
+    float partial_sum = 0.0f;
+    if ((p.k & 3u) == 0) {
+        const uint k_vector_count = p.k / 4;
+        const device float4* x_vectors = (const device float4*)x;
+        const device float4* weight_row =
+            (const device float4*)(w + output_index * p.k);
+        for (uint k_vector = lane_id;
+             k_vector < k_vector_count;
+             k_vector += simd_width) {
+            partial_sum += dot(x_vectors[k_vector], weight_row[k_vector]);
+        }
+    } else {
+        const device float* weight_row = w + output_index * p.k;
+        for (uint k = lane_id; k < p.k; k += simd_width) {
+            partial_sum += x[k] * weight_row[k];
+        }
+    }
+
+    const float output_value = simd_sum(partial_sum);
+    if (lane_id == 0) {
+        out[output_index] = output_value;
+    }
 }
 
 kernel void embedding_f32(
@@ -354,6 +398,7 @@ struct ArgmaxParams {
 
 struct Pipelines {
     id<MTLComputePipelineState> matmul = nil;
+    id<MTLComputePipelineState> matvec = nil;
     id<MTLComputePipelineState> embedding = nil;
     id<MTLComputePipelineState> add = nil;
     id<MTLComputePipelineState> rms_norm = nil;
@@ -373,6 +418,7 @@ void release_pipeline(id<MTLComputePipelineState>& pipeline) {
 
 void release_pipelines(Pipelines& pipelines) {
     release_pipeline(pipelines.matmul);
+    release_pipeline(pipelines.matvec);
     release_pipeline(pipelines.embedding);
     release_pipeline(pipelines.add);
     release_pipeline(pipelines.rms_norm);
@@ -418,6 +464,9 @@ Status build_pipelines(id<MTLDevice> device, Pipelines& pipelines) {
     }
 
     Status status = build_pipeline(device, library, "matmul_f32", pipelines.matmul);
+    if (status) {
+        status = build_pipeline(device, library, "matvec_f32", pipelines.matvec);
+    }
     if (status) {
         status = build_pipeline(device, library, "embedding_f32", pipelines.embedding);
     }
@@ -469,6 +518,7 @@ public:
           pipelines_(pipelines) {}
 
     ~MetalBackend() override {
+        (void)flush();
         release_pipelines(pipelines_);
         if (argmax_buffer_ != nil) {
             [argmax_buffer_ release];
@@ -518,6 +568,10 @@ public:
             return Status::invalid_argument_status("source host pointer is null");
         }
 
+        status = flush();
+        if (!status) {
+            return status;
+        }
         std::memcpy(data(dst), src, bytes);
         return Status::success();
     }
@@ -537,6 +591,10 @@ public:
             return Status::invalid_argument_status("destination host pointer is null");
         }
 
+        status = flush();
+        if (!status) {
+            return status;
+        }
         std::memcpy(dst, data(src), bytes);
         return Status::success();
     }
@@ -550,16 +608,30 @@ public:
         params.k = checked_u32(x.dim(1), "Metal matmul k exceeds uint32");
         params.n = checked_u32(w.dim(0), "Metal matmul n exceeds uint32");
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        [encoder setComputePipelineState:pipelines_.matmul];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        id<MTLComputePipelineState> pipeline =
+            params.m == 1 ? pipelines_.matvec : pipelines_.matmul;
+        [encoder setComputePipelineState:pipeline];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, x, 1);
         set_tensor(encoder, w, 2);
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        dispatch_1d(encoder, pipelines_.matmul, static_cast<NSUInteger>(params.m) * params.n);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
+        if (params.m == 1) {
+            constexpr NSUInteger simd_width = 32;
+            constexpr NSUInteger outputs_per_threadgroup = 4;
+            constexpr NSUInteger threads_per_threadgroup =
+                outputs_per_threadgroup * simd_width;
+            const NSUInteger threadgroups_for_n =
+                (static_cast<NSUInteger>(params.n) + outputs_per_threadgroup - 1) /
+                outputs_per_threadgroup;
+            [encoder dispatchThreadgroups:MTLSizeMake(threadgroups_for_n, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
+        } else {
+            dispatch_1d(
+                encoder,
+                pipeline,
+                static_cast<NSUInteger>(params.m) * params.n);
+        }
     }
 
     void embedding_out(
@@ -584,8 +656,7 @@ public:
             "Metal embedding token count exceeds uint32");
         params.hidden = checked_u32(table.dim(1), "Metal embedding hidden exceeds uint32");
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.embedding];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, table, 1);
@@ -595,10 +666,7 @@ public:
             encoder,
             pipelines_.embedding,
             static_cast<NSUInteger>(params.token_count) * params.hidden);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
-
-        [token_buffer release];
+        transient_buffers_.push_back(token_buffer);
     }
 
     void add_inplace(
@@ -607,15 +675,12 @@ public:
         AddParams params;
         params.count = checked_u32(dst.numel(), "Metal add count exceeds uint32");
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.add];
         set_tensor(encoder, dst, 0);
         set_tensor(encoder, src, 1);
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_1d(encoder, pipelines_.add, params.count);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
     }
 
     void rms_norm_out(
@@ -628,16 +693,13 @@ public:
         params.hidden = checked_u32(x.dim(1), "Metal RMSNorm hidden exceeds uint32");
         params.eps = eps;
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.rms_norm];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, x, 1);
         set_tensor(encoder, weight, 2);
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_1d(encoder, pipelines_.rms_norm, params.rows);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
     }
 
     void rope_inplace(
@@ -659,8 +721,7 @@ public:
         k_params.start_pos = start_pos;
         k_params.theta = theta;
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.rope];
         set_tensor(encoder, q, 0);
         [encoder setBytes:&q_params length:sizeof(q_params) atIndex:1];
@@ -679,8 +740,6 @@ public:
             static_cast<NSUInteger>(k_params.seq_len) *
                 k_params.heads *
                 (k_params.head_dim / 2));
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
     }
 
     void attention_out(
@@ -708,8 +767,7 @@ public:
         attention_params.start_pos = start_pos;
         attention_params.kv_len = kv_len;
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.write_kv_cache];
         set_tensor(encoder, k_cache, 0);
         set_tensor(encoder, v_cache, 1);
@@ -735,8 +793,6 @@ public:
             static_cast<NSUInteger>(attention_params.seq_len) *
                 attention_params.n_heads *
                 attention_params.head_dim);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
     }
 
     void swiglu_out(
@@ -746,16 +802,13 @@ public:
         UnaryParams params;
         params.count = checked_u32(out.numel(), "Metal SwiGLU count exceeds uint32");
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.swiglu];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, gate, 1);
         set_tensor(encoder, up, 2);
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_1d(encoder, pipelines_.swiglu, params.count);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
     }
 
     void argmax(
@@ -767,25 +820,27 @@ public:
         ArgmaxParams params;
         params.count = checked_u32(logits.numel(), "Metal argmax count exceeds uint32");
 
-        id<MTLCommandBuffer> command_buffer = begin_command_buffer();
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = pending_encoder();
         [encoder setComputePipelineState:pipelines_.argmax];
         [encoder setBuffer:argmax_buffer_ offset:0 atIndex:0];
         set_tensor(encoder, logits, 1);
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_1d(encoder, pipelines_.argmax, 1);
-        [encoder endEncoding];
-        commit_and_wait(command_buffer);
+        Status status = flush();
+        if (!status) {
+            panic("Metal command buffer execution failed", __FILE__, __LINE__);
+        }
 
         out_token = *static_cast<uint32_t*>([argmax_buffer_ contents]);
     }
 
     Status synchronize() override {
-        return Status::success();
+        return flush();
     }
 
 protected:
     void release_arena(MemoryArena& arena) noexcept override {
+        (void)flush();
         id<MTLBuffer> buffer = metal_buffer(arena);
         if (buffer != nil) {
             [buffer release];
@@ -823,20 +878,49 @@ private:
         return Status::success();
     }
 
-    id<MTLCommandBuffer> begin_command_buffer() {
-        id<MTLCommandBuffer> command_buffer = [queue_ commandBuffer];
-        if (command_buffer == nil) {
+    id<MTLComputeCommandEncoder> pending_encoder() {
+        if (pending_encoder_ != nil) {
+            return pending_encoder_;
+        }
+
+        pending_command_buffer_ = [[queue_ commandBuffer] retain];
+        if (pending_command_buffer_ == nil) {
             panic("Metal command buffer creation failed", __FILE__, __LINE__);
         }
-        return command_buffer;
+        pending_encoder_ = [[pending_command_buffer_ computeCommandEncoder] retain];
+        if (pending_encoder_ == nil) {
+            [pending_command_buffer_ release];
+            pending_command_buffer_ = nil;
+            panic("Metal compute encoder creation failed", __FILE__, __LINE__);
+        }
+        return pending_encoder_;
     }
 
-    void commit_and_wait(id<MTLCommandBuffer> command_buffer) {
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if ([command_buffer status] == MTLCommandBufferStatusError) {
-            panic("Metal command buffer execution failed", __FILE__, __LINE__);
+    Status flush() {
+        if (pending_command_buffer_ == nil) {
+            return Status::success();
         }
+
+        [pending_encoder_ endEncoding];
+        [pending_encoder_ release];
+        pending_encoder_ = nil;
+
+        [pending_command_buffer_ commit];
+        [pending_command_buffer_ waitUntilCompleted];
+        const bool failed =
+            [pending_command_buffer_ status] == MTLCommandBufferStatusError;
+
+        for (id<MTLBuffer> buffer : transient_buffers_) {
+            [buffer release];
+        }
+        transient_buffers_.clear();
+
+        [pending_command_buffer_ release];
+        pending_command_buffer_ = nil;
+        if (failed) {
+            return Status::backend_error_status("Metal command buffer execution failed");
+        }
+        return Status::success();
     }
 
     void dispatch_1d(
@@ -889,6 +973,9 @@ private:
     id<MTLCommandQueue> queue_ = nil;
     Pipelines pipelines_;
     id<MTLBuffer> argmax_buffer_ = nil;
+    id<MTLCommandBuffer> pending_command_buffer_ = nil;
+    id<MTLComputeCommandEncoder> pending_encoder_ = nil;
+    std::vector<id<MTLBuffer>> transient_buffers_;
 };
 
 #endif
