@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -872,12 +873,18 @@ NSUInteger dispatch_width(id<MTLComputePipelineState> pipeline, NSUInteger total
     return std::min<NSUInteger>(total, [pipeline maxTotalThreadsPerThreadgroup]);
 }
 
+bool metal_profile_enabled() {
+    const char* value = std::getenv("TINYINFER_METAL_PROFILE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 class MetalBackend final : public Backend {
 public:
     MetalBackend(id<MTLDevice> device, id<MTLCommandQueue> queue, Pipelines pipelines)
         : device_(device),
           queue_(queue),
-          pipelines_(pipelines) {}
+          pipelines_(pipelines),
+          profile_enabled_(metal_profile_enabled()) {}
 
     ~MetalBackend() override {
         (void)flush();
@@ -982,6 +989,15 @@ public:
                 ? pipelines_.small_m_gemm_tiled
                 : pipelines_.small_m_gemm;
         }
+        if (pipeline == pipelines_.matvec) {
+            profile_signpost(encoder, @"matvec_f32");
+        } else if (pipeline == pipelines_.small_m_gemm_tiled) {
+            profile_signpost(encoder, @"small_m_gemm_tiled_f32");
+        } else if (pipeline == pipelines_.small_m_gemm) {
+            profile_signpost(encoder, @"small_m_gemm_f32");
+        } else {
+            profile_signpost(encoder, @"matmul_f32");
+        }
         [encoder setComputePipelineState:pipeline];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, x, 1);
@@ -1041,6 +1057,7 @@ public:
         ensure_argmax_partial_buffer(partial_count);
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"matvec_argmax_partial_f32");
         [encoder setComputePipelineState:pipelines_.matvec_argmax_partial];
         [encoder setBuffer:argmax_partial_buffer_ offset:0 atIndex:0];
         set_tensor(encoder, x, 1);
@@ -1053,6 +1070,7 @@ public:
         argmax_params.count = checked_u32(
             static_cast<int64_t>(partial_count),
             "Metal argmax partial count exceeds uint32");
+        profile_signpost(encoder, @"argmax_reduce_pairs_f32");
         [encoder setComputePipelineState:pipelines_.argmax_reduce_pairs];
         [encoder setBuffer:argmax_buffer_ offset:0 atIndex:0];
         [encoder setBuffer:argmax_partial_buffer_ offset:0 atIndex:1];
@@ -1090,6 +1108,7 @@ public:
         params.hidden = checked_u32(table.dim(1), "Metal embedding hidden exceeds uint32");
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"embedding_f32");
         [encoder setComputePipelineState:pipelines_.embedding];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, table, 1);
@@ -1109,6 +1128,7 @@ public:
         params.count = checked_u32(dst.numel(), "Metal add count exceeds uint32");
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"add_f32");
         [encoder setComputePipelineState:pipelines_.add];
         set_tensor(encoder, dst, 0);
         set_tensor(encoder, src, 1);
@@ -1140,6 +1160,7 @@ public:
         params.eps = eps;
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"add_rms_norm_f32");
         [encoder setComputePipelineState:pipelines_.add_rms_norm];
         set_tensor(encoder, norm_out, 0);
         set_tensor(encoder, residual_out, 1);
@@ -1163,6 +1184,7 @@ public:
         params.eps = eps;
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"rms_norm_f32");
         [encoder setComputePipelineState:pipelines_.rms_norm];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, x, 1);
@@ -1193,6 +1215,11 @@ public:
         k_params.theta = theta;
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        if (profile_enabled_) {
+            [pending_command_buffer_ setLabel:
+                start_pos == 0 ? @"tinyinfer.prefill" : @"tinyinfer.decode"];
+        }
+        profile_signpost(encoder, @"rope_q_f32");
         [encoder setComputePipelineState:pipelines_.rope];
         set_tensor(encoder, q, 0);
         [encoder setBytes:&q_params length:sizeof(q_params) atIndex:1];
@@ -1203,6 +1230,7 @@ public:
                 q_params.heads *
                 (q_params.head_dim / 2));
 
+        profile_signpost(encoder, @"rope_k_f32");
         set_tensor(encoder, k, 0);
         [encoder setBytes:&k_params length:sizeof(k_params) atIndex:1];
         dispatch_1d(
@@ -1239,6 +1267,7 @@ public:
         attention_params.kv_len = kv_len;
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"write_kv_cache_f32");
         [encoder setComputePipelineState:pipelines_.write_kv_cache];
         set_tensor(encoder, k_cache, 0);
         set_tensor(encoder, v_cache, 1);
@@ -1252,6 +1281,7 @@ public:
                 write_params.n_kv_heads *
                 write_params.head_dim);
 
+        profile_signpost(encoder, @"attention_f32");
         [encoder setComputePipelineState:pipelines_.attention];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, q, 1);
@@ -1274,6 +1304,7 @@ public:
         params.count = checked_u32(out.numel(), "Metal SwiGLU count exceeds uint32");
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"swiglu_f32");
         [encoder setComputePipelineState:pipelines_.swiglu];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, gate, 1);
@@ -1292,6 +1323,7 @@ public:
         params.count = checked_u32(logits.numel(), "Metal argmax count exceeds uint32");
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
+        profile_signpost(encoder, @"argmax_f32");
         [encoder setComputePipelineState:pipelines_.argmax];
         [encoder setBuffer:argmax_buffer_ offset:0 atIndex:0];
         set_tensor(encoder, logits, 1);
@@ -1358,11 +1390,17 @@ private:
         if (pending_command_buffer_ == nil) {
             panic("Metal command buffer creation failed", __FILE__, __LINE__);
         }
+        if (profile_enabled_) {
+            [pending_command_buffer_ setLabel:@"tinyinfer.inference"];
+        }
         pending_encoder_ = [[pending_command_buffer_ computeCommandEncoder] retain];
         if (pending_encoder_ == nil) {
             [pending_command_buffer_ release];
             pending_command_buffer_ = nil;
             panic("Metal compute encoder creation failed", __FILE__, __LINE__);
+        }
+        if (profile_enabled_) {
+            [pending_encoder_ setLabel:@"tinyinfer.compute"];
         }
         return pending_encoder_;
     }
@@ -1380,6 +1418,18 @@ private:
         [pending_command_buffer_ waitUntilCompleted];
         const bool failed =
             [pending_command_buffer_ status] == MTLCommandBufferStatusError;
+        if (profile_enabled_) {
+            const CFTimeInterval gpu_start = [pending_command_buffer_ GPUStartTime];
+            const CFTimeInterval gpu_end = [pending_command_buffer_ GPUEndTime];
+            NSString* label = [pending_command_buffer_ label];
+            if (gpu_start > 0.0 && gpu_end >= gpu_start) {
+                std::fprintf(
+                    stderr,
+                    "metal_profile,label=%s,gpu_ms=%.3f\n",
+                    label == nil ? "unlabeled" : [label UTF8String],
+                    (gpu_end - gpu_start) * 1000.0);
+            }
+        }
 
         for (id<MTLBuffer> buffer : transient_buffers_) {
             [buffer release];
@@ -1392,6 +1442,14 @@ private:
             return Status::backend_error_status("Metal command buffer execution failed");
         }
         return Status::success();
+    }
+
+    void profile_signpost(
+        id<MTLComputeCommandEncoder> encoder,
+        NSString* label) const {
+        if (profile_enabled_) {
+            [encoder insertDebugSignpost:label];
+        }
     }
 
     void dispatch_1d(
@@ -1465,6 +1523,7 @@ private:
     id<MTLCommandBuffer> pending_command_buffer_ = nil;
     id<MTLComputeCommandEncoder> pending_encoder_ = nil;
     std::vector<id<MTLBuffer>> transient_buffers_;
+    bool profile_enabled_ = false;
 };
 
 #endif
