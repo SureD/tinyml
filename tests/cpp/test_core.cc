@@ -997,6 +997,46 @@ void run_reference_operator_checks(Backend& backend) {
 
     arena.reset();
     {
+        constexpr int64_t m = 5;
+        constexpr int64_t k = 256;
+        constexpr int64_t n = 6;
+        Result<TensorView> x = arena.alloc(make_shape({m, k}), DType::f32);
+        Result<TensorView> w = arena.alloc(make_shape({n, k}), DType::f32);
+        Result<TensorView> out = arena.alloc(make_shape({m, n}), DType::f32);
+        EXPECT_TRUE(x.status);
+        EXPECT_TRUE(w.status);
+        EXPECT_TRUE(out.status);
+
+        std::vector<float> x_values(static_cast<size_t>(m * k));
+        std::vector<float> w_values(static_cast<size_t>(n * k));
+        std::vector<float> expected(static_cast<size_t>(m * n));
+        for (int64_t row = 0; row < m; ++row) {
+            std::fill_n(
+                x_values.begin() + row * k,
+                k,
+                static_cast<float>(row + 1));
+        }
+        for (int64_t col = 0; col < n; ++col) {
+            std::fill_n(
+                w_values.begin() + col * k,
+                k,
+                static_cast<float>(col + 1));
+        }
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t col = 0; col < n; ++col) {
+                expected[static_cast<size_t>(row * n + col)] =
+                    static_cast<float>(k * (row + 1) * (col + 1));
+            }
+        }
+
+        copy_f32_to_tensor(backend, x.value, x_values.data());
+        copy_f32_to_tensor(backend, w.value, w_values.data());
+        backend.matmul_out(out.value, x.value, w.value);
+        expect_f32_tensor_near(backend, out.value, expected);
+    }
+
+    arena.reset();
+    {
         Result<TensorView> x = arena.alloc(make_shape({5, 8}), DType::f32);
         Result<TensorView> w = arena.alloc(make_shape({6, 8}), DType::f32);
         Result<TensorView> out = arena.alloc(make_shape({5, 6}), DType::f32);

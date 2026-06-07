@@ -214,6 +214,75 @@ kernel void small_m_gemm_f32(
     }
 }
 
+kernel void small_m_gemm_tiled_f32(
+    device float* out [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    const device float* w [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint2 threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint output_col_in_tile [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint simd_width = 32;
+    constexpr uint output_rows_per_tile = 4;
+    constexpr uint output_cols_per_tile = 4;
+    constexpr uint k_per_tile = 128;
+    constexpr uint k_vectors_per_tile = k_per_tile / 4;
+
+    // 1. One threadgroup owns a 4x4 output tile.
+    const uint output_row_begin = threadgroup_id.y * output_rows_per_tile;
+    const uint output_col =
+        threadgroup_id.x * output_cols_per_tile + output_col_in_tile;
+    const bool valid_output_col = output_col < p.n;
+
+    // 2. All 128 threads cooperatively load one X[4, 128] tile.
+    // Each SIMD group then computes one output column from the shared X tile.
+    threadgroup float4 x_tile[output_rows_per_tile * k_vectors_per_tile];
+    const uint x_row_in_tile = thread_id / k_vectors_per_tile;
+    const uint x_k_vector = thread_id % k_vectors_per_tile;
+
+    float partial_sums[output_rows_per_tile] = {};
+    for (uint k_begin = 0; k_begin < p.k; k_begin += k_per_tile) {
+        const uint output_row = output_row_begin + x_row_in_tile;
+        float4 x_values = float4(0.0f);
+        if (output_row < p.m) {
+            const device float4* x_row =
+                (const device float4*)(x + output_row * p.k + k_begin);
+            x_values = x_row[x_k_vector];
+        }
+        x_tile[thread_id] = x_values;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3. The 32 lanes split BK=128 as 32 float4 vectors. A loaded
+        // weight vector is reused across all four M rows in this tile.
+        if (valid_output_col) {
+            const device float4* weight_row =
+                (const device float4*)(w + output_col * p.k + k_begin);
+            const float4 weight_values = weight_row[lane_id];
+            for (uint row_in_tile = 0;
+                 row_in_tile < output_rows_per_tile;
+                 ++row_in_tile) {
+                partial_sums[row_in_tile] += dot(
+                    x_tile[row_in_tile * k_vectors_per_tile + lane_id],
+                    weight_values);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint row_in_tile = 0;
+         row_in_tile < output_rows_per_tile;
+         ++row_in_tile) {
+        const float output_value = simd_sum(partial_sums[row_in_tile]);
+        const uint output_row = output_row_begin + row_in_tile;
+        if (lane_id == 0 && valid_output_col && output_row < p.m) {
+            out[output_row * p.n + output_col] = output_value;
+        }
+    }
+}
+
 kernel void embedding_f32(
     device float* out [[buffer(0)]],
     const device float* table [[buffer(1)]],
@@ -472,6 +541,7 @@ struct Pipelines {
     id<MTLComputePipelineState> matmul = nil;
     id<MTLComputePipelineState> matvec = nil;
     id<MTLComputePipelineState> small_m_gemm = nil;
+    id<MTLComputePipelineState> small_m_gemm_tiled = nil;
     id<MTLComputePipelineState> embedding = nil;
     id<MTLComputePipelineState> add = nil;
     id<MTLComputePipelineState> rms_norm = nil;
@@ -493,6 +563,7 @@ void release_pipelines(Pipelines& pipelines) {
     release_pipeline(pipelines.matmul);
     release_pipeline(pipelines.matvec);
     release_pipeline(pipelines.small_m_gemm);
+    release_pipeline(pipelines.small_m_gemm_tiled);
     release_pipeline(pipelines.embedding);
     release_pipeline(pipelines.add);
     release_pipeline(pipelines.rms_norm);
@@ -543,6 +614,13 @@ Status build_pipelines(id<MTLDevice> device, Pipelines& pipelines) {
     }
     if (status) {
         status = build_pipeline(device, library, "small_m_gemm_f32", pipelines.small_m_gemm);
+    }
+    if (status) {
+        status = build_pipeline(
+            device,
+            library,
+            "small_m_gemm_tiled_f32",
+            pipelines.small_m_gemm_tiled);
     }
     if (status) {
         status = build_pipeline(device, library, "embedding_f32", pipelines.embedding);
@@ -690,7 +768,9 @@ public:
         if (params.m == 1) {
             pipeline = pipelines_.matvec;
         } else if (params.m <= 16) {
-            pipeline = pipelines_.small_m_gemm;
+            pipeline = params.k % 128 == 0
+                ? pipelines_.small_m_gemm_tiled
+                : pipelines_.small_m_gemm;
         }
         [encoder setComputePipelineState:pipeline];
         set_tensor(encoder, out, 0);
