@@ -142,6 +142,78 @@ kernel void matvec_f32(
     }
 }
 
+kernel void small_m_gemm_f32(
+    device float* out [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    const device float* w [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint2 threadgroup_id [[threadgroup_position_in_grid]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint output_col_in_tile [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint simd_width = 32;
+    constexpr uint output_rows_per_tile = 4;
+    constexpr uint output_cols_per_tile = 4;
+
+    // 1. One threadgroup owns a 4x4 tile in the [M, N] output matrix.
+    const uint output_row_begin = threadgroup_id.y * output_rows_per_tile;
+    const uint output_col =
+        threadgroup_id.x * output_cols_per_tile + output_col_in_tile;
+    if (output_col >= p.n) {
+        return;
+    }
+
+    // 2. One SIMD group computes one column of the tile and reuses each
+    // weight value across up to four output rows.
+    float partial_sums[output_rows_per_tile] = {};
+    if ((p.k & 3u) == 0) {
+        const uint k_vector_count = p.k / 4;
+        const device float4* weight_row =
+            (const device float4*)(w + output_col * p.k);
+
+        // 3. The 32 lanes split K. Each lane accumulates its part of four dots.
+        for (uint k_vector = lane_id;
+             k_vector < k_vector_count;
+             k_vector += simd_width) {
+            const float4 weight_values = weight_row[k_vector];
+            for (uint row_in_tile = 0;
+                 row_in_tile < output_rows_per_tile;
+                 ++row_in_tile) {
+                const uint output_row = output_row_begin + row_in_tile;
+                if (output_row < p.m) {
+                    const device float4* x_row =
+                        (const device float4*)(x + output_row * p.k);
+                    partial_sums[row_in_tile] +=
+                        dot(x_row[k_vector], weight_values);
+                }
+            }
+        }
+    } else {
+        const device float* weight_row = w + output_col * p.k;
+        for (uint k = lane_id; k < p.k; k += simd_width) {
+            const float weight_value = weight_row[k];
+            for (uint row_in_tile = 0;
+                 row_in_tile < output_rows_per_tile;
+                 ++row_in_tile) {
+                const uint output_row = output_row_begin + row_in_tile;
+                if (output_row < p.m) {
+                    partial_sums[row_in_tile] +=
+                        x[output_row * p.k + k] * weight_value;
+                }
+            }
+        }
+    }
+
+    for (uint row_in_tile = 0;
+         row_in_tile < output_rows_per_tile;
+         ++row_in_tile) {
+        const float output_value = simd_sum(partial_sums[row_in_tile]);
+        const uint output_row = output_row_begin + row_in_tile;
+        if (lane_id == 0 && output_row < p.m) {
+            out[output_row * p.n + output_col] = output_value;
+        }
+    }
+}
+
 kernel void embedding_f32(
     device float* out [[buffer(0)]],
     const device float* table [[buffer(1)]],
@@ -399,6 +471,7 @@ struct ArgmaxParams {
 struct Pipelines {
     id<MTLComputePipelineState> matmul = nil;
     id<MTLComputePipelineState> matvec = nil;
+    id<MTLComputePipelineState> small_m_gemm = nil;
     id<MTLComputePipelineState> embedding = nil;
     id<MTLComputePipelineState> add = nil;
     id<MTLComputePipelineState> rms_norm = nil;
@@ -419,6 +492,7 @@ void release_pipeline(id<MTLComputePipelineState>& pipeline) {
 void release_pipelines(Pipelines& pipelines) {
     release_pipeline(pipelines.matmul);
     release_pipeline(pipelines.matvec);
+    release_pipeline(pipelines.small_m_gemm);
     release_pipeline(pipelines.embedding);
     release_pipeline(pipelines.add);
     release_pipeline(pipelines.rms_norm);
@@ -466,6 +540,9 @@ Status build_pipelines(id<MTLDevice> device, Pipelines& pipelines) {
     Status status = build_pipeline(device, library, "matmul_f32", pipelines.matmul);
     if (status) {
         status = build_pipeline(device, library, "matvec_f32", pipelines.matvec);
+    }
+    if (status) {
+        status = build_pipeline(device, library, "small_m_gemm_f32", pipelines.small_m_gemm);
     }
     if (status) {
         status = build_pipeline(device, library, "embedding_f32", pipelines.embedding);
@@ -609,8 +686,12 @@ public:
         params.n = checked_u32(w.dim(0), "Metal matmul n exceeds uint32");
 
         id<MTLComputeCommandEncoder> encoder = pending_encoder();
-        id<MTLComputePipelineState> pipeline =
-            params.m == 1 ? pipelines_.matvec : pipelines_.matmul;
+        id<MTLComputePipelineState> pipeline = pipelines_.matmul;
+        if (params.m == 1) {
+            pipeline = pipelines_.matvec;
+        } else if (params.m <= 16) {
+            pipeline = pipelines_.small_m_gemm;
+        }
         [encoder setComputePipelineState:pipeline];
         set_tensor(encoder, out, 0);
         set_tensor(encoder, x, 1);
@@ -625,6 +706,21 @@ public:
                 (static_cast<NSUInteger>(params.n) + outputs_per_threadgroup - 1) /
                 outputs_per_threadgroup;
             [encoder dispatchThreadgroups:MTLSizeMake(threadgroups_for_n, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
+        } else if (params.m <= 16) {
+            constexpr NSUInteger simd_width = 32;
+            constexpr NSUInteger output_rows_per_tile = 4;
+            constexpr NSUInteger output_cols_per_tile = 4;
+            constexpr NSUInteger threads_per_threadgroup =
+                output_cols_per_tile * simd_width;
+            const NSUInteger threadgroups_for_n =
+                (static_cast<NSUInteger>(params.n) + output_cols_per_tile - 1) /
+                output_cols_per_tile;
+            const NSUInteger threadgroups_for_m =
+                (static_cast<NSUInteger>(params.m) + output_rows_per_tile - 1) /
+                output_rows_per_tile;
+            [encoder dispatchThreadgroups:
+                    MTLSizeMake(threadgroups_for_n, threadgroups_for_m, 1)
                 threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
         } else {
             dispatch_1d(
