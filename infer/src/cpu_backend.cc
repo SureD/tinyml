@@ -289,6 +289,16 @@ public:
         return Status::success();
     }
 
+    void* host_bytes(const TensorView& view) override {
+        if (!view.defined() || view.arena == nullptr || !owns_arena(*view.arena)) {
+            return nullptr;
+        }
+        if (!view.contiguous() || view.dtype != DType::f32) {
+            return nullptr;
+        }
+        return data(view);
+    }
+
 protected:
     void release_arena(MemoryArena& arena) noexcept override {
         void* handle = arena_handle(arena);

@@ -34,6 +34,8 @@ endif()
 add_library(tinyinfer STATIC
     infer/src/cpu_backend.cc
     infer/src/core.cc
+    infer/src/embedder.cc
+    infer/src/embedder_loader.cc
     infer/src/llama.cc
     infer/src/model_loader.cc
     infer/src/metal_backend.mm
@@ -82,5 +84,16 @@ add_executable(bench_infer
 target_link_libraries(bench_infer PRIVATE tinyinfer)
 target_compile_options(bench_infer PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(embedder_tests
+    tests/cpp/test_embedder.cc
+)
+
+target_link_libraries(embedder_tests PRIVATE tinyinfer)
+target_compile_options(embedder_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(embedder_tests PRIVATE
+    TINYINFER_EMBEDDER_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/data"
+)
+
 enable_testing()
 add_test(NAME tinyinfer_tests COMMAND tinyinfer_tests)
+add_test(NAME embedder_tests COMMAND embedder_tests)
