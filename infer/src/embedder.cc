@@ -1,5 +1,6 @@
 #include "tinyinfer/embedder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -42,8 +43,8 @@ bool matryoshka_width(size_t width, uint32_t embedding_dim) {
     return width == 128 || width == 256 || width == 512;
 }
 
-Status alloc_f32(MemoryArena& arena, const Shape& shape, TensorView& out) {
-    Result<TensorView> view = arena.alloc(shape, DType::f32);
+Status alloc_dtype(MemoryArena& arena, const Shape& shape, DType dtype, TensorView& out) {
+    Result<TensorView> view = arena.alloc(shape, dtype);
     if (!view.status) {
         return view.status;
     }
@@ -51,13 +52,130 @@ Status alloc_f32(MemoryArena& arena, const Shape& shape, TensorView& out) {
     return Status::success();
 }
 
+Status alloc_f32(MemoryArena& arena, const Shape& shape, TensorView& out) {
+    return alloc_dtype(arena, shape, DType::f32, out);
+}
+
 Status require_f32(Backend& backend, const TensorView& view, float*& out) {
+    if (view.dtype != DType::f32) {
+        return Status::backend_error_status("embedder tensor is not float32");
+    }
     void* bytes = backend.host_bytes(view);
     if (bytes == nullptr) {
         return Status::backend_error_status("embedder tensor is not a CPU f32 buffer");
     }
     out = static_cast<float*>(bytes);
     return Status::success();
+}
+
+Status require_i8(Backend& backend, const TensorView& view, int8_t*& out) {
+    if (view.dtype != DType::i8) {
+        return Status::backend_error_status("embedder tensor is not int8");
+    }
+    void* bytes = backend.host_bytes(view);
+    if (bytes == nullptr) {
+        return Status::backend_error_status("embedder tensor is not a CPU int8 buffer");
+    }
+    out = static_cast<int8_t*>(bytes);
+    return Status::success();
+}
+
+int unpack_q(const int8_t* packed, int64_t index, int bits) {
+    if (bits == 8) {
+        return packed[index];
+    }
+    const uint8_t byte = static_cast<uint8_t>(packed[index / 2]);
+    int nibble = (index & 1) != 0 ? (byte >> 4) : (byte & 0x0f);
+    if ((nibble & 0x8) != 0) {
+        nibble -= 16;
+    }
+    return nibble;
+}
+
+void store_q(int8_t* packed, int64_t index, int bits, int q) {
+    if (bits == 8) {
+        packed[index] = static_cast<int8_t>(q);
+        return;
+    }
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(packed);
+    const uint8_t nibble = static_cast<uint8_t>(q) & 0x0f;
+    if ((index & 1) == 0) {
+        bytes[index / 2] = nibble;
+    } else {
+        bytes[index / 2] = static_cast<uint8_t>(bytes[index / 2] | (nibble << 4));
+    }
+}
+
+int64_t packed_cols(int64_t cols, int bits) {
+    if (bits == 8) {
+        return cols;
+    }
+    return (cols + 1) / 2;
+}
+
+void quantize_matrix(
+    const float* weight,
+    int64_t rows,
+    int64_t cols,
+    int bits,
+    std::vector<int8_t>& packed,
+    std::vector<float>& scale,
+    std::vector<int8_t>& zero) {
+    const int qmin = bits == 8 ? -128 : -8;
+    const int qmax = bits == 8 ? 127 : 7;
+    const int64_t stride = packed_cols(cols, bits);
+    packed.assign(static_cast<size_t>(rows * stride), 0);
+    scale.assign(static_cast<size_t>(rows), 0.0f);
+    zero.assign(static_cast<size_t>(rows), 0);
+    for (int64_t row = 0; row < rows; ++row) {
+        const float* src = weight + row * cols;
+        int8_t* dst = packed.data() + row * stride;
+        float min_v = src[0];
+        float max_v = src[0];
+        for (int64_t col = 1; col < cols; ++col) {
+            min_v = std::min(min_v, src[col]);
+            max_v = std::max(max_v, src[col]);
+        }
+        int zero_point = 0;
+        float row_scale = 0.0f;
+        if (max_v == min_v) {
+            // (q - zero) * scale with q = 1 and zero = 0 reproduces the constant.
+            row_scale = max_v;
+            zero_point = 0;
+            for (int64_t col = 0; col < cols; ++col) {
+                store_q(dst, col, bits, 1);
+            }
+        } else {
+            row_scale = (max_v - min_v) / static_cast<float>(qmax - qmin);
+            float zp_f = std::round(static_cast<float>(qmin) - min_v / row_scale);
+            if (zp_f < static_cast<float>(qmin)) {
+                zp_f = static_cast<float>(qmin);
+            }
+            if (zp_f > static_cast<float>(qmax)) {
+                zp_f = static_cast<float>(qmax);
+            }
+            zero_point = static_cast<int>(zp_f);
+            for (int64_t col = 0; col < cols; ++col) {
+                double scaled = static_cast<double>(src[col]) / static_cast<double>(row_scale);
+                if (scaled > static_cast<double>(qmax - qmin)) {
+                    scaled = static_cast<double>(qmax - qmin);
+                }
+                if (scaled < static_cast<double>(qmin - qmax)) {
+                    scaled = static_cast<double>(qmin - qmax);
+                }
+                int q = static_cast<int>(std::lround(scaled)) + zero_point;
+                if (q < qmin) {
+                    q = qmin;
+                }
+                if (q > qmax) {
+                    q = qmax;
+                }
+                store_q(dst, col, bits, q);
+            }
+        }
+        scale[static_cast<size_t>(row)] = row_scale;
+        zero[static_cast<size_t>(row)] = static_cast<int8_t>(zero_point);
+    }
 }
 
 void gemm(
@@ -76,6 +194,44 @@ void gemm(
             float sum = 0.0f;
             for (int64_t inner = 0; inner < k; ++inner) {
                 sum += x_row[inner] * w_row[inner];
+            }
+            out_row[col] = sum;
+        }
+    }
+}
+
+void gemm_quant(
+    float* out,
+    const float* x,
+    const int8_t* packed,
+    const float* scale,
+    const int8_t* zero,
+    int64_t rows,
+    int64_t k,
+    int64_t cols,
+    int bits) {
+    // Dequantize a short run of the weight row, then accumulate float32.
+    // The unpacked matrix is not stored.
+    constexpr int64_t kTile = 32;
+    for (int64_t row = 0; row < rows; ++row) {
+        const float* x_row = x + row * k;
+        float* out_row = out + row * cols;
+        for (int64_t col = 0; col < cols; ++col) {
+            const float row_scale = scale[col];
+            const int row_zero = zero[col];
+            const int8_t* row_q = packed + col * packed_cols(k, bits);
+            float sum = 0.0f;
+            for (int64_t inner = 0; inner < k;) {
+                const int64_t tile = std::min(kTile, k - inner);
+                float decoded[kTile];
+                for (int64_t t = 0; t < tile; ++t) {
+                    const int q = unpack_q(row_q, inner + t, bits);
+                    decoded[t] = static_cast<float>(q - row_zero) * row_scale;
+                }
+                for (int64_t t = 0; t < tile; ++t) {
+                    sum += x_row[inner + t] * decoded[t];
+                }
+                inner += tile;
             }
             out_row[col] = sum;
         }
@@ -413,6 +569,7 @@ EmbeddingGemma2Engine::EmbeddingGemma2Engine(EmbeddingGemma2Engine&& other) noex
       config_(std::move(other.config_)),
       max_seq_len_(other.max_seq_len_),
       weights_loaded_(other.weights_loaded_),
+      quant_(other.quant_),
       weights_(std::move(other.weights_)),
       workspace_(std::move(other.workspace_)),
       model_(std::move(other.model_)),
@@ -422,6 +579,7 @@ EmbeddingGemma2Engine::EmbeddingGemma2Engine(EmbeddingGemma2Engine&& other) noex
     other.backend_ = nullptr;
     other.max_seq_len_ = 0;
     other.weights_loaded_ = false;
+    other.quant_ = EmbeddingGemma2Quant::f32;
     other.work_ = {};
 }
 
@@ -433,6 +591,7 @@ EmbeddingGemma2Engine& EmbeddingGemma2Engine::operator=(EmbeddingGemma2Engine&& 
     config_ = std::move(other.config_);
     max_seq_len_ = other.max_seq_len_;
     weights_loaded_ = other.weights_loaded_;
+    quant_ = other.quant_;
     weights_ = std::move(other.weights_);
     workspace_ = std::move(other.workspace_);
     model_ = std::move(other.model_);
@@ -442,6 +601,7 @@ EmbeddingGemma2Engine& EmbeddingGemma2Engine::operator=(EmbeddingGemma2Engine&& 
     other.backend_ = nullptr;
     other.max_seq_len_ = 0;
     other.weights_loaded_ = false;
+    other.quant_ = EmbeddingGemma2Quant::f32;
     other.work_ = {};
     return *this;
 }
@@ -514,10 +674,15 @@ Status EmbeddingGemma2Engine::bind_weights() {
     const int64_t embed = config_.embedding_dim;
     const int64_t layers = config_.n_layers;
 
-    Status status = alloc_f32(
-        weights_,
-        make_shape({static_cast<int64_t>(config_.vocab_size), hidden}),
-        model_.embed_tokens);
+    auto alloc_matrix = [&](int64_t rows, int64_t cols, Matrix& out) -> Status {
+        out.rows = rows;
+        out.cols = cols;
+        out.scale = {};
+        out.zero = {};
+        return alloc_f32(weights_, make_shape({rows, cols}), out.weight);
+    };
+
+    Status status = alloc_matrix(config_.vocab_size, hidden, model_.embed_tokens);
     if (!status) {
         return status;
     }
@@ -525,11 +690,11 @@ Status EmbeddingGemma2Engine::bind_weights() {
     if (!status) {
         return status;
     }
-    status = alloc_f32(weights_, make_shape({embed, hidden}), model_.embedding_projection);
+    status = alloc_matrix(embed, hidden, model_.embedding_projection);
     if (!status) {
         return status;
     }
-    status = alloc_f32(weights_, make_shape({layers * ple, hidden}), model_.ple_projection);
+    status = alloc_matrix(layers * ple, hidden, model_.ple_projection);
     if (!status) {
         return status;
     }
@@ -561,19 +726,19 @@ Status EmbeddingGemma2Engine::bind_weights() {
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({q_dim, hidden}), layer.q_proj);
+        status = alloc_matrix(q_dim, hidden, layer.q_proj);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({kv_dim, hidden}), layer.k_proj);
+        status = alloc_matrix(kv_dim, hidden, layer.k_proj);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({kv_dim, hidden}), layer.v_proj);
+        status = alloc_matrix(kv_dim, hidden, layer.v_proj);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({hidden, q_dim}), layer.o_proj);
+        status = alloc_matrix(hidden, q_dim, layer.o_proj);
         if (!status) {
             return status;
         }
@@ -585,23 +750,23 @@ Status EmbeddingGemma2Engine::bind_weights() {
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({inter, hidden}), layer.gate_proj);
+        status = alloc_matrix(inter, hidden, layer.gate_proj);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({inter, hidden}), layer.up_proj);
+        status = alloc_matrix(inter, hidden, layer.up_proj);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({hidden, inter}), layer.down_proj);
+        status = alloc_matrix(hidden, inter, layer.down_proj);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({ple, hidden}), layer.ple_gate);
+        status = alloc_matrix(ple, hidden, layer.ple_gate);
         if (!status) {
             return status;
         }
-        status = alloc_f32(weights_, make_shape({hidden, ple}), layer.ple_proj);
+        status = alloc_matrix(hidden, ple, layer.ple_proj);
         if (!status) {
             return status;
         }
@@ -694,28 +859,34 @@ void EmbeddingGemma2Engine::rebind_view(TensorView& view, const EmbeddingGemma2E
     }
 }
 
+void EmbeddingGemma2Engine::rebind_matrix(Matrix& matrix, const EmbeddingGemma2Engine& source) {
+    rebind_view(matrix.weight, source);
+    rebind_view(matrix.scale, source);
+    rebind_view(matrix.zero, source);
+}
+
 void EmbeddingGemma2Engine::rebind_views_after_move(const EmbeddingGemma2Engine& source) {
-    rebind_view(model_.embed_tokens, source);
+    rebind_matrix(model_.embed_tokens, source);
     rebind_view(model_.final_norm, source);
-    rebind_view(model_.embedding_projection, source);
-    rebind_view(model_.ple_projection, source);
+    rebind_matrix(model_.embedding_projection, source);
+    rebind_matrix(model_.ple_projection, source);
     rebind_view(model_.ple_norm, source);
     for (LayerWeights& layer : model_.layers) {
         rebind_view(layer.input_layernorm, source);
         rebind_view(layer.post_attention_layernorm, source);
         rebind_view(layer.pre_feedforward_layernorm, source);
         rebind_view(layer.post_feedforward_layernorm, source);
-        rebind_view(layer.q_proj, source);
-        rebind_view(layer.k_proj, source);
-        rebind_view(layer.v_proj, source);
-        rebind_view(layer.o_proj, source);
+        rebind_matrix(layer.q_proj, source);
+        rebind_matrix(layer.k_proj, source);
+        rebind_matrix(layer.v_proj, source);
+        rebind_matrix(layer.o_proj, source);
         rebind_view(layer.q_norm, source);
         rebind_view(layer.k_norm, source);
-        rebind_view(layer.gate_proj, source);
-        rebind_view(layer.up_proj, source);
-        rebind_view(layer.down_proj, source);
-        rebind_view(layer.ple_gate, source);
-        rebind_view(layer.ple_proj, source);
+        rebind_matrix(layer.gate_proj, source);
+        rebind_matrix(layer.up_proj, source);
+        rebind_matrix(layer.down_proj, source);
+        rebind_matrix(layer.ple_gate, source);
+        rebind_matrix(layer.ple_proj, source);
         rebind_view(layer.ple_norm, source);
         rebind_view(layer.layer_scalar, source);
     }
@@ -753,6 +924,225 @@ size_t EmbeddingGemma2Engine::workspace_arena_bytes() const {
 
 bool EmbeddingGemma2Engine::weights_loaded() const {
     return weights_loaded_;
+}
+
+EmbeddingGemma2Quant EmbeddingGemma2Engine::weight_quant() const {
+    return quant_;
+}
+
+Status EmbeddingGemma2Engine::quantize_weights(EmbeddingGemma2Quant quant) {
+    if (backend_ == nullptr) {
+        return Status::invalid_argument_status("embedder is empty");
+    }
+    if (!weights_loaded_ || quant_ != EmbeddingGemma2Quant::f32) {
+        return Status::invalid_argument_status("quantize requires loaded float32 weights");
+    }
+    int bits = 0;
+    if (quant == EmbeddingGemma2Quant::int8) {
+        bits = 8;
+    } else if (quant == EmbeddingGemma2Quant::int4) {
+        bits = 4;
+    } else {
+        return Status::invalid_argument_status("quantize target must be int8 or int4");
+    }
+
+    // Per matrix row, not a LiteRT file. Each 2-D weight is read as float32,
+    // packed, then the float copy is dropped. 1-D norms stay float32.
+    struct PackedMatrix {
+        Matrix* matrix = nullptr;
+        std::vector<int8_t> packed;
+        std::vector<float> scale;
+        std::vector<int8_t> zero;
+    };
+    struct SavedVector {
+        TensorView* view = nullptr;
+        Shape shape;
+        std::vector<float> values;
+    };
+
+    std::vector<Matrix*> matrices;
+    auto push_matrix = [&](Matrix& matrix) { matrices.push_back(&matrix); };
+    push_matrix(model_.embed_tokens);
+    push_matrix(model_.embedding_projection);
+    push_matrix(model_.ple_projection);
+    for (LayerWeights& layer : model_.layers) {
+        push_matrix(layer.q_proj);
+        push_matrix(layer.k_proj);
+        push_matrix(layer.v_proj);
+        push_matrix(layer.o_proj);
+        push_matrix(layer.gate_proj);
+        push_matrix(layer.up_proj);
+        push_matrix(layer.down_proj);
+        push_matrix(layer.ple_gate);
+        push_matrix(layer.ple_proj);
+    }
+
+    std::vector<TensorView*> vectors;
+    auto push_vector = [&](TensorView& view) { vectors.push_back(&view); };
+    push_vector(model_.final_norm);
+    push_vector(model_.ple_norm);
+    for (LayerWeights& layer : model_.layers) {
+        push_vector(layer.input_layernorm);
+        push_vector(layer.post_attention_layernorm);
+        push_vector(layer.pre_feedforward_layernorm);
+        push_vector(layer.post_feedforward_layernorm);
+        push_vector(layer.q_norm);
+        push_vector(layer.k_norm);
+        push_vector(layer.ple_norm);
+        push_vector(layer.layer_scalar);
+    }
+
+    std::vector<PackedMatrix> packed(matrices.size());
+    for (size_t i = 0; i < matrices.size(); ++i) {
+        Matrix& matrix = *matrices[i];
+        if (matrix.rows <= 0 || matrix.cols <= 0 || matrix.weight.dtype != DType::f32) {
+            return Status::backend_error_status("weight matrix is not float32");
+        }
+        const int64_t count = matrix.rows * matrix.cols;
+        if (count <= 0 || static_cast<size_t>(count) != static_cast<size_t>(matrix.weight.numel())) {
+            return Status::backend_error_status("weight matrix shape does not match its view");
+        }
+        std::vector<float> values(static_cast<size_t>(count));
+        Status status = backend_->copy_to_host(
+            values.data(),
+            matrix.weight,
+            matrix.weight.logical_nbytes());
+        if (!status) {
+            return status;
+        }
+        for (float value : values) {
+            if (!std::isfinite(value)) {
+                return Status::invalid_argument_status("weight matrix is not finite");
+            }
+        }
+        packed[i].matrix = &matrix;
+        quantize_matrix(
+            values.data(),
+            matrix.rows,
+            matrix.cols,
+            bits,
+            packed[i].packed,
+            packed[i].scale,
+            packed[i].zero);
+    }
+
+    std::vector<SavedVector> saved(vectors.size());
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        TensorView& view = *vectors[i];
+        if (view.dtype != DType::f32 || view.numel() <= 0) {
+            return Status::backend_error_status("norm weight is not float32");
+        }
+        saved[i].view = &view;
+        saved[i].shape = view.shape;
+        saved[i].values.resize(static_cast<size_t>(view.numel()));
+        Status status = backend_->copy_to_host(
+            saved[i].values.data(),
+            view,
+            view.logical_nbytes());
+        if (!status) {
+            return status;
+        }
+    }
+
+    size_t bytes = 0;
+    auto add_tensor = [&](size_t nbytes) -> bool {
+        return checked_add(bytes, nbytes, bytes) &&
+            checked_add(bytes, kTensorAlignmentSlack, bytes);
+    };
+    for (const PackedMatrix& item : packed) {
+        size_t scale_bytes = 0;
+        if (!checked_mul(item.scale.size(), sizeof(float), scale_bytes) ||
+            !add_tensor(item.packed.size()) ||
+            !add_tensor(scale_bytes) ||
+            !add_tensor(item.zero.size())) {
+            return Status::invalid_argument_status("quantized weight arena size overflows");
+        }
+    }
+    for (const SavedVector& item : saved) {
+        size_t vector_bytes = 0;
+        if (!checked_mul(item.values.size(), sizeof(float), vector_bytes) ||
+            !add_tensor(vector_bytes)) {
+            return Status::invalid_argument_status("quantized weight arena size overflows");
+        }
+    }
+
+    Status status = backend_->alloc_arena(weights_, bytes, MemoryKind::weights);
+    if (!status) {
+        return status;
+    }
+
+    auto fail = [&](Status error) -> Status {
+        weights_loaded_ = false;
+        quant_ = EmbeddingGemma2Quant::f32;
+        return error;
+    };
+
+    for (PackedMatrix& item : packed) {
+        const int64_t stride = packed_cols(item.matrix->cols, bits);
+        status = alloc_dtype(
+            weights_,
+            make_shape({item.matrix->rows, stride}),
+            DType::i8,
+            item.matrix->weight);
+        if (!status) {
+            return fail(status);
+        }
+        status = alloc_dtype(
+            weights_,
+            make_shape({item.matrix->rows}),
+            DType::f32,
+            item.matrix->scale);
+        if (!status) {
+            return fail(status);
+        }
+        status = alloc_dtype(
+            weights_,
+            make_shape({item.matrix->rows}),
+            DType::i8,
+            item.matrix->zero);
+        if (!status) {
+            return fail(status);
+        }
+        status = backend_->copy_from_host(
+            item.matrix->weight,
+            item.packed.data(),
+            item.packed.size());
+        if (!status) {
+            return fail(status);
+        }
+        status = backend_->copy_from_host(
+            item.matrix->scale,
+            item.scale.data(),
+            item.scale.size() * sizeof(float));
+        if (!status) {
+            return fail(status);
+        }
+        status = backend_->copy_from_host(
+            item.matrix->zero,
+            item.zero.data(),
+            item.zero.size());
+        if (!status) {
+            return fail(status);
+        }
+    }
+
+    for (SavedVector& item : saved) {
+        status = alloc_dtype(weights_, item.shape, DType::f32, *item.view);
+        if (!status) {
+            return fail(status);
+        }
+        status = backend_->copy_from_host(
+            *item.view,
+            item.values.data(),
+            item.values.size() * sizeof(float));
+        if (!status) {
+            return fail(status);
+        }
+    }
+
+    quant_ = quant;
+    weights_loaded_ = true;
+    return Status::success();
 }
 
 Status EmbeddingGemma2Engine::embed(
@@ -812,11 +1202,8 @@ Status EmbeddingGemma2Engine::forward(
     float* ple = nullptr;
     float* projected = nullptr;
     float* pooled = nullptr;
-    float* table = nullptr;
-    float* ple_weight = nullptr;
     float* ple_norm_weight = nullptr;
     float* final_norm = nullptr;
-    float* embed_weight = nullptr;
 
     Status status = require_f32(*backend_, work_.hidden, hidden_states);
     if (!status) {
@@ -874,14 +1261,6 @@ Status EmbeddingGemma2Engine::forward(
     if (!status) {
         return status;
     }
-    status = require_f32(*backend_, model_.embed_tokens, table);
-    if (!status) {
-        return status;
-    }
-    status = require_f32(*backend_, model_.ple_projection, ple_weight);
-    if (!status) {
-        return status;
-    }
     status = require_f32(*backend_, model_.ple_norm, ple_norm_weight);
     if (!status) {
         return status;
@@ -890,20 +1269,85 @@ Status EmbeddingGemma2Engine::forward(
     if (!status) {
         return status;
     }
-    status = require_f32(*backend_, model_.embedding_projection, embed_weight);
-    if (!status) {
-        return status;
-    }
 
-    for (int64_t t = 0; t < seq; ++t) {
-        const float* src = table + static_cast<int64_t>(tokens[static_cast<size_t>(t)]) * hidden;
-        float* dst = hidden_states + t * hidden;
-        for (int64_t i = 0; i < hidden; ++i) {
-            dst[i] = src[i] * embed_scale;
+    const int quant_bits = quant_ == EmbeddingGemma2Quant::int8 ? 8 : 4;
+    auto linear = [&](float* dst, const float* src, const Matrix& matrix, int64_t m, int64_t k, int64_t n) -> Status {
+        if (matrix.rows != n || matrix.cols != k) {
+            return Status::backend_error_status("matrix shape does not match the linear");
+        }
+        if (quant_ == EmbeddingGemma2Quant::f32) {
+            float* weight = nullptr;
+            Status linear_status = require_f32(*backend_, matrix.weight, weight);
+            if (!linear_status) {
+                return linear_status;
+            }
+            gemm(dst, src, weight, m, k, n);
+            return Status::success();
+        }
+        int8_t* packed = nullptr;
+        float* scale = nullptr;
+        int8_t* zero = nullptr;
+        Status linear_status = require_i8(*backend_, matrix.weight, packed);
+        if (!linear_status) {
+            return linear_status;
+        }
+        linear_status = require_f32(*backend_, matrix.scale, scale);
+        if (!linear_status) {
+            return linear_status;
+        }
+        linear_status = require_i8(*backend_, matrix.zero, zero);
+        if (!linear_status) {
+            return linear_status;
+        }
+        gemm_quant(dst, src, packed, scale, zero, m, k, n, quant_bits);
+        return Status::success();
+    };
+
+    if (quant_ == EmbeddingGemma2Quant::f32) {
+        float* table = nullptr;
+        status = require_f32(*backend_, model_.embed_tokens.weight, table);
+        if (!status) {
+            return status;
+        }
+        for (int64_t t = 0; t < seq; ++t) {
+            const float* src = table + static_cast<int64_t>(tokens[static_cast<size_t>(t)]) * hidden;
+            float* dst = hidden_states + t * hidden;
+            for (int64_t i = 0; i < hidden; ++i) {
+                dst[i] = src[i] * embed_scale;
+            }
+        }
+    } else {
+        int8_t* packed = nullptr;
+        float* scale = nullptr;
+        int8_t* zero = nullptr;
+        status = require_i8(*backend_, model_.embed_tokens.weight, packed);
+        if (!status) {
+            return status;
+        }
+        status = require_f32(*backend_, model_.embed_tokens.scale, scale);
+        if (!status) {
+            return status;
+        }
+        status = require_i8(*backend_, model_.embed_tokens.zero, zero);
+        if (!status) {
+            return status;
+        }
+        const int64_t stride = packed_cols(hidden, quant_bits);
+        for (int64_t t = 0; t < seq; ++t) {
+            const int64_t id = static_cast<int64_t>(tokens[static_cast<size_t>(t)]);
+            const int8_t* row = packed + id * stride;
+            float* dst = hidden_states + t * hidden;
+            for (int64_t i = 0; i < hidden; ++i) {
+                const int q = unpack_q(row, i, quant_bits);
+                dst[i] = static_cast<float>(q - zero[id]) * scale[id] * embed_scale;
+            }
         }
     }
 
-    gemm(ple, hidden_states, ple_weight, seq, hidden, n_layers * ple_dim);
+    status = linear(ple, hidden_states, model_.ple_projection, seq, hidden, n_layers * ple_dim);
+    if (!status) {
+        return status;
+    }
     const int64_t ple_count = seq * n_layers * ple_dim;
     for (int64_t i = 0; i < ple_count; ++i) {
         ple[i] *= ple_scale;
@@ -922,17 +1366,8 @@ Status EmbeddingGemma2Engine::forward(
         float* post_attn_ln = nullptr;
         float* pre_ffn_ln = nullptr;
         float* post_ffn_ln = nullptr;
-        float* q_weight = nullptr;
-        float* k_weight = nullptr;
-        float* v_weight = nullptr;
-        float* o_weight = nullptr;
         float* q_norm = nullptr;
         float* k_norm = nullptr;
-        float* gate_weight = nullptr;
-        float* up_weight = nullptr;
-        float* down_weight = nullptr;
-        float* ple_gate_weight = nullptr;
-        float* ple_proj_weight = nullptr;
         float* ple_post_norm = nullptr;
         float* layer_scalar = nullptr;
 
@@ -952,47 +1387,11 @@ Status EmbeddingGemma2Engine::forward(
         if (!status) {
             return status;
         }
-        status = require_f32(*backend_, layer.q_proj, q_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.k_proj, k_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.v_proj, v_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.o_proj, o_weight);
-        if (!status) {
-            return status;
-        }
         status = require_f32(*backend_, layer.q_norm, q_norm);
         if (!status) {
             return status;
         }
         status = require_f32(*backend_, layer.k_norm, k_norm);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.gate_proj, gate_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.up_proj, up_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.down_proj, down_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.ple_gate, ple_gate_weight);
-        if (!status) {
-            return status;
-        }
-        status = require_f32(*backend_, layer.ple_proj, ple_proj_weight);
         if (!status) {
             return status;
         }
@@ -1007,9 +1406,18 @@ Status EmbeddingGemma2Engine::forward(
 
         std::memcpy(residual, hidden_states, static_cast<size_t>(seq * hidden) * sizeof(float));
         rms_norm(normed, hidden_states, input_ln, seq, hidden, eps);
-        gemm(q, normed, q_weight, seq, hidden, q_dim);
-        gemm(k, normed, k_weight, seq, hidden, kv_dim);
-        gemm(v, normed, v_weight, seq, hidden, kv_dim);
+        status = linear(q, normed, layer.q_proj, seq, hidden, q_dim);
+        if (!status) {
+            return status;
+        }
+        status = linear(k, normed, layer.k_proj, seq, hidden, kv_dim);
+        if (!status) {
+            return status;
+        }
+        status = linear(v, normed, layer.v_proj, seq, hidden, kv_dim);
+        if (!status) {
+            return status;
+        }
         rms_norm(q, q, q_norm, seq * n_heads, head_dim, eps);
         rms_norm(k, k, k_norm, seq * n_kv, head_dim, eps);
         rms_norm(v, v, nullptr, seq * n_kv, head_dim, eps);
@@ -1027,7 +1435,10 @@ Status EmbeddingGemma2Engine::forward(
             head_dim,
             !spec.full_attention,
             static_cast<int64_t>(config_.sliding_window));
-        gemm(normed, attn, o_weight, seq, q_dim, hidden);
+        status = linear(normed, attn, layer.o_proj, seq, q_dim, hidden);
+        if (!status) {
+            return status;
+        }
         rms_norm(normed, normed, post_attn_ln, seq, hidden, eps);
         for (int64_t i = 0; i < seq * hidden; ++i) {
             hidden_states[i] = residual[i] + normed[i];
@@ -1035,20 +1446,32 @@ Status EmbeddingGemma2Engine::forward(
 
         std::memcpy(residual, hidden_states, static_cast<size_t>(seq * hidden) * sizeof(float));
         rms_norm(normed, hidden_states, pre_ffn_ln, seq, hidden, eps);
-        gemm(gate, normed, gate_weight, seq, hidden, inter);
-        gemm(up, normed, up_weight, seq, hidden, inter);
+        status = linear(gate, normed, layer.gate_proj, seq, hidden, inter);
+        if (!status) {
+            return status;
+        }
+        status = linear(up, normed, layer.up_proj, seq, hidden, inter);
+        if (!status) {
+            return status;
+        }
         gelu_tanh(gate, seq * inter);
         for (int64_t i = 0; i < seq * inter; ++i) {
             gate[i] *= up[i];
         }
-        gemm(normed, gate, down_weight, seq, inter, hidden);
+        status = linear(normed, gate, layer.down_proj, seq, inter, hidden);
+        if (!status) {
+            return status;
+        }
         rms_norm(normed, normed, post_ffn_ln, seq, hidden, eps);
         for (int64_t i = 0; i < seq * hidden; ++i) {
             hidden_states[i] = residual[i] + normed[i];
         }
 
         std::memcpy(residual, hidden_states, static_cast<size_t>(seq * hidden) * sizeof(float));
-        gemm(ple_h, hidden_states, ple_gate_weight, seq, hidden, ple_dim);
+        status = linear(ple_h, hidden_states, layer.ple_gate, seq, hidden, ple_dim);
+        if (!status) {
+            return status;
+        }
         gelu_tanh(ple_h, seq * ple_dim);
         for (int64_t t = 0; t < seq; ++t) {
             const float* ple_row = ple + (t * n_layers + layer_index) * ple_dim;
@@ -1057,7 +1480,10 @@ Status EmbeddingGemma2Engine::forward(
                 gate_row[d] *= ple_row[d];
             }
         }
-        gemm(normed, ple_h, ple_proj_weight, seq, ple_dim, hidden);
+        status = linear(normed, ple_h, layer.ple_proj, seq, ple_dim, hidden);
+        if (!status) {
+            return status;
+        }
         rms_norm(normed, normed, ple_post_norm, seq, hidden, eps);
         const float scalar = layer_scalar[0];
         for (int64_t i = 0; i < seq * hidden; ++i) {
@@ -1066,7 +1492,10 @@ Status EmbeddingGemma2Engine::forward(
     }
 
     rms_norm(normed, hidden_states, final_norm, seq, hidden, eps);
-    gemm(projected, normed, embed_weight, seq, hidden, embed_dim);
+    status = linear(projected, normed, model_.embedding_projection, seq, hidden, embed_dim);
+    if (!status) {
+        return status;
+    }
     mean_pool(pooled, projected, seq, embed_dim);
 
     const int64_t width = static_cast<int64_t>(embedding.size());

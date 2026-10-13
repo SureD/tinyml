@@ -58,6 +58,8 @@ size_t dtype_size(DType dtype) {
     case DType::f16:
     case DType::bf16:
         return 2;
+    case DType::i8:
+        return 1;
     }
     return 0;
 }

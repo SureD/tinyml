@@ -15,6 +15,7 @@ enum class DType {
     bf16,
     i32,
     u32,
+    i8,
 };
 
 enum class DeviceType {

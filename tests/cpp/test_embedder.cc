@@ -288,12 +288,146 @@ void test_tiny_reference() {
     EXPECT_TRUE(!matryoshka_status);
 }
 
+void test_quantize_one(
+    EmbeddingGemma2Quant quant,
+    const char* name,
+    const std::string& dir,
+    const std::vector<std::vector<uint32_t>>& sequences,
+    const std::vector<float>& expected,
+    const std::vector<float>& f32_embeddings,
+    uint32_t width) {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    if (!backend.status) {
+        return;
+    }
+    Result<EmbeddingGemma2Engine> engine = load_embeddinggemma2_from_hf_dir(
+        *backend.value,
+        dir.c_str(),
+        8);
+    EXPECT_TRUE(engine.status);
+    if (!engine.status) {
+        return;
+    }
+
+    const size_t workspace_before = engine.value.workspace_arena_bytes();
+    const size_t weights_before = engine.value.weight_arena_bytes();
+    Status bad = engine.value.quantize_weights(EmbeddingGemma2Quant::f32);
+    EXPECT_TRUE(!bad);
+
+    Status status = engine.value.quantize_weights(quant);
+    EXPECT_TRUE(status);
+    if (!status) {
+        std::cerr << name << " quantize: " << status.message << "\n";
+        return;
+    }
+    EXPECT_TRUE(engine.value.weight_quant() == quant);
+    EXPECT_TRUE(engine.value.workspace_arena_bytes() == workspace_before);
+    std::cout << name
+              << " weight_bytes " << weights_before
+              << " -> " << engine.value.weight_arena_bytes()
+              << " workspace_bytes " << engine.value.workspace_arena_bytes()
+              << "\n";
+
+    Status again = engine.value.quantize_weights(quant);
+    EXPECT_TRUE(!again);
+
+    size_t offset = 0;
+    for (const std::vector<uint32_t>& tokens : sequences) {
+        std::vector<float> got(width);
+        status = engine.value.embed(tokens, got);
+        EXPECT_TRUE(status);
+        if (!status) {
+            std::cerr << name << " embed: " << status.message << "\n";
+            return;
+        }
+        double norm = 0.0;
+        double max_abs_f32 = 0.0;
+        for (uint32_t i = 0; i < width; ++i) {
+            norm += static_cast<double>(got[i]) * static_cast<double>(got[i]);
+            const double diff = std::fabs(
+                static_cast<double>(got[i]) - static_cast<double>(f32_embeddings[offset + i]));
+            if (diff > max_abs_f32) {
+                max_abs_f32 = diff;
+            }
+            EXPECT_TRUE(std::isfinite(got[i]));
+        }
+        EXPECT_TRUE(std::fabs(std::sqrt(norm) - 1.0) < 1e-5);
+        const double vs_f32 = cosine(got.data(), f32_embeddings.data() + offset, width);
+        const double vs_ref = cosine(got.data(), expected.data() + offset, width);
+        std::cout << name
+                  << " cosine_vs_f32=" << vs_f32
+                  << " cosine_vs_reference=" << vs_ref
+                  << " max_abs_vs_f32=" << max_abs_f32
+                  << "\n";
+        // Measured on this Linux machine against the tiny fixture, 2026-10-13.
+        // int8: 0.998763 and 0.995469. int4: 0.907365 and 0.846225.
+        // These are not the official 32-text gates.
+        const double cosine_floor = quant == EmbeddingGemma2Quant::int8 ? 0.995 : 0.846;
+        const double abs_ceil = quant == EmbeddingGemma2Quant::int8 ? 0.06 : 0.38;
+        EXPECT_TRUE(vs_f32 >= cosine_floor);
+        EXPECT_TRUE(vs_ref >= cosine_floor);
+        EXPECT_TRUE(max_abs_f32 <= abs_ceil);
+        offset += width;
+    }
+}
+
+void test_quantize() {
+    const std::string dir = fixture_path("embeddinggemma2_tiny");
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    if (!backend.status) {
+        return;
+    }
+    Result<EmbeddingGemma2Engine> f32_engine = load_embeddinggemma2_from_hf_dir(
+        *backend.value,
+        dir.c_str(),
+        8);
+    EXPECT_TRUE(f32_engine.status);
+    if (!f32_engine.status) {
+        return;
+    }
+
+    std::vector<std::vector<uint32_t>> sequences;
+    std::vector<float> expected;
+    EXPECT_TRUE(load_tokens(dir + "/tokens.txt", sequences));
+    EXPECT_TRUE(load_f32(dir + "/expected.f32", expected));
+    const uint32_t width = f32_engine.value.config().embedding_dim;
+    std::vector<float> f32_embeddings(sequences.size() * width);
+    size_t offset = 0;
+    for (const std::vector<uint32_t>& tokens : sequences) {
+        Status status = f32_engine.value.embed(
+            tokens,
+            std::span<float>(f32_embeddings.data() + offset, width));
+        EXPECT_TRUE(status);
+        offset += width;
+    }
+
+    test_quantize_one(
+        EmbeddingGemma2Quant::int8,
+        "int8",
+        dir,
+        sequences,
+        expected,
+        f32_embeddings,
+        width);
+    test_quantize_one(
+        EmbeddingGemma2Quant::int4,
+        "int4",
+        dir,
+        sequences,
+        expected,
+        f32_embeddings,
+        width);
+}
+
 }  // namespace
 
 int main() {
     test_official_config();
     test_config_rejects();
     test_tiny_reference();
+    test_quantize();
     if (g_failures != 0) {
         std::cerr << g_failures << " failure(s)\n";
         return 1;
