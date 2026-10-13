@@ -1,178 +1,222 @@
-# EmbeddingGemma 2 migration plan
+# EmbeddingGemma 2 on TinyInfer for a MacBook Air
 
-Date: 2026-10-13. Research only. No runtime code in this change.
+Date: 2026-10-13. Design only. No runtime code in this change.
 
-EmbeddingGemma 2 is a real model. It is not a drop-in replacement for the TinyLlama decoder this repo runs today. The first milestone is a text embedding that stays inside the memory of an Apple Silicon MacBook Air and a 12 GB RTX 3060. A C++ port comes after those two machines match a reference vector.
+Goal: run EmbeddingGemma 2 text embeddings inside TinyInfer on an Apple Silicon MacBook Air, smoothly enough to stay resident. The engine is purpose-built for this one model. It is not a second Llama, and it is not a generic graph runtime.
 
-## Hardware this plan is written for
+The Air's RAM is not recorded in the repo. Plan for two unified-memory budgets, and do not assume a Max or Ultra:
 
-**MacBook Air, Apple Silicon.** Unified memory, not a Max or Ultra. The exact Air (M1 through M4) and its RAM are not recorded in the repo, so the plan has two budgets:
+- 8 GB Air: keep the TinyInfer process under about 2 GB RSS, so macOS and the editor still fit.
+- 16 GB Air: keep it under about 4 GB RSS.
 
-- 8 GB Air: the embedding process stays under about 2 GB RSS. macOS and the editor need the rest.
-- 16 GB Air: the process stays under about 4 GB RSS.
+`sysctl hw.memsize` decides which budget applies. These RSS figures are plan caps, not measurements. Do not reuse latency from `docs/metal_backend_validation.md` (Apple M5, TinyLlama, f32) or from LiteRT's MacBook Pro M5 table.
 
-24 GB and larger Air configs are out of the success criteria. If `sysctl hw.memsize` reports something else, re-pick the row below. Do not copy latency or RSS from the LiteRT MacBook Pro M5 table or from `docs/metal_backend_validation.md` (that run was an M5, TinyLlama, f32).
+Text only. Vision (170M) and audio (300M) stay unloaded. The launch post and the LiteRT cards say those towers are optional.
 
-**"JTX3060".** That is not an NVIDIA product name. This plan treats it as a desktop GeForce RTX 3060, 12 GB GDDR6, Ampere, compute capability 8.6, which has native bfloat16. The 3060 family also includes an 8 GB desktop card and a 6 GB laptop card. Before any quant choice, run `nvidia-smi --query-gpu=name,memory.total --format=csv`. If the total is not 12288 MiB, use the smaller-card column. Do not assume the name was a typo for a 12 GB card without that reading.
+One caveat: a machine the user called "JTX3060" is not an NVIDIA product name. If that box is ever used, treat a confirmed 12 GB desktop RTX 3060 as a secondary CUDA check. It does not drive this design.
 
-## What EmbeddingGemma 2 is
+## 1. Architecture
 
-Sources: [Google AI model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2), [Hugging Face `google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2), [launch post, 2026-10-06](https://blog.google/innovation-and-ai/technology/developers-tools/embeddinggemma-2/), [overview](https://ai.google.dev/gemma/docs/embeddinggemma).
+Sources: [model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2), [Hugging Face `google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2), [launch post, 2026-10-06](https://blog.google/innovation-and-ai/technology/developers-tools/embeddinggemma-2/), [overview](https://ai.google.dev/gemma/docs/embeddinggemma), [sentence-transformers guide](https://ai.google.dev/gemma/docs/embeddinggemma/inference-embeddinggemma-with-sentence-transformers).
+
+### Verified
 
 | Item | Value |
 | --- | --- |
-| Hugging Face id | `google/embeddinggemma-2` |
-| License | Apache 2.0 |
-| Parameters | 740M total. Text 270M = 130M backbone + 140M embedder. Vision 170M. Audio 300M. Towers load independently. |
-| Output | 768-d, then a linear map from model dim 512. Matryoshka prefixes 128, 256, 512. Re-normalize after truncation. |
-| Context | 8,192 tokens shared across modalities |
+| Id and license | `google/embeddinggemma-2`, Apache 2.0 |
+| Parameters | 740M total. Text 270M = 130M backbone + 140M embedder. Vision 170M. Audio 300M. |
+| Stack | Gemma 4 decoder, used as an embedding model |
+| Layers | 24 |
+| Model dimension | 512 |
+| FFN hidden dimension | 2048 |
+| Heads | 4 |
+| KV heads | 2 local, 1 global |
+| Local:global | 5:1 |
+| Attention | GQA / MQA |
+| Sliding window | 1024 tokens |
+| Vocabulary | 262,144 |
+| Activation | Gated FFN with GELU |
+| Pool | Mean pool, then a 512→768 projection |
+| Context | 8,192 tokens, shared across modalities |
+| Output | 768-d. Matryoshka prefixes 128, 256, 512. Re-normalize after a cut. |
 | Languages | 100+ at inference. Training text covers 140+ languages. Quality is not uniform. |
-| Text shape | 24 layers, dim 512, FFN 2048, 4 heads, local/global KV heads 2/1, local:global 5:1, sliding window 1024, vocab 262,144, gated FFN with GELU, mean pool |
-| Precision rule | bfloat16 or float32. Not float16. The card says float16 activations go NaN or silently degrade. |
-| On-device note from Google | Quantized text weights about 191 MB active RAM, full multimodal about 567 MB, measured on a Pixel 11 Pro. Not a measurement for the Air or the 3060. |
+| Precision | bfloat16 or float32. Not float16. The card says float16 activations go NaN or silently degrade. |
+| Checkpoint dtype on Hugging Face | BF16 |
+| Text-only load | Skip vision and audio (`vision_config` and `audio_config` unset). Effective size 270M. |
+| Task text | Prefixes such as `task: search result \| query: …` and `title: none \| text: …` |
 
-Weight bytes below are `parameters × bytes`, or published file sizes. They are not process RSS.
+Official text quantization, from the LiteRT-LM cards Google's launch post points at: int4 per-channel QAT for the text transformer and the embedding table. Download size for the text bundle is 165 MB ([`litert-community/embeddinggemma-2-text-270m-litert-lm`](https://huggingface.co/litert-community/embeddinggemma-2-text-270m-litert-lm)). Vision on the larger bundles is int8 per-channel QAT. That vision scheme is out of scope until a tower is loaded.
 
-| Checkpoint | Text 270M | Full 740M |
-| --- | --- | --- |
-| float32 weights | ~1.08 GB | ~2.96 GB |
-| bfloat16 weights | ~540 MB | ~1.48 GB |
-| Token table alone, vocab 262144 × 512, bf16 | 256 MB | same table |
+`ggml-org/embeddinggemma-2-GGUF` publishes a text BF16 file (558 MB) and a text Q8_0 file (310 MB), architecture `gemma-embedding2`. No Q4 file is in that listing. Useful as an external numerical check, not as the TinyInfer format.
 
-The token table is most of the 140M embedder. A KV cache is not the long-term cost: this model is one forward plus mean pool, not a decode loop. Derived from the card (head dim 512/4 = 128, 5:1 local/global, window 1024), a full 8k forward holds on the order of a few tens of MB of K and V in bf16. Framework overhead and the embedding table dominate.
+### Derived, inferred, or not on the card
 
-### Quantized files that were actually published
+- Head dimension 128 is derived: model dimension 512 divided by 4 heads. Confirm from `config.json` before freezing a kernel.
+- A 5:1 schedule across 24 layers would be 20 local layers and 4 global layers. The card states the ratio, not the layer index list. Read the schedule from the checkpoint.
+- RMSNorm and RoPE are not named on this card. They are typical of the Gemma line. Treat both as inferred. The first implementation reads the real op from `config.json` and from a sentence-transformers forward. It does not hard-code a Llama RMSNorm or Llama RoPE call and hope.
+- The attention mask is not stated. The card calls the stack a Gemma 4 decoder and also says the output is a mean-pooled embedding. A community GGUF readme claimed bidirectional attention. That claim is not the model card. The mask comes from the checkpoint.
+- Per-tensor names, biases, and whether any matrix is tied are not in the card. The loader learns them from the safetensors header.
 
-Official text QAT is int4, not int8. int8 shows up on the vision tower and in community Q8 files.
+### Predecessor, labeled so it is not mixed in
 
-- LiteRT-LM, linked from the launch post: [`litert-community/embeddinggemma-2-text-270m-litert-lm`](https://huggingface.co/litert-community/embeddinggemma-2-text-270m-litert-lm), [`...-text-vision-440m-litert-lm`](https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm), [`...-740m-litert-lm`](https://huggingface.co/litert-community/embeddinggemma-2-740m-litert-lm). Text transformer and embeddings are int4 per-channel QAT. Vision is int8 per-channel QAT. Audio is mixed int2/int4/int8 per-channel QAT. Download sizes: 165 MB, 388 MB, 485 MB. Fixed text lengths include 128, 256, 512, 1024, 2048, 8192.
-- llama.cpp: [`ggml-org/embeddinggemma-2-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF), architecture `gemma-embedding2`, Apache 2.0. Files seen: text BF16 558 MB, text Q8_0 310 MB, multimodal projector BF16 982 MB, projector Q8_0 555 MB. No Q4 file in that listing.
-- ONNX: [`onnx-community/embeddinggemma-2-ONNX`](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX) (community, not a Google-owned repo). Published dtypes include fp32, fp16, q8, q4, q4f16. Their table lists text fp32 1085 MB, text q8 314 MB, text q4 175 MB, full fp32 2929 MB, full q8 850 MB, full q4 473 MB, and a worst-case cosine vs fp32 of about 0.9997 for q8 and 0.975 for q4 (text q4 about 0.988). They also list fp16 at cosine 0.9998. That fp16 file conflicts with Google's model card. Do not deploy it.
-- A separate `.tflite` flatbuffer was not found. The on-device path Google points at is LiteRT-LM and MediaPipe.
-- No TensorRT engine was found.
-- The launch post also names transformers, sentence-transformers, MLX, vLLM, llama.cpp, SGLang, Ollama, LM Studio, and transformers.js. An official Google MLX weight repo was not verified. Core ML is not in that list. Community Core ML conversions exist and store compute in float16, which this plan rejects.
+EmbeddingGemma 1 ([model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card)) is text-only, Gemma 3, about 300M (the v2 overview also writes 308M), context 2,048, same 768-d Matryoshka cuts. Its QAT note is mixed int4/int8, plus Q8_0 and Q4_0. Hugging Face id on the older ONNX tree: `google/embeddinggemma-300m`. None of those tensors load here.
 
-Text-only load is `config_kwargs={"vision_config": None, "audio_config": None}` in sentence-transformers (270M). Task prefixes are part of the model: `task: search result | query: ...` and `title: none | text: ...`.
+## 2. Engine design
 
-### Difference from EmbeddingGemma (the first model)
+One type, one entry point: embed a batch of token-id rows, return one vector per row. No sampler, no chat template, no modality switch.
 
-The first model card ([EmbeddingGemma](https://ai.google.dev/gemma/docs/embeddinggemma/model_card), updated 2025-09-25) is text-only, Gemma 3, 300M, context 2,048, output 768 with the same 128/256/512 Matryoshka cuts, 100+ languages. Its QAT configs are mixed int4/int8, Q8_0, and Q4_0. The EmbeddingGemma 2 overview calls that predecessor EmbeddingGemma 1 and also says 308M; both figures are on Google's pages. Hugging Face id used by the older ONNX tree: `google/embeddinggemma-300m`.
+The serving pattern is an encoder even though Google built the weights as a Gemma 4 decoder. The call is a single forward over a known token sequence, then mean pool. Nothing is generated, so nothing from step N is reread at step N+1.
 
-EmbeddingGemma 2 adds image, video, and audio, moves the text tower from about 300M to 270M, extends context from 2k to 8k, and changes the stack to Gemma 4 (GELU gated FFN, sliding window, mixed local/global KV heads). Same native width, 768.
+### KV cache
 
-## What this repo is
+No persistent KV cache.
 
-It is a LLaMA-style decoder, not an embedding runtime.
+`LlamaInferEngine` keeps K and V for every layer for the whole session because decode appends one token at a time (`infer/src/llama.cc` plans `kv_cache_bytes` across all layers). An embedding call does not append. K and V for layer `i` die when layer `i` finishes.
 
-- Model spec: `model.md`. `TinyLlama/TinyLlama-1.1B-Chat-v1.0`. `LlamaConfig::tinyllama_1_1b()` in `infer/src/llama.cc` is 22 layers, hidden 2048, intermediate 5632, 32 heads, 4 KV heads, vocab 32000, context 2048, SiLU, RoPE. `model.md` still says tokenizer, real checkpoint loading, and quantization are out of scope. The loader has since landed; quantization has not.
-- Build: `CMakeLists.txt`. CMake 3.20, C++20 and Objective-C++, static `tinyinfer`, `nlohmann_json` via FetchContent. On Apple it links Metal and Foundation. Targets: `tinyinfer_tests`, `load_checkpoint_smoke`, `run_token_ids_smoke`, `bench_infer`. No CUDA language, no ORT, no TensorRT, no Core ML.
-- Layout: `infer/include/tinyinfer/{core,backend,llama,model_loader}.h`, `infer/src/{core,cpu_backend,llama,model_loader}.cc`, `infer/src/metal_backend.mm`, `reference/` (PyTorch TinyLlama, `reference/pyproject.toml` depends on torch, safetensors, tokenizers, huggingface-hub, numpy), `tests/cpp/`, `tests/test_tiny_llama.py`, `scripts/`, `docs/`.
-- Devices: `DeviceType` is `cpu` and `metal` only (`infer/include/tinyinfer/core.h`). `DType` lists f16 and bf16, but the kernels and the loader are f32. `load_llama_safetensors` requires a contiguous f32 destination and returns `unimplemented` for an unsupported checkpoint dtype (`infer/src/model_loader.cc`).
-- Loader gate: `model_type == llama`, `hidden_act == silu`, no rope scaling, untied embeddings, tensor names `model.embed_tokens`, per-layer `q_proj`/`k_proj`/`v_proj`/`o_proj`, `gate_proj`/`up_proj`/`down_proj`, and `lm_head`. An EmbeddingGemma 2 config fails this on purpose.
-- Implemented: f32 CPU and Metal matmul, token embedding, residual, RMSNorm, RoPE, causal grouped-query attention, SwiGLU, argmax, prefill, greedy decode, KV cache layout `[layer, kv_head, position, head_dim]`. `docs/metal_backend_validation.md` records TinyLlama token parity on an M5.
-- Not implemented: tokenizer inside the engine (callers pass token ids), quantization, CUDA, mean pooling, a 512→768 projection, GELU, sliding-window attention, mixed KV-head counts per layer, multimodal towers.
+Scratch for the current layer still exists, inside the workspace arena:
 
-`LlamaInferEngine` generates token ids. EmbeddingGemma 2 returns one vector. Do not retarget `load_llama_from_hf_dir` at `google/embeddinggemma-2`.
+- Local layer: K and V for the sliding window only (1024 positions, 2 KV heads). Verified window and verified local KV-head count.
+- Global layer: K and V for this sequence only (1 KV head). Discarded before the next layer.
 
-## Runtime and quant per machine
+That scratch is activation memory, not a cache. There is no `MemoryKind::kv_cache` arena on this path.
 
-Text only for the first ship. This repo has no image, audio, or video path, and the text tower is the piece that can share a later C++ implementation. Store 256-d Matryoshka vectors after a 768-d quality check. The card says 256-d stays close on text; 128-d is the one to re-measure. Queries and documents use the same width. Cap the first bring-up at 512 tokens. Move to 2048, then 8192, only after that machine's memory gate still holds.
+### Quantization
 
-| Machine | Compute | Weights | Why |
-| --- | --- | --- | --- |
-| Air, 8 GB | llama.cpp Metal, `gemma-embedding2` | `ggml-org` text Q8_0, 310 MB | Fits the 2 GB process budget. Q4 is not in that official GGUF listing. LiteRT int4 text (165 MB) is the fallback if Metal Q8 RSS is still too high. |
-| Air, 16 GB | same Metal Q8_0 | same 310 MB file | Headroom for a 2048-token check. Still do not load the 982 MB bf16 projector. |
-| RTX 3060, 12 GB confirmed | PyTorch CUDA, sentence-transformers | bf16 text tower, ~540 MB | Ampere runs bf16. The model card wants bf16 or fp32. 12 GB does not need int4. |
-| NVIDIA card at 8 GB | CUDA bf16 text, or ONNX Runtime CUDA q8 text (314 MB) | no full fp32 tower | fp32 text is ~1.1 GB and still fits; full fp32 (~3 GB) plus a desktop session is the wrong default. |
-| NVIDIA card at 6 GB | ONNX Runtime CUDA q8 text, or CUDA bf16 text | no multimodal tower until `nvidia-smi` memory during a 512-token forward stays under 4 GB | Laptop 3060s are 6 GB. |
+Activations stay float32. The model card forbids float16, and TinyInfer's kernels are already f32 (`infer/src/cpu_backend.cc`, `infer/src/metal_backend.mm`). Do not quantize activations in this design.
 
-Rejected on both machines:
+Weights, in order:
 
-- float16. That includes MPS fp16, a Core ML fp16 package, an ONNX `fp16` file, and a TensorRT FP16 engine. The model card forbids it. A community cosine near 1.0 does not lift the ban until a local run shows zero NaNs and matches the bf16 or fp32 reference below.
-- Core ML as a target. Not in Google's runtime list, and the published conversions use float16.
-- TensorRT in this migration. No official engine. The 12 GB card is not memory-bound at bf16. A later engine is in scope only for bf16 or for the LiteRT QAT dtypes, and only after the cosine gate.
-- Loading `onnx-community/embeddinggemma-300m-ONNX` or `google/embeddinggemma-300m`. Those are the first model.
+1. Bring-up stores the Hugging Face BF16 checkpoint and computes in float32. Text BF16 is about 540 MB (`270e6 × 2`). The token table alone is 262,144 × 512 × 2 = 256 MB. This fits the 16 GB cap with room, and it is the accuracy reference on the Air. On an 8 GB Air it is only a short-lived check: macOS plus a 540 MB table plus the process overhead can press the 2 GB cap, so the 8 GB machine does not stay on BF16.
+2. int8 per-channel is the first quantized Metal kernel. One scale (and a zero-point only if the tensor file has one) per output row. Symmetric is not assumed. Text int8 weights are about 270 MB before scales. Q8_0 from ggml-org is an external cosine check, not the file format TinyInfer stores.
+3. int4 per-channel is the resident format, matching the verified LiteRT text QAT scheme (transformer and embedding table). About 135 MB of packed weights before scales. Order inside that step: token table first (half the text footprint), then the FFN gate/up/down matrices (the other large GEMMs at 512×2048), then Q/K/V/O. Per-output-channel, not an invented group size.
 
-MPS is the PyTorch path on the Air, used only as a numerical reference: sentence-transformers, text tower, float32, sequence 512. `torch.cuda.is_bf16_supported()` is the card's bf16 switch and is false under MPS, so the documented Air PyTorch dtype is float32 (~1.1 GB weights). That is acceptable as a one-shot reference on a 16 GB Air and tight on an 8 GB Air. If the 8 GB machine swaps or the process is killed, skip MPS and compare llama.cpp Q8_0 against the 3060's saved vectors instead.
+If a LiteRT or safetensors QAT file ships scales, load those scales. A homemade calibration set is a fallback only after the unquantized forward matches sentence-transformers, and its cosine is reported rather than assumed equal to int8.
 
-ONNX Runtime is the quantized CUDA path, not the quality path. Use the CUDA execution provider and dtype `q8`. Do not enable the fp16 graph.
+8 GB Air runs int4 text day to day. 16 GB Air may keep int8 if int4 loses more cosine than the accuracy gate allows. Neither machine loads the 740M tower.
 
-## Phases
+### Memory layout
 
-Each phase is done only if the previous gate passed. No TinyInfer code until phase 4.
+Two arenas, both from the existing `MemoryArena` (`infer/include/tinyinfer/core.h`).
 
-### 0. Name the machines
+**Weights.** One allocation, read-only after load, 64-byte aligned tensors (same slack idea as `build_memory_plan` in `infer/src/llama.cc`). Quantized tensors are packed int8 or int4 plus a small scale vector beside each matrix. No second buffer that holds the unpacked float matrix.
 
-On the Air: `sysctl machdep.cpu.brand_string hw.memsize`, and confirm Metal exists. On the NVIDIA box: `nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv`.
+**Workspace.** Sized once for a sequence bucket, reset every `embed()` call. Buckets follow the lengths LiteRT already publishes for text: 128, 256, 512, 1024, 2048, 8192. A request uses the smallest bucket that fits. Float32 slots, reused across all 24 layers:
 
-Gate: write the two strings into the run log. Pick the table row from the real RAM and VRAM. Stop if the GPU is not a 3060-class card at all.
+- two hidden mats, `[bucket, 512]`, ping-pong
+- two FFN mats, `[bucket, 2048]`
+- one local KV scratch, `[1024, 2, 128]`, and one global KV scratch, `[bucket, 1, 128]`
+- one output row, `[768]`, per batch element
 
-### 1. Freeze a reference vector on the 3060
+Derived head dim is in that scratch shape. If `config.json` disagrees, the scratch changes and the kernel changes with it.
 
-Environment: Python, `sentence-transformers` and `transformers`, CUDA. Load `google/embeddinggemma-2` with `torch.bfloat16` and `vision_config` / `audio_config` set to `None`.
+At 512 tokens the workspace is a few megabytes. At 8192 the FFN slot dominates and is still on the order of 100 MB (`2 × 8192 × 2048 × 4` bytes), far under either RSS cap. Weights decide the budget, not the workspace. There is no third arena.
 
-Prompts, from the model card:
+Batching pads each row up to the bucket. Mean pool uses the true length, not the pad. Batch 1 is the first correct path. The benchmark later measures 4 and 8.
 
-- `task: search result | query: What causes the northern lights?`
-- `title: none | text: The northern lights are caused by charged particles from the sun.`
+### Copies
 
-Encode at 768-d with `normalize_embeddings=True`, sequence cap 512. Save both vectors. Record `nvidia-smi` process memory.
+- The loader writes packed weights straight into the weight arena. It does not decode BF16 into a temporary full-size float tensor and then copy.
+- Token gather writes hidden state into the workspace. Token ids stay in a small host or Metal buffer. Rows of the table are not staged on the CPU.
+- int8 and int4 GEMM dequantizes a tile into threadgroup memory, then FMAs in float32. The unpacked matrix is never stored.
+- Residual add is in place on the hidden ping-pong buffer.
+- The GPU returns one 768-d vector (or the chosen Matryoshka prefix, already re-normalized) per row. `copy_to_host` runs once per `embed()` call.
+- Metal already records every op onto one command buffer and commits it at `synchronize` (`infer/src/metal_backend.mm`). One `embed()` call encodes the whole forward and synchronizes once. No per-layer commit.
 
-Gate: both vectors finite, shape `(768,)`, cosine between them positive and stable across two processes. Process memory under 4 GB. Then repeat one forward at 256-d and check it matches the renormalized 768-d prefix.
+### Metal
 
-### 2. Air reference, then the Metal deploy path
+Keep the kernels narrow.
 
-16 GB Air: same library, float32, MPS if `torch.backends.mps.is_available()` else CPU. Text tower only. Cosine against the 3060 bf16 vectors.
+- Unquantized and BF16-weight path: reuse the existing small-M tiled f32 GEMM (`small_m_gemm_tiled_f32`). Embedding queries are a short `M` (batch × tokens) with `N` in {512, 2048}. That is the shape that kernel was built for.
+- Long documents make `M` large. A large-M tile is a later kernel, written only after a profile shows the small-M kernel bandwidth-bound at 2048 or 8192. Do not guess that tile size here.
+- Quantized GEMM is a sibling kernel, not a flag inside the f32 one: load packed bytes, dequant a panel to float in the threadgroup, same FMA loop, float32 accumulate.
+- Local attention reads at most 1024 keys. Global attention reads this sequence. Four-head, head-dim-128 attention is a short kernel with a float32 online softmax. The mask mode is a kernel argument once the checkpoint says what it is.
+- Mean pool is a reduction over the valid tokens, same shape of threadgroup reduction the Metal RMSNorm kernel already uses, writing 512 floats and then the 512→768 projection.
+- Fusion waits on a profile. Likely first fuse is the gated GELU (gate, up, multiply, down's input) if it shows up as extra bandwidth. Norm fusion waits until the norm op is verified.
 
-8 GB Air: skip the MPS float32 load if phase 0 showed 8 GB. Go straight to llama.cpp.
+Apple GPU on an Air is bandwidth-bound at this width. Occupancy tricks matter less than not re-reading the token table and not materializing 24 layers of KV.
 
-Then both Airs: current llama.cpp with `gemma-embedding2` support, Metal, `ggml-org/embeddinggemma-2-GGUF` text Q8_0, embedding mode, mean pooling, context 512. Same two prompts.
+### What to reuse, what to leave alone
 
-Gate: cosine versus the 3060 bf16 vectors at least 0.999 on both prompts, zero NaNs, RSS under 2 GB on the 8 GB Air and under 4 GB on the 16 GB Air. If Q8_0 misses 0.999, stop and compare BF16 GGUF (558 MB) before touching int4. If RSS fails on the 8 GB Air, switch that machine to LiteRT-LM text int4 and apply the same cosine gate. Do not "fix" a miss by casting to float16.
+Reuse:
 
-### 3. 3060 deploy path, and the VRAM branch
+- `MemoryArena`, `TensorView`, `Status` / `Result`, `DeviceType::metal`
+- Backend allocation, host/device copy, and the single command-buffer flush
+- CPU f32 matmul and embedding gather as the obvious shape of a reference kernel
+- Metal tiled GEMM and the reduction pattern
+- CMake target style and `ctest`
 
-Stay on CUDA bf16 sentence-transformers for the quality path. Optionally run ONNX Runtime CUDA, text q8, same prompts.
+Leave the Llama decoder untouched:
 
-Gate: q8 cosine versus the phase-1 bf16 vectors at least 0.999, no NaNs, `nvidia-smi` memory under 4 GB at batch 1, sequence 512. If VRAM is 8 GB or 6 GB, q8 becomes the default and bf16 must still pass the 4 GB (8 GB card) or a 3 GB (6 GB card) process limit. Do not build a TensorRT engine in this phase.
+- `LlamaInferEngine`, `infer/src/llama.cc`, `infer/include/tinyinfer/llama.h`
+- `load_llama_config_json` and the Llama tensor list in `infer/src/model_loader.cc` (it requires `model_type=llama`, `hidden_act=silu`, and `lm_head`)
+- `swiglu_out`, `rope_inplace`, causal `attention_out`, `argmax`, greedy prefill/decode
+- The persistent KV layout `[layer, kv_head, position, head_dim]`
+- `tests/test_tiny_llama.py` and the existing C++ smokes
 
-Raise context to 2048, then 8192, only on the machine whose 512-token gate passed. Record memory again. 8192 is optional. Failing it does not fail the migration.
+New code lives beside that path: an embedder type, its own config loader, and its own kernels. `CMakeLists.txt` gains sources only. No ONNX Runtime, Core ML, or TensorRT dependency. Core ML conversions published by third parties use float16, which this model card forbids.
 
-### 4. C++ embedder, only after phases 1–3
+## 3. Benchmark plan
 
-New code, beside the Llama engine, not inside it. The first C++ target is text, f32 or bf16 storage with f32 accumulation, mean pool, 512→768, L2 norm, Matryoshka truncate. Attention mask, RoPE, and which layers are local versus global come from the checkpoint config, not from `LlamaInferEngine`'s causal mask.
+Run on the Air that will actually ship. Record `hw.memsize`, chip name, and macOS version in the log. Warm up one untimed call, then time.
 
-Files a real port touches:
+| Axis | Points |
+| --- | --- |
+| Batch | 1, 4, 8 |
+| Sequence | 128, 512, 2048. Add 8192 only if the RSS cap still holds. |
+| Output width | 768 and 256 (truncate and re-normalize) |
+| Weight format | BF16-stored f32 compute, then int8, then int4 |
 
-- Add `infer/include/tinyinfer/embedder.h` and `infer/src/embedder.cc`. Leave `infer/src/llama.cc` on TinyLlama.
-- `infer/include/tinyinfer/backend.h`: new kernels for a GELU gated FFN, mean pool, and the Gemma attention pattern. `swiglu_out` is SiLU and is the wrong op.
-- `infer/include/tinyinfer/core.h`: no dtype or device change required for a CPU f32 reference. A Metal embedder reuses `DeviceType::metal`. A CUDA backend is a new `DeviceType` and a new `.cu`, and it is not required to ship if phase 3 already serves the 3060.
-- New loader. Do not extend `load_llama_config_json`. That function rejects non-`llama` and non-`silu` configs, and it requires `lm_head`.
-- `CMakeLists.txt`: new sources only. No TensorRT, ONNX Runtime, or Core ML dependency.
-- `reference/pyproject.toml`: add `sentence-transformers` and `transformers` for the reference script. The C++ build does not link them.
-- New test beside `tests/cpp/`, cosine against the saved phase-1 vectors. Do not weaken `tests/test_tiny_llama.py`.
-- `model.md` and `docs/arch.md` stay the TinyLlama documents until the embedder builds and passes. Update them in the same change as the code, not before.
+Report, each cell:
 
-Gate: CPU f32 cosine versus the saved 3060 vectors at least 0.999 on the two prompts, then the same bar for Metal on the Air at Q8-or-better only after the f32 path matches. `ctest` for the existing Llama tests still passes. No quant kernels in this phase. int4 and int8 stay in llama.cpp, LiteRT, or ONNX Runtime until an f32 C++ match exists.
+- Latency: p50 and p95 of `embed()`, milliseconds
+- Throughput: sequences per second and tokens per second
+- Footprint: peak RSS, plus weight-arena bytes and workspace-arena bytes from the counters already on `MemoryArena`
+- Correctness: every output finite, shape matches, cosine against a frozen sentence-transformers reference
 
-## What is blocked
+Reference: sentence-transformers, text tower only, float32 on MPS or CPU (the published dtype switch keys bfloat16 off CUDA, so the Air reference is float32). Same token ids, not a second tokenizer's retokenization, once TinyInfer has the ids. Prompts include the model-card pair ("What causes the northern lights?" / the charged-particle sentence) plus a fixed set of 32 texts checked into the repo later.
 
-- Nothing about whether the model exists. The card, the Hugging Face repo, and the 2026-10-06 launch post agree.
-- Casting the Llama loader at this checkpoint. It will fail closed, and working around that check would run the wrong equation.
-- float16 on MPS, Core ML, ONNX, or TensorRT.
-- Using Pixel, M5, or RTX 4090 LiteRT numbers as the Air or 3060 budget.
-- Multimodal towers, until text passes on the actual RAM and VRAM measured in phase 0.
-- An in-tree CUDA or TensorRT backend. The 3060 is served by sentence-transformers and, if needed, ONNX Runtime.
+Accuracy gates for this project, not numbers from Google:
+
+- BF16-stored and int8 paths: cosine at least 0.999 versus the float32 reference on that set, zero NaNs.
+- int4: zero NaNs, and the cosine is published per sequence length. It is not required to hit 0.999. The ONNX community card reports text q4 around 0.988 versus fp32; that is their graph, not ours. If our int4 cosine falls below 0.99 on the 32-text set, keep int8 as the resident format on the 16 GB Air and only use int4 on the 8 GB Air if the RSS cap demands it.
+
+RSS gates: under 2 GB on an 8 GB Air, under 4 GB on a 16 GB Air, measured at batch 8 and the longest sequence that phase enables.
+
+## 4. Roadmap
+
+Each phase ends before the next starts. Llama `ctest` stays green throughout.
+
+### Phase A — running
+
+CPU forward, then Metal, text only, BF16 weights, float32 compute, batch 1, sequences 128 and 512. Mask, norm, and position op taken from the checkpoint. Output 768-d, L2-normalized.
+
+Verify: cosine at least 0.999 against sentence-transformers on the prompt pair and the 32-text set. Finite outputs. Existing Llama tests pass. RSS recorded. An 8 GB Air may fail the 2 GB cap here; that does not block phase A on a 16 GB Air, and it is the reason phase B exists.
+
+### Phase B — quantize
+
+int8 per-channel Metal GEMM with in-tile dequant and float32 accumulate. Then int4 per-channel in the order in section 2: token table, FFN, attention. Load QAT scales if the file has them.
+
+Verify: int8 meets the 0.999 cosine gate and the RSS cap for this Air. int4 meets the NaN check, the published-cosine rule, and the RSS cap. Workspace bytes do not grow versus phase A.
+
+### Phase C — optimize
+
+Only kernels the phase A/B profile shows as hot. Expected order: local-window attention that does not read past 1024 keys, then the large-M GEMM if 2048-token prompts are bandwidth bound, then one fused GELU-gate if the unfused FFN is the top kernel. Still one command buffer per call.
+
+Verify: cosine unchanged versus the phase B output for the same weight format (bitwise or cosine above 0.999999). p50 latency at batch 1, sequence 512, does not regress. RSS does not regress.
+
+### Phase D — benchmark validation
+
+Fill the table in section 3. Store the raw log next to the binary output, not in this doc.
+
+Verify: every cell has latency, throughput, RSS, arena bytes, and cosine. Any cell over the RSS cap or under its cosine gate fails the phase. 8192 is reported only when it fits. The Llama smoke binaries still match their previous token ids.
 
 ## Sources
 
 - https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2
 - https://ai.google.dev/gemma/docs/embeddinggemma
 - https://ai.google.dev/gemma/docs/embeddinggemma/model_card
+- https://ai.google.dev/gemma/docs/embeddinggemma/inference-embeddinggemma-with-sentence-transformers
 - https://huggingface.co/google/embeddinggemma-2
 - https://blog.google/innovation-and-ai/technology/developers-tools/embeddinggemma-2/
-- https://huggingface.co/litert-community/embeddinggemma-2-740m-litert-lm
 - https://huggingface.co/litert-community/embeddinggemma-2-text-270m-litert-lm
 - https://huggingface.co/ggml-org/embeddinggemma-2-GGUF
-- https://huggingface.co/onnx-community/embeddinggemma-2-ONNX
-- https://ai.google.dev/gemma/docs/embeddinggemma/inference-embeddinggemma-with-sentence-transformers
