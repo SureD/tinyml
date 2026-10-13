@@ -234,7 +234,11 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    engine.value.reset();
+    status = engine.value.reset();
+    if (!status) {
+        std::cerr << "reset failed: " << status.message << "\n";
+        return EXIT_FAILURE;
+    }
 
     BenchResult result;
     status = run_measured(

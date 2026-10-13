@@ -50,7 +50,7 @@ public:
         const LlamaConfig& config,
         uint32_t max_seq_len);
 
-    void reset();
+    Status reset();
     Status prefill(std::span<const TokenId> prompt, TokenId& next_token);
     Status decode_one(TokenId token, TokenId& next_token);
     Status generate(
@@ -110,8 +110,8 @@ private:
     Status init_kv_cache();
     void rebind_views_after_move(const LlamaInferEngine& source);
     void rebind_view_after_move(TensorView& view, const LlamaInferEngine& source);
-    TensorView workspace_tensor(const Shape& shape);
-    void run_layers(
+    Status workspace_tensor(const Shape& shape, TensorView& out);
+    Status run_layers(
         std::span<const TokenId> tokens,
         uint32_t start_pos,
         TokenId& next_token);

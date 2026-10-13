@@ -408,23 +408,13 @@ Status LlamaInferEngine::init_kv_cache() {
     return Status::success();
 }
 
-void LlamaInferEngine::reset() {
+Status LlamaInferEngine::reset() {
     workspace_.reset();
-    kv_cache_arena_.reset();
-    const Shape shape = make_shape({
-        static_cast<int64_t>(config_.n_layers),
-        static_cast<int64_t>(config_.n_kv_heads),
-        static_cast<int64_t>(max_seq_len_),
-        static_cast<int64_t>(config_.head_dim()),
-    });
-    cache_.keys = kv_cache_arena_.alloc(shape, DType::f32).value;
-    cache_.values = kv_cache_arena_.alloc(shape, DType::f32).value;
-    cache_.seq_len = 0;
-    cache_.max_seq_len = max_seq_len_;
+    return init_kv_cache();
 }
 
-TensorView LlamaInferEngine::workspace_tensor(const Shape& shape) {
-    return workspace_.alloc(shape, DType::f32).value;
+Status LlamaInferEngine::workspace_tensor(const Shape& shape, TensorView& out) {
+    return alloc_view(workspace_, shape, out);
 }
 
 void LlamaInferEngine::rebind_view_after_move(
@@ -470,7 +460,10 @@ Status LlamaInferEngine::prefill(std::span<const TokenId> prompt, TokenId& next_
     }
 
     workspace_.reset();
-    run_layers(prompt, 0, next_token);
+    status = run_layers(prompt, 0, next_token);
+    if (!status) {
+        return status;
+    }
 
     cache_.seq_len = static_cast<uint32_t>(prompt.size());
     return Status::success();
@@ -484,7 +477,10 @@ Status LlamaInferEngine::decode_one(TokenId token, TokenId& next_token) {
     }
 
     workspace_.reset();
-    run_layers(one_token, cache_.seq_len, next_token);
+    status = run_layers(one_token, cache_.seq_len, next_token);
+    if (!status) {
+        return status;
+    }
 
     ++cache_.seq_len;
     return Status::success();
@@ -513,7 +509,10 @@ Status LlamaInferEngine::generate(
         return Status::invalid_argument_status("generation exceeds model max sequence length");
     }
 
-    reset();
+    status = reset();
+    if (!status) {
+        return status;
+    }
 
     for (size_t i = 0; i < prompt.size(); ++i) {
         output[i] = prompt[i];
@@ -560,54 +559,84 @@ uint32_t LlamaInferEngine::max_seq_len() const {
     return max_seq_len_;
 }
 
-void LlamaInferEngine::run_layers(
+Status LlamaInferEngine::run_layers(
     std::span<const TokenId> tokens,
     uint32_t start_pos,
     TokenId& next_token) {
     const uint32_t seq_len = static_cast<uint32_t>(tokens.size());
-    TensorView hidden = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.hidden_size),
-    }));
-    TensorView normed = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.hidden_size),
-    }));
-    TensorView q = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.n_heads),
-        static_cast<int64_t>(config_.head_dim()),
-    }));
-    TensorView k = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.n_kv_heads),
-        static_cast<int64_t>(config_.head_dim()),
-    }));
-    TensorView v = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.n_kv_heads),
-        static_cast<int64_t>(config_.head_dim()),
-    }));
-    TensorView attn_out = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.hidden_size),
-    }));
-    TensorView gate = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.intermediate_size),
-    }));
-    TensorView up = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.intermediate_size),
-    }));
-    TensorView swiglu = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.intermediate_size),
-    }));
-    TensorView ffn_out = workspace_tensor(make_shape({
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.hidden_size),
-    }));
+    const int64_t n_tokens = static_cast<int64_t>(seq_len);
+    const int64_t hidden_size = static_cast<int64_t>(config_.hidden_size);
+    const int64_t intermediate_size = static_cast<int64_t>(config_.intermediate_size);
+
+    TensorView hidden;
+    TensorView normed;
+    TensorView q;
+    TensorView k;
+    TensorView v;
+    TensorView attn_out;
+    TensorView gate;
+    TensorView up;
+    TensorView swiglu;
+    TensorView ffn_out;
+
+    Status status = workspace_tensor(make_shape({n_tokens, hidden_size}), hidden);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(make_shape({n_tokens, hidden_size}), normed);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(
+        make_shape({
+            n_tokens,
+            static_cast<int64_t>(config_.n_heads),
+            static_cast<int64_t>(config_.head_dim()),
+        }),
+        q);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(
+        make_shape({
+            n_tokens,
+            static_cast<int64_t>(config_.n_kv_heads),
+            static_cast<int64_t>(config_.head_dim()),
+        }),
+        k);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(
+        make_shape({
+            n_tokens,
+            static_cast<int64_t>(config_.n_kv_heads),
+            static_cast<int64_t>(config_.head_dim()),
+        }),
+        v);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(make_shape({n_tokens, hidden_size}), attn_out);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(make_shape({n_tokens, intermediate_size}), gate);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(make_shape({n_tokens, intermediate_size}), up);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(make_shape({n_tokens, intermediate_size}), swiglu);
+    if (!status) {
+        return status;
+    }
+    status = workspace_tensor(make_shape({n_tokens, hidden_size}), ffn_out);
+    if (!status) {
+        return status;
+    }
 
     backend_->embedding_out(
         hidden,
@@ -668,6 +697,8 @@ void LlamaInferEngine::run_layers(
             backend_->matmul_argmax(next_token, last_hidden, model_.lm_head);
         }
     }
+
+    return Status::success();
 }
 
 }  // namespace tinyinfer
