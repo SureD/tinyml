@@ -1,0 +1,338 @@
+# raw stdout of tests/cpp/bench_embedder.cc
+# Clang 18.1.3, CMAKE_BUILD_TYPE=Release, CMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG
+# host: Linux 6.12.94+ x86_64, 4 vCPUs, KVM, MemTotal 16387416 kB
+timestamp 2026-10-13T16:06:09Z
+build_type Release
+cpu Intel(R) Xeon(R) Processor
+mem_total 16387416 kB
+fixture embeddinggemma2_tiny
+backend cpu
+batch 1
+max_seq_len 64
+warmup_calls 1
+measured_calls 500
+percentile index=llround(p*(n-1)) on sorted embed() times
+official_model not_run
+cosine_gate_0.999 not_run
+metal not_yet_measured
+macbook_air not_yet_measured
+rtx_3060 not_yet_measured
+create_metal_backend Metal framework is not available
+quant f32 weight_bytes 10200 workspace_bytes 32088 embedding_dim 6
+case quant seq_len p50_ms p95_ms seq_per_s tok_per_s finite cosine_vs_f32 cosine_vs_expected
+fixture0 f32 5 0.010941 0.011858 91399.3236 456996.618 1 1 1
+fixture1 f32 3 0.005665 0.005711 176522.507 529567.52 1 1 1
+pattern1 f32 1 0.001976 0.002013 506072.874 506072.874 1 1 na
+pattern8 f32 8 0.021093 0.022788 47409.0931 379272.745 1 1 na
+pattern32 f32 32 0.210281 0.227252 4755.54139 152177.325 1 1 na
+pattern64 f32 64 0.747896 0.796489 1337.0843 85573.3952 1 1 na
+rss_after f32 vmrss_kib 4416 vmhwm_kib 4436
+quant int8 weight_bytes 8514 workspace_bytes 32088 embedding_dim 6
+case quant seq_len p50_ms p95_ms seq_per_s tok_per_s finite cosine_vs_f32 cosine_vs_expected
+fixture0 int8 5 0.014257 0.015397 70140.9834 350704.917 1 0.998762932 0.998762932
+fixture1 int8 3 0.007801 0.00785 128188.694 384566.081 1 0.995468775 0.995468775
+pattern1 int8 1 0.002985 0.003031 335008.375 335008.375 1 0.999871015 na
+pattern8 int8 8 0.025968 0.029633 38508.9341 308071.473 1 0.990230871 na
+pattern32 int8 32 0.2277 0.24608 4391.74352 140535.793 1 0.999903518 na
+pattern64 int8 64 0.784563 0.835771 1274.5949 81574.0737 1 0.999554024 na
+rss_after int8 vmrss_kib 4444 vmhwm_kib 4444
+quant int4 weight_bytes 7610 workspace_bytes 32088 embedding_dim 6
+case quant seq_len p50_ms p95_ms seq_per_s tok_per_s finite cosine_vs_f32 cosine_vs_expected
+fixture0 int4 5 0.020418 0.023381 48976.3934 244881.967 1 0.907364921 0.907364921
+fixture1 int4 3 0.011613 0.011669 86110.3935 258331.181 1 0.846225173 0.846225173
+pattern1 int4 1 0.004211 0.005221 237473.284 237473.284 1 0.997272489 na
+pattern8 int4 8 0.035935 0.039035 27828.0228 222624.183 1 0.876848987 na
+pattern32 int4 32 0.267891 0.289582 3732.8615 119451.568 1 0.61120961 na
+pattern64 int4 64 0.86486 0.929796 1156.2565 74000.4163 1 0.772617157 na
+rss_after int4 vmrss_kib 4444 vmhwm_kib 4444
+
+# design-grid cells. no timings. not the tiny-fixture table above.
+backend device batch seq width weights result
+metal macbook_air_8gb 1 128 768 f32 not_yet_measured
+metal macbook_air_8gb 1 128 768 int8 not_yet_measured
+metal macbook_air_8gb 1 128 768 int4 not_yet_measured
+metal macbook_air_8gb 1 128 256 f32 not_yet_measured
+metal macbook_air_8gb 1 128 256 int8 not_yet_measured
+metal macbook_air_8gb 1 128 256 int4 not_yet_measured
+metal macbook_air_8gb 1 512 768 f32 not_yet_measured
+metal macbook_air_8gb 1 512 768 int8 not_yet_measured
+metal macbook_air_8gb 1 512 768 int4 not_yet_measured
+metal macbook_air_8gb 1 512 256 f32 not_yet_measured
+metal macbook_air_8gb 1 512 256 int8 not_yet_measured
+metal macbook_air_8gb 1 512 256 int4 not_yet_measured
+metal macbook_air_8gb 1 2048 768 f32 not_yet_measured
+metal macbook_air_8gb 1 2048 768 int8 not_yet_measured
+metal macbook_air_8gb 1 2048 768 int4 not_yet_measured
+metal macbook_air_8gb 1 2048 256 f32 not_yet_measured
+metal macbook_air_8gb 1 2048 256 int8 not_yet_measured
+metal macbook_air_8gb 1 2048 256 int4 not_yet_measured
+metal macbook_air_8gb 1 8192 768 f32 not_yet_measured
+metal macbook_air_8gb 1 8192 768 int8 not_yet_measured
+metal macbook_air_8gb 1 8192 768 int4 not_yet_measured
+metal macbook_air_8gb 1 8192 256 f32 not_yet_measured
+metal macbook_air_8gb 1 8192 256 int8 not_yet_measured
+metal macbook_air_8gb 1 8192 256 int4 not_yet_measured
+metal macbook_air_8gb 4 128 768 f32 not_yet_measured
+metal macbook_air_8gb 4 128 768 int8 not_yet_measured
+metal macbook_air_8gb 4 128 768 int4 not_yet_measured
+metal macbook_air_8gb 4 128 256 f32 not_yet_measured
+metal macbook_air_8gb 4 128 256 int8 not_yet_measured
+metal macbook_air_8gb 4 128 256 int4 not_yet_measured
+metal macbook_air_8gb 4 512 768 f32 not_yet_measured
+metal macbook_air_8gb 4 512 768 int8 not_yet_measured
+metal macbook_air_8gb 4 512 768 int4 not_yet_measured
+metal macbook_air_8gb 4 512 256 f32 not_yet_measured
+metal macbook_air_8gb 4 512 256 int8 not_yet_measured
+metal macbook_air_8gb 4 512 256 int4 not_yet_measured
+metal macbook_air_8gb 4 2048 768 f32 not_yet_measured
+metal macbook_air_8gb 4 2048 768 int8 not_yet_measured
+metal macbook_air_8gb 4 2048 768 int4 not_yet_measured
+metal macbook_air_8gb 4 2048 256 f32 not_yet_measured
+metal macbook_air_8gb 4 2048 256 int8 not_yet_measured
+metal macbook_air_8gb 4 2048 256 int4 not_yet_measured
+metal macbook_air_8gb 4 8192 768 f32 not_yet_measured
+metal macbook_air_8gb 4 8192 768 int8 not_yet_measured
+metal macbook_air_8gb 4 8192 768 int4 not_yet_measured
+metal macbook_air_8gb 4 8192 256 f32 not_yet_measured
+metal macbook_air_8gb 4 8192 256 int8 not_yet_measured
+metal macbook_air_8gb 4 8192 256 int4 not_yet_measured
+metal macbook_air_8gb 8 128 768 f32 not_yet_measured
+metal macbook_air_8gb 8 128 768 int8 not_yet_measured
+metal macbook_air_8gb 8 128 768 int4 not_yet_measured
+metal macbook_air_8gb 8 128 256 f32 not_yet_measured
+metal macbook_air_8gb 8 128 256 int8 not_yet_measured
+metal macbook_air_8gb 8 128 256 int4 not_yet_measured
+metal macbook_air_8gb 8 512 768 f32 not_yet_measured
+metal macbook_air_8gb 8 512 768 int8 not_yet_measured
+metal macbook_air_8gb 8 512 768 int4 not_yet_measured
+metal macbook_air_8gb 8 512 256 f32 not_yet_measured
+metal macbook_air_8gb 8 512 256 int8 not_yet_measured
+metal macbook_air_8gb 8 512 256 int4 not_yet_measured
+metal macbook_air_8gb 8 2048 768 f32 not_yet_measured
+metal macbook_air_8gb 8 2048 768 int8 not_yet_measured
+metal macbook_air_8gb 8 2048 768 int4 not_yet_measured
+metal macbook_air_8gb 8 2048 256 f32 not_yet_measured
+metal macbook_air_8gb 8 2048 256 int8 not_yet_measured
+metal macbook_air_8gb 8 2048 256 int4 not_yet_measured
+metal macbook_air_8gb 8 8192 768 f32 not_yet_measured
+metal macbook_air_8gb 8 8192 768 int8 not_yet_measured
+metal macbook_air_8gb 8 8192 768 int4 not_yet_measured
+metal macbook_air_8gb 8 8192 256 f32 not_yet_measured
+metal macbook_air_8gb 8 8192 256 int8 not_yet_measured
+metal macbook_air_8gb 8 8192 256 int4 not_yet_measured
+metal macbook_air_16gb 1 128 768 f32 not_yet_measured
+metal macbook_air_16gb 1 128 768 int8 not_yet_measured
+metal macbook_air_16gb 1 128 768 int4 not_yet_measured
+metal macbook_air_16gb 1 128 256 f32 not_yet_measured
+metal macbook_air_16gb 1 128 256 int8 not_yet_measured
+metal macbook_air_16gb 1 128 256 int4 not_yet_measured
+metal macbook_air_16gb 1 512 768 f32 not_yet_measured
+metal macbook_air_16gb 1 512 768 int8 not_yet_measured
+metal macbook_air_16gb 1 512 768 int4 not_yet_measured
+metal macbook_air_16gb 1 512 256 f32 not_yet_measured
+metal macbook_air_16gb 1 512 256 int8 not_yet_measured
+metal macbook_air_16gb 1 512 256 int4 not_yet_measured
+metal macbook_air_16gb 1 2048 768 f32 not_yet_measured
+metal macbook_air_16gb 1 2048 768 int8 not_yet_measured
+metal macbook_air_16gb 1 2048 768 int4 not_yet_measured
+metal macbook_air_16gb 1 2048 256 f32 not_yet_measured
+metal macbook_air_16gb 1 2048 256 int8 not_yet_measured
+metal macbook_air_16gb 1 2048 256 int4 not_yet_measured
+metal macbook_air_16gb 1 8192 768 f32 not_yet_measured
+metal macbook_air_16gb 1 8192 768 int8 not_yet_measured
+metal macbook_air_16gb 1 8192 768 int4 not_yet_measured
+metal macbook_air_16gb 1 8192 256 f32 not_yet_measured
+metal macbook_air_16gb 1 8192 256 int8 not_yet_measured
+metal macbook_air_16gb 1 8192 256 int4 not_yet_measured
+metal macbook_air_16gb 4 128 768 f32 not_yet_measured
+metal macbook_air_16gb 4 128 768 int8 not_yet_measured
+metal macbook_air_16gb 4 128 768 int4 not_yet_measured
+metal macbook_air_16gb 4 128 256 f32 not_yet_measured
+metal macbook_air_16gb 4 128 256 int8 not_yet_measured
+metal macbook_air_16gb 4 128 256 int4 not_yet_measured
+metal macbook_air_16gb 4 512 768 f32 not_yet_measured
+metal macbook_air_16gb 4 512 768 int8 not_yet_measured
+metal macbook_air_16gb 4 512 768 int4 not_yet_measured
+metal macbook_air_16gb 4 512 256 f32 not_yet_measured
+metal macbook_air_16gb 4 512 256 int8 not_yet_measured
+metal macbook_air_16gb 4 512 256 int4 not_yet_measured
+metal macbook_air_16gb 4 2048 768 f32 not_yet_measured
+metal macbook_air_16gb 4 2048 768 int8 not_yet_measured
+metal macbook_air_16gb 4 2048 768 int4 not_yet_measured
+metal macbook_air_16gb 4 2048 256 f32 not_yet_measured
+metal macbook_air_16gb 4 2048 256 int8 not_yet_measured
+metal macbook_air_16gb 4 2048 256 int4 not_yet_measured
+metal macbook_air_16gb 4 8192 768 f32 not_yet_measured
+metal macbook_air_16gb 4 8192 768 int8 not_yet_measured
+metal macbook_air_16gb 4 8192 768 int4 not_yet_measured
+metal macbook_air_16gb 4 8192 256 f32 not_yet_measured
+metal macbook_air_16gb 4 8192 256 int8 not_yet_measured
+metal macbook_air_16gb 4 8192 256 int4 not_yet_measured
+metal macbook_air_16gb 8 128 768 f32 not_yet_measured
+metal macbook_air_16gb 8 128 768 int8 not_yet_measured
+metal macbook_air_16gb 8 128 768 int4 not_yet_measured
+metal macbook_air_16gb 8 128 256 f32 not_yet_measured
+metal macbook_air_16gb 8 128 256 int8 not_yet_measured
+metal macbook_air_16gb 8 128 256 int4 not_yet_measured
+metal macbook_air_16gb 8 512 768 f32 not_yet_measured
+metal macbook_air_16gb 8 512 768 int8 not_yet_measured
+metal macbook_air_16gb 8 512 768 int4 not_yet_measured
+metal macbook_air_16gb 8 512 256 f32 not_yet_measured
+metal macbook_air_16gb 8 512 256 int8 not_yet_measured
+metal macbook_air_16gb 8 512 256 int4 not_yet_measured
+metal macbook_air_16gb 8 2048 768 f32 not_yet_measured
+metal macbook_air_16gb 8 2048 768 int8 not_yet_measured
+metal macbook_air_16gb 8 2048 768 int4 not_yet_measured
+metal macbook_air_16gb 8 2048 256 f32 not_yet_measured
+metal macbook_air_16gb 8 2048 256 int8 not_yet_measured
+metal macbook_air_16gb 8 2048 256 int4 not_yet_measured
+metal macbook_air_16gb 8 8192 768 f32 not_yet_measured
+metal macbook_air_16gb 8 8192 768 int8 not_yet_measured
+metal macbook_air_16gb 8 8192 768 int4 not_yet_measured
+metal macbook_air_16gb 8 8192 256 f32 not_yet_measured
+metal macbook_air_16gb 8 8192 256 int8 not_yet_measured
+metal macbook_air_16gb 8 8192 256 int4 not_yet_measured
+cuda rtx_3060_12gb 1 128 768 f32 not_yet_measured
+cuda rtx_3060_12gb 1 128 768 int8 not_yet_measured
+cuda rtx_3060_12gb 1 128 768 int4 not_yet_measured
+cuda rtx_3060_12gb 1 128 256 f32 not_yet_measured
+cuda rtx_3060_12gb 1 128 256 int8 not_yet_measured
+cuda rtx_3060_12gb 1 128 256 int4 not_yet_measured
+cuda rtx_3060_12gb 1 512 768 f32 not_yet_measured
+cuda rtx_3060_12gb 1 512 768 int8 not_yet_measured
+cuda rtx_3060_12gb 1 512 768 int4 not_yet_measured
+cuda rtx_3060_12gb 1 512 256 f32 not_yet_measured
+cuda rtx_3060_12gb 1 512 256 int8 not_yet_measured
+cuda rtx_3060_12gb 1 512 256 int4 not_yet_measured
+cuda rtx_3060_12gb 1 2048 768 f32 not_yet_measured
+cuda rtx_3060_12gb 1 2048 768 int8 not_yet_measured
+cuda rtx_3060_12gb 1 2048 768 int4 not_yet_measured
+cuda rtx_3060_12gb 1 2048 256 f32 not_yet_measured
+cuda rtx_3060_12gb 1 2048 256 int8 not_yet_measured
+cuda rtx_3060_12gb 1 2048 256 int4 not_yet_measured
+cuda rtx_3060_12gb 1 8192 768 f32 not_yet_measured
+cuda rtx_3060_12gb 1 8192 768 int8 not_yet_measured
+cuda rtx_3060_12gb 1 8192 768 int4 not_yet_measured
+cuda rtx_3060_12gb 1 8192 256 f32 not_yet_measured
+cuda rtx_3060_12gb 1 8192 256 int8 not_yet_measured
+cuda rtx_3060_12gb 1 8192 256 int4 not_yet_measured
+cuda rtx_3060_12gb 4 128 768 f32 not_yet_measured
+cuda rtx_3060_12gb 4 128 768 int8 not_yet_measured
+cuda rtx_3060_12gb 4 128 768 int4 not_yet_measured
+cuda rtx_3060_12gb 4 128 256 f32 not_yet_measured
+cuda rtx_3060_12gb 4 128 256 int8 not_yet_measured
+cuda rtx_3060_12gb 4 128 256 int4 not_yet_measured
+cuda rtx_3060_12gb 4 512 768 f32 not_yet_measured
+cuda rtx_3060_12gb 4 512 768 int8 not_yet_measured
+cuda rtx_3060_12gb 4 512 768 int4 not_yet_measured
+cuda rtx_3060_12gb 4 512 256 f32 not_yet_measured
+cuda rtx_3060_12gb 4 512 256 int8 not_yet_measured
+cuda rtx_3060_12gb 4 512 256 int4 not_yet_measured
+cuda rtx_3060_12gb 4 2048 768 f32 not_yet_measured
+cuda rtx_3060_12gb 4 2048 768 int8 not_yet_measured
+cuda rtx_3060_12gb 4 2048 768 int4 not_yet_measured
+cuda rtx_3060_12gb 4 2048 256 f32 not_yet_measured
+cuda rtx_3060_12gb 4 2048 256 int8 not_yet_measured
+cuda rtx_3060_12gb 4 2048 256 int4 not_yet_measured
+cuda rtx_3060_12gb 4 8192 768 f32 not_yet_measured
+cuda rtx_3060_12gb 4 8192 768 int8 not_yet_measured
+cuda rtx_3060_12gb 4 8192 768 int4 not_yet_measured
+cuda rtx_3060_12gb 4 8192 256 f32 not_yet_measured
+cuda rtx_3060_12gb 4 8192 256 int8 not_yet_measured
+cuda rtx_3060_12gb 4 8192 256 int4 not_yet_measured
+cuda rtx_3060_12gb 8 128 768 f32 not_yet_measured
+cuda rtx_3060_12gb 8 128 768 int8 not_yet_measured
+cuda rtx_3060_12gb 8 128 768 int4 not_yet_measured
+cuda rtx_3060_12gb 8 128 256 f32 not_yet_measured
+cuda rtx_3060_12gb 8 128 256 int8 not_yet_measured
+cuda rtx_3060_12gb 8 128 256 int4 not_yet_measured
+cuda rtx_3060_12gb 8 512 768 f32 not_yet_measured
+cuda rtx_3060_12gb 8 512 768 int8 not_yet_measured
+cuda rtx_3060_12gb 8 512 768 int4 not_yet_measured
+cuda rtx_3060_12gb 8 512 256 f32 not_yet_measured
+cuda rtx_3060_12gb 8 512 256 int8 not_yet_measured
+cuda rtx_3060_12gb 8 512 256 int4 not_yet_measured
+cuda rtx_3060_12gb 8 2048 768 f32 not_yet_measured
+cuda rtx_3060_12gb 8 2048 768 int8 not_yet_measured
+cuda rtx_3060_12gb 8 2048 768 int4 not_yet_measured
+cuda rtx_3060_12gb 8 2048 256 f32 not_yet_measured
+cuda rtx_3060_12gb 8 2048 256 int8 not_yet_measured
+cuda rtx_3060_12gb 8 2048 256 int4 not_yet_measured
+cuda rtx_3060_12gb 8 8192 768 f32 not_yet_measured
+cuda rtx_3060_12gb 8 8192 768 int8 not_yet_measured
+cuda rtx_3060_12gb 8 8192 768 int4 not_yet_measured
+cuda rtx_3060_12gb 8 8192 256 f32 not_yet_measured
+cuda rtx_3060_12gb 8 8192 256 int8 not_yet_measured
+cuda rtx_3060_12gb 8 8192 256 int4 not_yet_measured
+cuda rtx_3060_8gb 1 128 768 f32 not_yet_measured
+cuda rtx_3060_8gb 1 128 768 int8 not_yet_measured
+cuda rtx_3060_8gb 1 128 768 int4 not_yet_measured
+cuda rtx_3060_8gb 1 128 256 f32 not_yet_measured
+cuda rtx_3060_8gb 1 128 256 int8 not_yet_measured
+cuda rtx_3060_8gb 1 128 256 int4 not_yet_measured
+cuda rtx_3060_8gb 1 512 768 f32 not_yet_measured
+cuda rtx_3060_8gb 1 512 768 int8 not_yet_measured
+cuda rtx_3060_8gb 1 512 768 int4 not_yet_measured
+cuda rtx_3060_8gb 1 512 256 f32 not_yet_measured
+cuda rtx_3060_8gb 1 512 256 int8 not_yet_measured
+cuda rtx_3060_8gb 1 512 256 int4 not_yet_measured
+cuda rtx_3060_8gb 1 2048 768 f32 not_yet_measured
+cuda rtx_3060_8gb 1 2048 768 int8 not_yet_measured
+cuda rtx_3060_8gb 1 2048 768 int4 not_yet_measured
+cuda rtx_3060_8gb 1 2048 256 f32 not_yet_measured
+cuda rtx_3060_8gb 1 2048 256 int8 not_yet_measured
+cuda rtx_3060_8gb 1 2048 256 int4 not_yet_measured
+cuda rtx_3060_8gb 1 8192 768 f32 not_yet_measured
+cuda rtx_3060_8gb 1 8192 768 int8 not_yet_measured
+cuda rtx_3060_8gb 1 8192 768 int4 not_yet_measured
+cuda rtx_3060_8gb 1 8192 256 f32 not_yet_measured
+cuda rtx_3060_8gb 1 8192 256 int8 not_yet_measured
+cuda rtx_3060_8gb 1 8192 256 int4 not_yet_measured
+cuda rtx_3060_8gb 4 128 768 f32 not_yet_measured
+cuda rtx_3060_8gb 4 128 768 int8 not_yet_measured
+cuda rtx_3060_8gb 4 128 768 int4 not_yet_measured
+cuda rtx_3060_8gb 4 128 256 f32 not_yet_measured
+cuda rtx_3060_8gb 4 128 256 int8 not_yet_measured
+cuda rtx_3060_8gb 4 128 256 int4 not_yet_measured
+cuda rtx_3060_8gb 4 512 768 f32 not_yet_measured
+cuda rtx_3060_8gb 4 512 768 int8 not_yet_measured
+cuda rtx_3060_8gb 4 512 768 int4 not_yet_measured
+cuda rtx_3060_8gb 4 512 256 f32 not_yet_measured
+cuda rtx_3060_8gb 4 512 256 int8 not_yet_measured
+cuda rtx_3060_8gb 4 512 256 int4 not_yet_measured
+cuda rtx_3060_8gb 4 2048 768 f32 not_yet_measured
+cuda rtx_3060_8gb 4 2048 768 int8 not_yet_measured
+cuda rtx_3060_8gb 4 2048 768 int4 not_yet_measured
+cuda rtx_3060_8gb 4 2048 256 f32 not_yet_measured
+cuda rtx_3060_8gb 4 2048 256 int8 not_yet_measured
+cuda rtx_3060_8gb 4 2048 256 int4 not_yet_measured
+cuda rtx_3060_8gb 4 8192 768 f32 not_yet_measured
+cuda rtx_3060_8gb 4 8192 768 int8 not_yet_measured
+cuda rtx_3060_8gb 4 8192 768 int4 not_yet_measured
+cuda rtx_3060_8gb 4 8192 256 f32 not_yet_measured
+cuda rtx_3060_8gb 4 8192 256 int8 not_yet_measured
+cuda rtx_3060_8gb 4 8192 256 int4 not_yet_measured
+cuda rtx_3060_8gb 8 128 768 f32 not_yet_measured
+cuda rtx_3060_8gb 8 128 768 int8 not_yet_measured
+cuda rtx_3060_8gb 8 128 768 int4 not_yet_measured
+cuda rtx_3060_8gb 8 128 256 f32 not_yet_measured
+cuda rtx_3060_8gb 8 128 256 int8 not_yet_measured
+cuda rtx_3060_8gb 8 128 256 int4 not_yet_measured
+cuda rtx_3060_8gb 8 512 768 f32 not_yet_measured
+cuda rtx_3060_8gb 8 512 768 int8 not_yet_measured
+cuda rtx_3060_8gb 8 512 768 int4 not_yet_measured
+cuda rtx_3060_8gb 8 512 256 f32 not_yet_measured
+cuda rtx_3060_8gb 8 512 256 int8 not_yet_measured
+cuda rtx_3060_8gb 8 512 256 int4 not_yet_measured
+cuda rtx_3060_8gb 8 2048 768 f32 not_yet_measured
+cuda rtx_3060_8gb 8 2048 768 int8 not_yet_measured
+cuda rtx_3060_8gb 8 2048 768 int4 not_yet_measured
+cuda rtx_3060_8gb 8 2048 256 f32 not_yet_measured
+cuda rtx_3060_8gb 8 2048 256 int8 not_yet_measured
+cuda rtx_3060_8gb 8 2048 256 int4 not_yet_measured
+cuda rtx_3060_8gb 8 8192 768 f32 not_yet_measured
+cuda rtx_3060_8gb 8 8192 768 int8 not_yet_measured
+cuda rtx_3060_8gb 8 8192 768 int4 not_yet_measured
+cuda rtx_3060_8gb 8 8192 256 f32 not_yet_measured
+cuda rtx_3060_8gb 8 8192 256 int8 not_yet_measured
+cuda rtx_3060_8gb 8 8192 256 int4 not_yet_measured

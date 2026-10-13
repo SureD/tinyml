@@ -92,6 +92,58 @@ Not measured: cosine on `google/embeddinggemma-2`, the 32-text set, sentence-tra
 - **Tiling / threadgroup memory.** The CPU kernel dequantizes 32 lanes on the stack so the expanded row is not a heap matrix. A Metal kernel should dequantize in threadgroup memory and accumulate float32. Read Apple's threadgroup-memory GEMM notes, and a CUDA tiled GEMM, before picking a tile. The 32 here was not profiled.
 - **Arithmetic intensity / roofline.** Packed weights only help if the expanded values stay in registers or threadgroup memory. Expanding into a full float matrix drops the intensity back to the float GEMM and spends the bandwidth you just saved. Profile `embed()` at sequence 512 on the real text tower before rewriting the inner loop.
 
-## Phase C and D
+## Phase C
 
-Not opened. There is no profile of a hot kernel, and this machine is not Apple Silicon, so a Metal kernel or an Air benchmark cell would be unchecked. Metal, Mac RSS, and the RTX 3060 grid are not yet measured. No latency number is recorded here.
+Not opened. No profile picked a hot kernel.
+
+## Phase D — benchmark
+
+One Release (`-O3 -DNDEBUG`, Clang 18.1.3) run of `bench_embedder` on this Linux host: 4 vCPUs, KVM, `Intel(R) Xeon(R) Processor`, MemTotal 16387416 kB. The model is `tests/data/embeddinggemma2_tiny` (2 layers, hidden 8, embedding dim 6), loaded with `max_seq_len` 64. Batch is 1. Each cell is one warmup `embed()` and 500 timed calls. p50 and p95 use `llround(p * (n - 1))` on the sorted samples. sequences/s is `1000 / p50`. tokens/s multiplies that by the timed sequence length. The raw log is [embeddinggemma2-cpu-bench.log](embeddinggemma2-cpu-bench.log).
+
+This is not `google/embeddinggemma-2` and it is not the 0.999 gate.
+
+| Case | Quant | Seq | p50 ms | p95 ms | seq/s | tok/s | Cosine vs f32 | Cosine vs expected.f32 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fixture0 | f32 | 5 | 0.010941 | 0.011858 | 91399.3236 | 456996.618 | 1 | 1 |
+| fixture1 | f32 | 3 | 0.005665 | 0.005711 | 176522.507 | 529567.52 | 1 | 1 |
+| pattern1 | f32 | 1 | 0.001976 | 0.002013 | 506072.874 | 506072.874 | 1 | na |
+| pattern8 | f32 | 8 | 0.021093 | 0.022788 | 47409.0931 | 379272.745 | 1 | na |
+| pattern32 | f32 | 32 | 0.210281 | 0.227252 | 4755.54139 | 152177.325 | 1 | na |
+| pattern64 | f32 | 64 | 0.747896 | 0.796489 | 1337.0843 | 85573.3952 | 1 | na |
+| fixture0 | int8 | 5 | 0.014257 | 0.015397 | 70140.9834 | 350704.917 | 0.998762932 | 0.998762932 |
+| fixture1 | int8 | 3 | 0.007801 | 0.00785 | 128188.694 | 384566.081 | 0.995468775 | 0.995468775 |
+| pattern1 | int8 | 1 | 0.002985 | 0.003031 | 335008.375 | 335008.375 | 0.999871015 | na |
+| pattern8 | int8 | 8 | 0.025968 | 0.029633 | 38508.9341 | 308071.473 | 0.990230871 | na |
+| pattern32 | int8 | 32 | 0.2277 | 0.24608 | 4391.74352 | 140535.793 | 0.999903518 | na |
+| pattern64 | int8 | 64 | 0.784563 | 0.835771 | 1274.5949 | 81574.0737 | 0.999554024 | na |
+| fixture0 | int4 | 5 | 0.020418 | 0.023381 | 48976.3934 | 244881.967 | 0.907364921 | 0.907364921 |
+| fixture1 | int4 | 3 | 0.011613 | 0.011669 | 86110.3935 | 258331.181 | 0.846225173 | 0.846225173 |
+| pattern1 | int4 | 1 | 0.004211 | 0.005221 | 237473.284 | 237473.284 | 0.997272489 | na |
+| pattern8 | int4 | 8 | 0.035935 | 0.039035 | 27828.0228 | 222624.183 | 0.876848987 | na |
+| pattern32 | int4 | 32 | 0.267891 | 0.289582 | 3732.8615 | 119451.568 | 0.61120961 | na |
+| pattern64 | int4 | 64 | 0.86486 | 0.929796 | 1156.2565 | 74000.4163 | 0.772617157 | na |
+
+Weight arena bytes: f32 10200, int8 8514, int4 7610. Workspace arena bytes: 32088 for every cell, because the arena is sized to sequence 64. Process VmRSS after the int4 loop was 4444 KiB, VmHWM 4444 KiB. The phase B test's 4760-byte workspace was the same fixture loaded with `max_seq_len` 8.
+
+### How to read the CPU figures
+
+Compare f32, int8, and int4 at the same sequence length. tokens/s rises with sequence length even when each call gets slower, because it counts tokens inside the call. p95 is the tail of these 500 calls, not a service latency.
+
+int8 and int4 are slower than f32 here. The matrices are a few kilobytes, so they already sit in cache, and unpacking adds arithmetic. **Quantization tradeoffs:** packed weights save bandwidth only when the kernel is waiting on memory. **Arithmetic intensity / roofline:** this tiny tower is not that kernel. Do not carry this slowdown onto a GPU.
+
+**Memory hierarchy.** Workspace bytes do not shrink when the timed sequence is shorter than 64. RSS here is the whole process, including code. It is not a model-footprint budget.
+
+Pattern tokens are `1 + (i % 19)` on the tiny checkpoint. `na` means there is no frozen `expected.f32` for that length. The int4 cosine of 0.61120961 at sequence 32 is this fixture against its own float32 output. It is not the official 0.99 rule.
+
+### Rows left unmeasured
+
+The log lists every design-grid cell as `not_yet_measured`. No GPU time is filled in.
+
+| Device | What the row is for | Result |
+| --- | --- | --- |
+| MacBook Air 8 GB, Metal | Unified memory. Weights and activations are the process RSS. Plan cap about 2 GB. | not yet measured |
+| MacBook Air 16 GB, Metal | Same unified memory. Plan cap about 4 GB. `hw.memsize` was not run, so the cap was not chosen. | not yet measured |
+| RTX 3060 12 GB | Discrete VRAM. Read `nvidia-smi`, not Linux VmRSS. A host-to-device copy is traffic the Air does not pay. Plan cap 4 GB. | not yet measured |
+| RTX 3060 8 GB | Same discrete VRAM. Plan cap 3 GB. | not yet measured |
+
+Those cells are batch 1, 4, and 8; sequence 128, 512, 2048, and 8192; width 768 and 256; weights f32, int8, and int4. This CPU run cannot stand in for them: the engine is batch 1, the fixture embedding dim is 6, and its maximum position is 64.

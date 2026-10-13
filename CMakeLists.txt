@@ -84,6 +84,17 @@ add_executable(bench_infer
 target_link_libraries(bench_infer PRIVATE tinyinfer)
 target_compile_options(bench_infer PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(bench_embedder
+    tests/cpp/bench_embedder.cc
+)
+
+target_link_libraries(bench_embedder PRIVATE tinyinfer)
+target_compile_options(bench_embedder PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(bench_embedder PRIVATE
+    TINYINFER_EMBEDDER_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/data"
+    TINYINFER_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+)
+
 add_executable(embedder_tests
     tests/cpp/test_embedder.cc
 )
