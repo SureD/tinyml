@@ -59,7 +59,7 @@ CPU only. Every 2-D text weight is packed per matrix row: int8 in `[-128, 127]`,
 
 This packing is TinyInfer's. It is not a LiteRT QAT file, and it was not checked against one.
 
-Measured on the tiny fixture (`tests/data/embeddinggemma2_tiny`), both sequences, Linux x86_64, 2026-10-13. Cosine is against the float32 embedder and against `expected.f32`. Those two scores matched. Workspace bytes stayed 4760. Weight arena bytes are the tiny model, including 64-byte alignment slack, not the 270 MB / 135 MB estimates.
+Measured on the tiny fixture (`tests/data/embeddinggemma2_tiny`), both sequences, Linux x86_64. Cosine is against the float32 embedder and against `expected.f32`. Those two scores matched. After the attention-score buffer moved into the workspace, `embedder_tests` on 2026-10-14 printed workspace bytes 4856 at `max_seq_len` 8, and that size did not change across quantize. Weight arena bytes are the tiny model, including 64-byte alignment slack, not the 270 MB / 135 MB estimates.
 
 | Pack | Cosine | Max abs vs f32 | Weight arena bytes |
 | --- | --- | --- | --- |
