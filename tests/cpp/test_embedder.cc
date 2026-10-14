@@ -468,6 +468,59 @@ void test_quantize() {
         width);
 }
 
+void test_reload_after_quantize(EmbeddingGemma2Quant quant, const char* name) {
+    const std::string dir = fixture_path("embeddinggemma2_tiny");
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    if (!backend.status) {
+        return;
+    }
+    Result<EmbeddingGemma2Engine> engine = load_embeddinggemma2_from_hf_dir(
+        *backend.value,
+        dir.c_str(),
+        8);
+    EXPECT_TRUE(engine.status);
+    if (!engine.status) {
+        return;
+    }
+    const std::string weights = dir + "/model.safetensors";
+    Status status = load_embeddinggemma2_safetensors(engine.value, weights.c_str());
+    EXPECT_TRUE(status);
+    if (!status) {
+        std::cerr << name << " float32 reload: " << status.message << "\n";
+        return;
+    }
+    status = engine.value.quantize_weights(quant);
+    EXPECT_TRUE(status);
+    if (!status) {
+        return;
+    }
+
+    const std::vector<uint32_t> tokens = {1, 4, 7, 2, 9};
+    std::vector<float> before(engine.value.config().embedding_dim);
+    status = engine.value.embed(tokens, before);
+    EXPECT_TRUE(status);
+    if (!status) {
+        return;
+    }
+
+    Status reloaded = load_embeddinggemma2_safetensors(engine.value, weights.c_str());
+    EXPECT_TRUE(!reloaded);
+    EXPECT_TRUE(engine.value.weight_quant() == quant);
+    EXPECT_TRUE(engine.value.weights_loaded());
+
+    std::vector<float> after(before.size());
+    status = engine.value.embed(tokens, after);
+    EXPECT_TRUE(status);
+    if (!status) {
+        std::cerr << name << " embed after refused reload: " << status.message << "\n";
+        return;
+    }
+    for (size_t i = 0; i < before.size(); ++i) {
+        EXPECT_TRUE(before[i] == after[i]);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -476,6 +529,8 @@ int main() {
     test_tiny_reference();
     test_same_sign_quant_rows();
     test_quantize();
+    test_reload_after_quantize(EmbeddingGemma2Quant::int8, "int8");
+    test_reload_after_quantize(EmbeddingGemma2Quant::int4, "int4");
     if (g_failures != 0) {
         std::cerr << g_failures << " failure(s)\n";
         return 1;

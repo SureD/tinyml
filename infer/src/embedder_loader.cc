@@ -673,6 +673,12 @@ Result<EmbeddingGemma2Config> load_embeddinggemma2_config_json(const char* path)
 }
 
 Status load_embeddinggemma2_safetensors(EmbeddingGemma2Engine& engine, const char* path) {
+    // After quantize, matrix views are packed int8 with a per-row scale and zero.
+    // Copying f32 bytes into those views would leave quant mode set and the
+    // scales stale. Reload is refused until the engine is still float32.
+    if (engine.quant_ != EmbeddingGemma2Quant::f32) {
+        return Status::invalid_argument_status("cannot reload weights into a quantized embedder");
+    }
     engine.weights_loaded_ = false;
     if (engine.backend_ == nullptr || engine.model_.layers.size() != engine.config_.n_layers) {
         return Status::invalid_argument_status("embedder is not initialized");
