@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(tiny_test LANGUAGES CXX OBJCXX)
+# Objective-C++ is the Apple Metal path. Linux configures with CXX only;
+# metal_backend.mm is plain C++ when the Metal headers are not present.
+project(tiny_test LANGUAGES CXX)
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 include(FetchContent)
 
