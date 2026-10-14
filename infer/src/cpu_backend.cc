@@ -293,7 +293,7 @@ public:
         if (!view.defined() || view.arena == nullptr || !owns_arena(*view.arena)) {
             return nullptr;
         }
-        if (!view.contiguous() || view.dtype != DType::f32) {
+        if (!view.contiguous()) {
             return nullptr;
         }
         return data(view);

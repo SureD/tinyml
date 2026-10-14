@@ -39,6 +39,16 @@ struct EmbeddingGemma2Config {
     Status validate() const;
 };
 
+// Weight packing for the text matrices. f32 is the loaded checkpoint.
+// int8 and int4 are per output row, with a scale and a zero point, because
+// the checkpoint does not say the integers are symmetric. This is TinyInfer's
+// layout, not a LiteRT QAT file.
+enum class EmbeddingGemma2Quant {
+    f32,
+    int8,
+    int4,
+};
+
 // Text embedder. One call takes token ids and writes one L2-normalized vector.
 // Batch 1. There is no KV cache: each layer's K and V live in the workspace
 // and are overwritten by the next layer.
@@ -64,11 +74,17 @@ public:
         std::span<const uint32_t> tokens,
         std::span<float> embedding);
 
+    // Repacks every 2-D weight from the loaded float32 values.
+    // One-dimensional norms and layer scalars stay float32.
+    // The unpacked float matrices are not kept.
+    Status quantize_weights(EmbeddingGemma2Quant quant);
+
     const EmbeddingGemma2Config& config() const;
     uint32_t max_seq_len() const;
     size_t weight_arena_bytes() const;
     size_t workspace_arena_bytes() const;
     bool weights_loaded() const;
+    EmbeddingGemma2Quant weight_quant() const;
 
 private:
     friend Result<EmbeddingGemma2Config> load_embeddinggemma2_config_json(const char* path);
@@ -80,31 +96,42 @@ private:
         const char* model_dir,
         uint32_t max_seq_len);
 
+    // `weight` is float32 [rows, cols], or packed int8 / int4 after quantize.
+    // `scale` and `zero` are one per output row. int4 packs two values per byte,
+    // low nibble first, sign-extended on read.
+    struct Matrix {
+        TensorView weight;
+        TensorView scale;
+        TensorView zero;
+        int64_t rows = 0;
+        int64_t cols = 0;
+    };
+
     struct LayerWeights {
         TensorView input_layernorm;
         TensorView post_attention_layernorm;
         TensorView pre_feedforward_layernorm;
         TensorView post_feedforward_layernorm;
-        TensorView q_proj;
-        TensorView k_proj;
-        TensorView v_proj;
-        TensorView o_proj;
+        Matrix q_proj;
+        Matrix k_proj;
+        Matrix v_proj;
+        Matrix o_proj;
         TensorView q_norm;
         TensorView k_norm;
-        TensorView gate_proj;
-        TensorView up_proj;
-        TensorView down_proj;
-        TensorView ple_gate;
-        TensorView ple_proj;
+        Matrix gate_proj;
+        Matrix up_proj;
+        Matrix down_proj;
+        Matrix ple_gate;
+        Matrix ple_proj;
         TensorView ple_norm;
         TensorView layer_scalar;
     };
 
     struct Model {
-        TensorView embed_tokens;
+        Matrix embed_tokens;
         TensorView final_norm;
-        TensorView embedding_projection;
-        TensorView ple_projection;
+        Matrix embedding_projection;
+        Matrix ple_projection;
         TensorView ple_norm;
         std::vector<LayerWeights> layers;
     };
@@ -137,6 +164,7 @@ private:
     Status bind_weights();
     Status bind_workspace();
     void rebind_view(TensorView& view, const EmbeddingGemma2Engine& source);
+    void rebind_matrix(Matrix& matrix, const EmbeddingGemma2Engine& source);
     void rebind_views_after_move(const EmbeddingGemma2Engine& source);
     Status forward(
         std::span<const uint32_t> tokens,
@@ -146,6 +174,7 @@ private:
     EmbeddingGemma2Config config_;
     uint32_t max_seq_len_ = 0;
     bool weights_loaded_ = false;
+    EmbeddingGemma2Quant quant_ = EmbeddingGemma2Quant::f32;
     MemoryArena weights_;
     MemoryArena workspace_;
     Model model_;

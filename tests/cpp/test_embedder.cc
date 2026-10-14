@@ -1,11 +1,16 @@
 #include "tinyinfer/embedder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+namespace tinyinfer {
+void dequantized_row_for_test(const float* weight, int64_t cols, int bits, float* out);
+}
 
 using namespace tinyinfer;
 
@@ -288,12 +293,244 @@ void test_tiny_reference() {
     EXPECT_TRUE(!matryoshka_status);
 }
 
+void test_quantize_one(
+    EmbeddingGemma2Quant quant,
+    const char* name,
+    const std::string& dir,
+    const std::vector<std::vector<uint32_t>>& sequences,
+    const std::vector<float>& expected,
+    const std::vector<float>& f32_embeddings,
+    uint32_t width) {
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    if (!backend.status) {
+        return;
+    }
+    Result<EmbeddingGemma2Engine> engine = load_embeddinggemma2_from_hf_dir(
+        *backend.value,
+        dir.c_str(),
+        8);
+    EXPECT_TRUE(engine.status);
+    if (!engine.status) {
+        return;
+    }
+
+    const size_t workspace_before = engine.value.workspace_arena_bytes();
+    const size_t weights_before = engine.value.weight_arena_bytes();
+    Status bad = engine.value.quantize_weights(EmbeddingGemma2Quant::f32);
+    EXPECT_TRUE(!bad);
+
+    Status status = engine.value.quantize_weights(quant);
+    EXPECT_TRUE(status);
+    if (!status) {
+        std::cerr << name << " quantize: " << status.message << "\n";
+        return;
+    }
+    EXPECT_TRUE(engine.value.weight_quant() == quant);
+    EXPECT_TRUE(engine.value.workspace_arena_bytes() == workspace_before);
+    std::cout << name
+              << " weight_bytes " << weights_before
+              << " -> " << engine.value.weight_arena_bytes()
+              << " workspace_bytes " << engine.value.workspace_arena_bytes()
+              << "\n";
+
+    Status again = engine.value.quantize_weights(quant);
+    EXPECT_TRUE(!again);
+
+    size_t offset = 0;
+    for (const std::vector<uint32_t>& tokens : sequences) {
+        std::vector<float> got(width);
+        status = engine.value.embed(tokens, got);
+        EXPECT_TRUE(status);
+        if (!status) {
+            std::cerr << name << " embed: " << status.message << "\n";
+            return;
+        }
+        double norm = 0.0;
+        double max_abs_f32 = 0.0;
+        for (uint32_t i = 0; i < width; ++i) {
+            norm += static_cast<double>(got[i]) * static_cast<double>(got[i]);
+            const double diff = std::fabs(
+                static_cast<double>(got[i]) - static_cast<double>(f32_embeddings[offset + i]));
+            if (diff > max_abs_f32) {
+                max_abs_f32 = diff;
+            }
+            EXPECT_TRUE(std::isfinite(got[i]));
+        }
+        EXPECT_TRUE(std::fabs(std::sqrt(norm) - 1.0) < 1e-5);
+        const double vs_f32 = cosine(got.data(), f32_embeddings.data() + offset, width);
+        const double vs_ref = cosine(got.data(), expected.data() + offset, width);
+        std::cout << name
+                  << " cosine_vs_f32=" << vs_f32
+                  << " cosine_vs_reference=" << vs_ref
+                  << " max_abs_vs_f32=" << max_abs_f32
+                  << "\n";
+        // Measured on this Linux machine against the tiny fixture, 2026-10-14,
+        // after the quant range includes 0. int8: 0.99984 and 0.999858.
+        // int4: 0.920494 and 0.820283. Not the official 32-text gates.
+        const double cosine_floor = quant == EmbeddingGemma2Quant::int8 ? 0.9998 : 0.820;
+        const double abs_ceil = quant == EmbeddingGemma2Quant::int8 ? 0.014 : 0.39;
+        EXPECT_TRUE(vs_f32 >= cosine_floor);
+        EXPECT_TRUE(vs_ref >= cosine_floor);
+        EXPECT_TRUE(max_abs_f32 <= abs_ceil);
+        offset += width;
+    }
+}
+
+float row_error(const float* got, const float* want, int n) {
+    float error = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        error = std::max(error, std::fabs(got[i] - want[i]));
+    }
+    return error;
+}
+
+void test_same_sign_quant_rows() {
+    const float positive[] = {1.0f, 2.0f};
+    const float negative[] = {-2.0f, -1.0f};
+    const float zeros[] = {0.0f, 0.0f};
+    const float constant[] = {1.25f, 1.25f};
+    const float mixed[] = {-1.0f, 2.0f};
+    float out[2];
+    const int bits[] = {8, 4};
+    for (int bit : bits) {
+        const float bin = bit == 8 ? (2.0f / 255.0f) : (2.0f / 15.0f);
+        dequantized_row_for_test(positive, 2, bit, out);
+        std::cout << "same-sign +" << bit
+                  << " dequant=" << out[0] << "," << out[1] << "\n";
+        EXPECT_TRUE(row_error(out, positive, 2) <= bin);
+        EXPECT_TRUE(out[1] > out[0] + 0.5f);
+
+        dequantized_row_for_test(negative, 2, bit, out);
+        std::cout << "same-sign -" << bit
+                  << " dequant=" << out[0] << "," << out[1] << "\n";
+        EXPECT_TRUE(row_error(out, negative, 2) <= bin);
+        EXPECT_TRUE(out[0] < out[1] - 0.5f);
+
+        dequantized_row_for_test(zeros, 2, bit, out);
+        EXPECT_TRUE(out[0] == 0.0f && out[1] == 0.0f);
+
+        dequantized_row_for_test(constant, 2, bit, out);
+        EXPECT_TRUE(row_error(out, constant, 2) <= 1e-5f);
+
+        const float mixed_bin = bit == 8 ? (3.0f / 255.0f) : (3.0f / 15.0f);
+        dequantized_row_for_test(mixed, 2, bit, out);
+        EXPECT_TRUE(row_error(out, mixed, 2) <= mixed_bin);
+    }
+}
+
+void test_quantize() {
+    const std::string dir = fixture_path("embeddinggemma2_tiny");
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    if (!backend.status) {
+        return;
+    }
+    Result<EmbeddingGemma2Engine> f32_engine = load_embeddinggemma2_from_hf_dir(
+        *backend.value,
+        dir.c_str(),
+        8);
+    EXPECT_TRUE(f32_engine.status);
+    if (!f32_engine.status) {
+        return;
+    }
+
+    std::vector<std::vector<uint32_t>> sequences;
+    std::vector<float> expected;
+    EXPECT_TRUE(load_tokens(dir + "/tokens.txt", sequences));
+    EXPECT_TRUE(load_f32(dir + "/expected.f32", expected));
+    const uint32_t width = f32_engine.value.config().embedding_dim;
+    std::vector<float> f32_embeddings(sequences.size() * width);
+    size_t offset = 0;
+    for (const std::vector<uint32_t>& tokens : sequences) {
+        Status status = f32_engine.value.embed(
+            tokens,
+            std::span<float>(f32_embeddings.data() + offset, width));
+        EXPECT_TRUE(status);
+        offset += width;
+    }
+
+    test_quantize_one(
+        EmbeddingGemma2Quant::int8,
+        "int8",
+        dir,
+        sequences,
+        expected,
+        f32_embeddings,
+        width);
+    test_quantize_one(
+        EmbeddingGemma2Quant::int4,
+        "int4",
+        dir,
+        sequences,
+        expected,
+        f32_embeddings,
+        width);
+}
+
+void test_reload_after_quantize(EmbeddingGemma2Quant quant, const char* name) {
+    const std::string dir = fixture_path("embeddinggemma2_tiny");
+    Result<std::unique_ptr<Backend>> backend = create_cpu_backend();
+    EXPECT_TRUE(backend.status);
+    if (!backend.status) {
+        return;
+    }
+    Result<EmbeddingGemma2Engine> engine = load_embeddinggemma2_from_hf_dir(
+        *backend.value,
+        dir.c_str(),
+        8);
+    EXPECT_TRUE(engine.status);
+    if (!engine.status) {
+        return;
+    }
+    const std::string weights = dir + "/model.safetensors";
+    Status status = load_embeddinggemma2_safetensors(engine.value, weights.c_str());
+    EXPECT_TRUE(status);
+    if (!status) {
+        std::cerr << name << " float32 reload: " << status.message << "\n";
+        return;
+    }
+    status = engine.value.quantize_weights(quant);
+    EXPECT_TRUE(status);
+    if (!status) {
+        return;
+    }
+
+    const std::vector<uint32_t> tokens = {1, 4, 7, 2, 9};
+    std::vector<float> before(engine.value.config().embedding_dim);
+    status = engine.value.embed(tokens, before);
+    EXPECT_TRUE(status);
+    if (!status) {
+        return;
+    }
+
+    Status reloaded = load_embeddinggemma2_safetensors(engine.value, weights.c_str());
+    EXPECT_TRUE(!reloaded);
+    EXPECT_TRUE(engine.value.weight_quant() == quant);
+    EXPECT_TRUE(engine.value.weights_loaded());
+
+    std::vector<float> after(before.size());
+    status = engine.value.embed(tokens, after);
+    EXPECT_TRUE(status);
+    if (!status) {
+        std::cerr << name << " embed after refused reload: " << status.message << "\n";
+        return;
+    }
+    for (size_t i = 0; i < before.size(); ++i) {
+        EXPECT_TRUE(before[i] == after[i]);
+    }
+}
+
 }  // namespace
 
 int main() {
     test_official_config();
     test_config_rejects();
     test_tiny_reference();
+    test_same_sign_quant_rows();
+    test_quantize();
+    test_reload_after_quantize(EmbeddingGemma2Quant::int8, "int8");
+    test_reload_after_quantize(EmbeddingGemma2Quant::int4, "int4");
     if (g_failures != 0) {
         std::cerr << g_failures << " failure(s)\n";
         return 1;

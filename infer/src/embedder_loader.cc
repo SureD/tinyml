@@ -673,6 +673,12 @@ Result<EmbeddingGemma2Config> load_embeddinggemma2_config_json(const char* path)
 }
 
 Status load_embeddinggemma2_safetensors(EmbeddingGemma2Engine& engine, const char* path) {
+    // After quantize, matrix views are packed int8 with a per-row scale and zero.
+    // Copying f32 bytes into those views would leave quant mode set and the
+    // scales stale. Reload is refused until the engine is still float32.
+    if (engine.quant_ != EmbeddingGemma2Quant::f32) {
+        return Status::invalid_argument_status("cannot reload weights into a quantized embedder");
+    }
     engine.weights_loaded_ = false;
     if (engine.backend_ == nullptr || engine.model_.layers.size() != engine.config_.n_layers) {
         return Status::invalid_argument_status("embedder is not initialized");
@@ -685,10 +691,10 @@ Status load_embeddinggemma2_safetensors(EmbeddingGemma2Engine& engine, const cha
 
     std::vector<ExpectedTensor> expected;
     expected.reserve(5 + engine.config_.n_layers * 17);
-    add_expected(expected, "language_model.embed_tokens.weight", engine.model_.embed_tokens);
+    add_expected(expected, "language_model.embed_tokens.weight", engine.model_.embed_tokens.weight);
     add_expected(expected, "language_model.norm.weight", engine.model_.final_norm);
-    add_expected(expected, "language_model.embedding_projection.weight", engine.model_.embedding_projection);
-    add_expected(expected, "language_model.ple.per_layer_model_projection.weight", engine.model_.ple_projection);
+    add_expected(expected, "language_model.embedding_projection.weight", engine.model_.embedding_projection.weight);
+    add_expected(expected, "language_model.ple.per_layer_model_projection.weight", engine.model_.ple_projection.weight);
     add_expected(expected, "language_model.ple.per_layer_projection_norm.weight", engine.model_.ple_norm);
     for (uint32_t i = 0; i < engine.config_.n_layers; ++i) {
         EmbeddingGemma2Engine::LayerWeights& layer = engine.model_.layers[i];
@@ -696,17 +702,17 @@ Status load_embeddinggemma2_safetensors(EmbeddingGemma2Engine& engine, const cha
         add_expected(expected, layer_key(i, "post_attention_layernorm.weight"), layer.post_attention_layernorm);
         add_expected(expected, layer_key(i, "pre_feedforward_layernorm.weight"), layer.pre_feedforward_layernorm);
         add_expected(expected, layer_key(i, "post_feedforward_layernorm.weight"), layer.post_feedforward_layernorm);
-        add_expected(expected, layer_key(i, "self_attn.q_proj.weight"), layer.q_proj);
-        add_expected(expected, layer_key(i, "self_attn.k_proj.weight"), layer.k_proj);
-        add_expected(expected, layer_key(i, "self_attn.v_proj.weight"), layer.v_proj);
-        add_expected(expected, layer_key(i, "self_attn.o_proj.weight"), layer.o_proj);
+        add_expected(expected, layer_key(i, "self_attn.q_proj.weight"), layer.q_proj.weight);
+        add_expected(expected, layer_key(i, "self_attn.k_proj.weight"), layer.k_proj.weight);
+        add_expected(expected, layer_key(i, "self_attn.v_proj.weight"), layer.v_proj.weight);
+        add_expected(expected, layer_key(i, "self_attn.o_proj.weight"), layer.o_proj.weight);
         add_expected(expected, layer_key(i, "self_attn.q_norm.weight"), layer.q_norm);
         add_expected(expected, layer_key(i, "self_attn.k_norm.weight"), layer.k_norm);
-        add_expected(expected, layer_key(i, "mlp.gate_proj.weight"), layer.gate_proj);
-        add_expected(expected, layer_key(i, "mlp.up_proj.weight"), layer.up_proj);
-        add_expected(expected, layer_key(i, "mlp.down_proj.weight"), layer.down_proj);
-        add_expected(expected, layer_key(i, "ple_block.per_layer_input_gate.weight"), layer.ple_gate);
-        add_expected(expected, layer_key(i, "ple_block.per_layer_projection.weight"), layer.ple_proj);
+        add_expected(expected, layer_key(i, "mlp.gate_proj.weight"), layer.gate_proj.weight);
+        add_expected(expected, layer_key(i, "mlp.up_proj.weight"), layer.up_proj.weight);
+        add_expected(expected, layer_key(i, "mlp.down_proj.weight"), layer.down_proj.weight);
+        add_expected(expected, layer_key(i, "ple_block.per_layer_input_gate.weight"), layer.ple_gate.weight);
+        add_expected(expected, layer_key(i, "ple_block.per_layer_projection.weight"), layer.ple_proj.weight);
         add_expected(expected, layer_key(i, "ple_block.post_per_layer_input_norm.weight"), layer.ple_norm);
         add_expected(expected, layer_key(i, "layer_scalar"), layer.layer_scalar);
     }

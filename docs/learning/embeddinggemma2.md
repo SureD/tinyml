@@ -53,6 +53,45 @@ What to read: the three passes in `attention` in `infer/src/embedder.cc`. The GP
 
 What to try: on Metal, keep one query block's softmax weights in threadgroup memory and read V coalesced. Do not allocate the full attention matrix. Re-check cosine against this CPU path before trusting a fused kernel.
 
-## Phase B and later
+## Phase B — quantize
 
-Filled in on the phase branch that lands the work.
+CPU only. Every 2-D text weight is packed per matrix row: int8 in `[-128, 127]`, or int4 in `[-8, 7]`, two values per byte, low nibble first. Each row stores a float scale and an int8 zero point, because the checkpoint does not say the integers are symmetric. A constant row uses scale = value, zero = 0, and stored integer 1. The float matrices are read, packed, and not kept. Norms and `layer_scalar` stay float32. Activations stay float32. `gemm_quant` expands 32 weights onto the stack, then accumulates float32. That tile is a CPU stand-in. It is not a measured GPU tile size.
+
+This packing is TinyInfer's. It is not a LiteRT QAT file, and it was not checked against one.
+
+Measured on the tiny fixture (`tests/data/embeddinggemma2_tiny`), both sequences, Linux x86_64. Cosine is against the float32 embedder and against `expected.f32`. Those two scores matched. After the attention-score buffer moved into the workspace, `embedder_tests` on 2026-10-14 printed workspace bytes 4856 at `max_seq_len` 8, and that size did not change across quantize. Weight arena bytes are the tiny model, including 64-byte alignment slack, not the 270 MB / 135 MB estimates.
+
+| Pack | Cosine | Max abs vs f32 | Weight arena bytes |
+| --- | --- | --- | --- |
+| f32 | 1 | 1.78814e-7, 1.93715e-7 vs expected.f32 | 10200 |
+| int8 | 0.99984, 0.999858 | 0.013538, 0.0120243 | 10200 → 8514 |
+| int4 | 0.920494, 0.820283 | 0.303526, 0.389811 | 10200 → 7610 |
+
+The test floors are these measured scores, trimmed: int8 cosine at least 0.9998 and max abs at most 0.014; int4 cosine at least 0.820 and max abs at most 0.39. The int4 second sequence moved down from 0.846225 when the range was widened to include 0. That is this fixture, not the official 0.99 rule.
+
+### Quantization range and the zero point
+
+`scale = (max - min) / (qmax - qmin)` and `zero = round(qmin - min / scale)`. If every value in the row is positive, `min > 0` and that zero point is below `qmin`. The old code clamped the zero point and left the scale alone. The integer grid then covered only a slice of the row, and the large weights clipped. For int8, a row in `[1, 2]` stored both entries as 127 with zero point -128, and dequantized to `[1, 1]`. The all-negative case clamps the other way.
+
+`quantize_matrix` now folds 0 into min and max before the scale. A positive row uses `[0, max]`, so the zero point is `qmin` and the top of the row stays representable. A negative row uses `[min, 0]`. A mixed-sign row already contains 0, so its scale does not change. An all-zero row is still the constant path.
+
+Measured dequant of `[1, 2]` after the change: int8 `0.996078, 2`; int4 `0.933333, 2`. `[-2, -1]`: int8 `-2, -0.996078`; int4 `-2, -0.933333`.
+
+**Quantization tradeoffs.** Including 0 spends codes on the empty side of a same-sign row. int8 on this fixture got closer to float32 (cosine 0.99984 and 0.999858). int4 spent those codes and one sequence fell from 0.846225 to 0.820283. Clipping was the worse error on a single row; the embedding cosine is a separate measurement.
+
+What to read: the zero-point derivation in Jacob et al., "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference" (the affine map `r = scale * (q - zero)`), and `quantize_matrix` in `infer/src/embedder.cc`.
+
+What to try: keep the same-sign row test. On a GPU dequant kernel, use this scale and zero; a symmetric kernel would not match these bytes. Do not invent a group size to win the codes back.
+
+Not measured: cosine on `google/embeddinggemma-2`, the 32-text set, sentence-transformers, RSS, and any GPU.
+
+### Principles for this step
+
+- **Quantization tradeoffs.** Four bits per weight is a bandwidth win and a cosine loss. On this fixture int8 stays near the float vector and int4 does not. Read the row loop in `quantize_matrix` before changing the range or the zero point. Try the official checkpoint before deciding that int4 is the resident format. Do not add a group size; the verified LiteRT granularity is the whole output row.
+- **Memory hierarchy, and Apple unified memory versus a discrete GPU.** The unpacked float matrix is not resident. On a Mac the arena is the process RSS. On a discrete GPU the same second copy would be another device buffer and a transfer. Read `quantize_weights` before adding a dequantized cache.
+- **Tiling / threadgroup memory.** The CPU kernel dequantizes 32 lanes on the stack so the expanded row is not a heap matrix. A Metal kernel should dequantize in threadgroup memory and accumulate float32. Read Apple's threadgroup-memory GEMM notes, and a CUDA tiled GEMM, before picking a tile. The 32 here was not profiled.
+- **Arithmetic intensity / roofline.** Packed weights only help if the expanded values stay in registers or threadgroup memory. Expanding into a full float matrix drops the intensity back to the float GEMM and spends the bandwidth you just saved. Profile `embed()` at sequence 512 on the real text tower before rewriting the inner loop.
+
+## Phase C and D
+
+Not opened. There is no profile of a hot kernel, and this machine is not Apple Silicon, so a Metal kernel or an Air benchmark cell would be unchecked. Metal, Mac RSS, and the RTX 3060 grid are not yet measured. No latency number is recorded here.
