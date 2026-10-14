@@ -102,8 +102,9 @@ Mean pool uses the true length, not the bucket pad. Batch 1 is the first correct
 
 Copies:
 
-- Packed weights land in the weight arena. No full-size float temporary.
-- Token gather writes the hidden state in the workspace.
+- Phase A keeps the Hugging Face weights resident as BF16 in the weight arena. It does not allocate a second float copy of them (that copy would be about 1.08 GB). The kernels this bring-up reuses cannot read that buffer: `small_m_gemm_tiled_f32` loads weights as `const device float*` / `float4`, and `embedding_f32` loads the table as `const device float*` (`infer/src/metal_backend.mm`). CPU `matmul_out` and `embedding_out` likewise read `float*` (`infer/src/cpu_backend.cc`).
+- GEMM converts BF16→f32 in the weight-tile load. Each lane already consumes 4 weight values per K step (`k_per_tile` 128). Those 4 values are converted in registers, then the existing f32 dot runs. The X tile stays the current threadgroup `float4` buffer, because activations are already f32. No device scratch and no unpacked weight arena.
+- The embedding gather converts BF16→f32 while writing the existing f32 hidden row (`hidden` 512, the workspace slot from the layout above). CPU gather does the same element conversion. It does not `memcpy` a float row out of a BF16 table. No extra table buffer.
 - Quantized GEMM dequantizes a tile in threadgroup memory and accumulates float32.
 - Residual add is in place.
 - `copy_to_host` runs once, for the pooled vectors.
@@ -111,7 +112,7 @@ Copies:
 
 Metal kernels, narrow:
 
-- Bring-up reuses `small_m_gemm_tiled_f32`. Queries are a short `M` with `N` in {512, 2048}.
+- Bring-up keeps the `small_m_gemm_tiled_f32` tile (4×4 output, K tile 128, f32 dots) and the `embedding_f32` gather shape. It does not pass the BF16 arena to those kernels. Weight and table loads convert BF16→f32 as in the copies list. Queries are a short `M` with `N` in {512, 2048}.
 - A large-`M` GEMM waits until a profile shows the small-`M` kernel bandwidth-bound at long sequences.
 - int8/int4 GEMM is a sibling kernel, not a mode flag on the f32 kernel.
 - Local attention reads at most 1024 keys. Global attention reads this sequence. Mask mode is an argument after the checkpoint names it.
@@ -148,7 +149,7 @@ Activations stay float32 on Metal. On CUDA, bfloat16 compute is allowed by the c
 
 Weight order:
 
-1. Bring-up: Hugging Face BF16 stored, float32 compute on the Air. Accuracy reference.
+1. Bring-up: Hugging Face BF16 stored, float32 compute on the Air. BF16→f32 happens in the GEMM tile load and the embedding gather (section 5), not in a second weight buffer. Accuracy reference.
 2. int8 per output channel. A zero-point exists only if the file has one. Symmetric is not assumed. ggml Q8_0 is an external cosine check, not the on-disk format.
 3. int4 per output channel, matching verified LiteRT text QAT. Order: token table, FFN gate/up/down (512×2048), then Q/K/V/O. No invented group size.
 
@@ -192,7 +193,7 @@ The Air is the phase clock. Each phase ends before the next. Existing Llama `cte
 
 ### A — run
 
-CPU, then Metal. Text, BF16 weights, float32 compute, batch 1, sequences 128 and 512. Mask, norm, and position op from the checkpoint. Output 768-d, L2-normalized.
+CPU, then Metal. Text weights stay resident BF16. Float32 compute. GEMM converts BF16→f32 in the weight-tile load (4 values per lane, registers only). Gather converts BF16→f32 into the existing f32 hidden row. No unpacked weight arena. Batch 1, sequences 128 and 512. Mask, norm, and position op from the checkpoint. Output 768-d, L2-normalized.
 
 Verify: cosine at least 0.999 on the prompt pair and the 32 texts. Finite outputs. Llama tests pass. RSS recorded. An 8 GB Air may miss the 2 GB cap here; that does not block a 16 GB Air, and it is why phase B exists.
 
