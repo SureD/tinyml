@@ -17,6 +17,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# metal_backend.mm is Objective-C++ only when Metal headers exist. On other
+# hosts the same file is a C++ stub; compiling it as ObjC++ still emits
+# __gnu_objc_personality_v0, which the Linux linker does not provide.
+if(NOT APPLE)
+    set_source_files_properties(
+        infer/src/metal_backend.mm
+        PROPERTIES LANGUAGE CXX)
+endif()
+
 add_library(tinyinfer STATIC
     infer/src/cpu_backend.cc
     infer/src/core.cc
