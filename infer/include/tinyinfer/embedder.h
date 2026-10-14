@@ -117,6 +117,8 @@ private:
         TensorView k;
         TensorView v;
         TensorView attn;
+        // One softmax-score row, length max_seq_len. Reused by every layer.
+        TensorView attn_score;
         TensorView gate;
         TensorView up;
         TensorView ple_h;

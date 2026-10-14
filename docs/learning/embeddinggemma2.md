@@ -45,7 +45,7 @@ Nothing below was applied. Use it when a profile of `embed()` says which kernel 
 
 ## Attention softmax
 
-The first version recomputed `Q·K` and `exp` inside the loop over the head dimension. Softmax does not depend on V, so that repeated the same length-`L` weight vector `d` times: `O(L²·d²)` instead of `O(L²·d)`. `attention` now stores one score per key, turns that vector into softmax weights once, and then mixes V. On the tiny fixture the cosine against the frozen `expected.f32` is still 1. Max absolute error is 1.78814e-7 and 1.93715e-7, up from 0, because `exp` is no longer repeated per output dim.
+The first version recomputed `Q·K` and `exp` inside the loop over the head dimension. Softmax does not depend on V, so that repeated the same length-`L` weight vector `d` times: `O(L²·d²)` instead of `O(L²·d)`. `attention` now stores one score per key, turns that vector into softmax weights once, and then mixes V. That buffer is one `max_seq_len` float tensor in the workspace arena, reused by every layer. A failed allocation returns Status from init. It is not a heap vector inside `embed()`. On the tiny fixture the cosine against the frozen `expected.f32` is still 1. Max absolute error is 1.78814e-7 and 1.93715e-7, up from 0, because `exp` is no longer repeated per output dim.
 
 **Arithmetic intensity.** The wasted work was arithmetic, not a memory round trip: each extra dot reread K that was already in registers or L1. On a GPU the same mistake also blows bandwidth, because K is reloaded from device memory per output channel.
 

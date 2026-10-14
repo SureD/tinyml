@@ -163,6 +163,7 @@ void attention(
     const float* q,
     const float* k,
     const float* v,
+    float* weight,
     int64_t seq,
     int64_t n_heads,
     int64_t n_kv,
@@ -171,8 +172,8 @@ void attention(
     int64_t window) {
     // Softmax weights depend on Q and K, not on V. One vector per query head,
     // then a mix over V, is O(seq^2 * head_dim). Recomputing Q·K inside the
-    // head-dim loop was O(seq^2 * head_dim^2).
-    std::vector<float> weight(static_cast<size_t>(seq));
+    // head-dim loop was O(seq^2 * head_dim^2). `weight` holds max_seq_len
+    // floats from the workspace arena and is reused for every layer.
     const int64_t group = n_heads / n_kv;
     for (int64_t t = 0; t < seq; ++t) {
         for (int64_t h = 0; h < n_heads; ++h) {
@@ -312,7 +313,7 @@ size_t weight_elems(const EmbeddingGemma2Config& config) {
     return total;
 }
 
-constexpr size_t kWorkspaceTensors = 13;
+constexpr size_t kWorkspaceTensors = 14;
 
 size_t workspace_elems(const EmbeddingGemma2Config& config, uint32_t max_seq_len) {
     const size_t seq = max_seq_len;
@@ -329,7 +330,8 @@ size_t workspace_elems(const EmbeddingGemma2Config& config, uint32_t max_seq_len
         seq * ple +
         seq * static_cast<size_t>(config.n_layers) * ple +
         seq * embed +
-        embed;
+        embed +
+        seq;
 }
 
 }  // namespace
@@ -653,6 +655,10 @@ Status EmbeddingGemma2Engine::bind_workspace() {
     if (!status) {
         return status;
     }
+    status = alloc_f32(workspace_, make_shape({seq}), work_.attn_score);
+    if (!status) {
+        return status;
+    }
     status = alloc_f32(workspace_, make_shape({seq, inter}), work_.gate);
     if (!status) {
         return status;
@@ -720,6 +726,7 @@ void EmbeddingGemma2Engine::rebind_views_after_move(const EmbeddingGemma2Engine&
     rebind_view(work_.k, source);
     rebind_view(work_.v, source);
     rebind_view(work_.attn, source);
+    rebind_view(work_.attn_score, source);
     rebind_view(work_.gate, source);
     rebind_view(work_.up, source);
     rebind_view(work_.ple_h, source);
@@ -798,6 +805,7 @@ Status EmbeddingGemma2Engine::forward(
     float* k = nullptr;
     float* v = nullptr;
     float* attn = nullptr;
+    float* attn_score = nullptr;
     float* gate = nullptr;
     float* up = nullptr;
     float* ple_h = nullptr;
@@ -835,6 +843,10 @@ Status EmbeddingGemma2Engine::forward(
         return status;
     }
     status = require_f32(*backend_, work_.attn, attn);
+    if (!status) {
+        return status;
+    }
+    status = require_f32(*backend_, work_.attn_score, attn_score);
     if (!status) {
         return status;
     }
@@ -1008,6 +1020,7 @@ Status EmbeddingGemma2Engine::forward(
             q,
             k,
             v,
+            attn_score,
             seq,
             n_heads,
             n_kv,
