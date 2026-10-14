@@ -2,7 +2,7 @@
 
 ## Status
 
-Shipped in tree: TinyLlama-1.1B-Chat f32 inference. CPU and Metal kernels, prefill, greedy decode, persistent KV cache, Hugging Face config and safetensors load into f32. `docs/metal_backend_validation.md` records token parity on an Apple M5 (2026-06-06). `model.md` still lists checkpoint loading as future work; `infer/src/model_loader.cc` has since implemented it for Llama only. The loader rejects anything that is not `model_type=llama` and `hidden_act=silu`.
+Shipped in tree: TinyLlama-1.1B-Chat f32 inference. CPU and Metal kernels, prefill, greedy decode, persistent KV cache, Hugging Face config and safetensors load into f32. `docs/metal_backend_validation.md` records token parity on an Apple M5 (2026-06-06). `model.md` and `infer/src/model_loader.cc` implement checkpoint loading for Llama only. The loader rejects anything that is not `model_type=llama` and `hidden_act=silu`.
 
 Not in tree: a tokenizer inside the engine (callers pass token ids), Llama quantization, CUDA, and a Metal EmbeddingGemma kernel.
 
@@ -12,7 +12,8 @@ EmbeddingGemma 2 (`google/embeddinggemma-2`) is specified in [docs/embeddinggemm
 
 | Path | What it is |
 | --- | --- |
-| `CMakeLists.txt` | CMake 3.20, C++20, static `tinyinfer`, `nlohmann_json`. Metal and Foundation on Apple. Tests: `tinyinfer_tests`, `load_checkpoint_smoke`, `run_token_ids_smoke`, `bench_infer`, `bench_embedder`. |
+| `CMakeLists.txt` | CMake 3.20, C++20, static `tinyinfer`, `nlohmann_json`. Metal and Foundation on Apple. Tests: `tinyinfer_tests`, `embedder_tests`, `load_checkpoint_smoke`, `run_token_ids_smoke`, `bench_infer`, `bench_embedder`. |
+| `.github/workflows/ci.yml` | Linux configure, build, and ctest on pull requests and on main. |
 | `infer/include/tinyinfer/` | `core.h` (arenas, `TensorView`, `cpu`/`metal`), `backend.h`, `llama.h`, `model_loader.h`, `embedder.h`. |
 | `infer/src/` | `core.cc`, `cpu_backend.cc`, `llama.cc`, `model_loader.cc`, `metal_backend.mm`, `embedder.cc`, `embedder_loader.cc`. |
 | `reference/` | PyTorch TinyLlama (`tiny_llama.py`, `pyproject.toml`). |
@@ -20,7 +21,7 @@ EmbeddingGemma 2 (`google/embeddinggemma-2`) is specified in [docs/embeddinggemm
 | `reference/embeddinggemma2.py` | Float32 twin of the EmbeddingGemma 2 text forward. |
 | `scripts/` | Token-id smoke, prompt helper, bench cases. |
 | `docs/arch.md` | TinyInfer architecture: arenas, eager execution, Llama equation. |
-| `docs/embeddinggemma2-design.md` | EmbeddingGemma 2 design under review. |
+| `docs/embeddinggemma2-design.md` | EmbeddingGemma 2 design. Phases A, B, and D are in the tree; phase C is not. |
 | `model.md` | TinyLlama shape the C++ engine targets. |
 | `readme.md` | Phase 0–2 for the Llama engine. |
 | `AGENTS.md` | Engineering taste for runtime changes. |
