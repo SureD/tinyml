@@ -138,6 +138,13 @@ def apply_rope(states: np.ndarray, freq: np.ndarray) -> None:
                 row[i + half] = x2 * c + x1 * s
 
 
+def _dot(a: np.ndarray, b: np.ndarray) -> np.float32:
+    total = f32(0)
+    for i in range(a.shape[0]):
+        total += a[i] * b[i]
+    return total
+
+
 def attention(
     q: np.ndarray,
     k: np.ndarray,
@@ -145,10 +152,13 @@ def attention(
     sliding: bool,
     window: int,
 ) -> np.ndarray:
+    # Softmax weights are one vector per query head. Mixing V with that vector
+    # is O(seq^2 * head_dim). Recomputing Q·K per output dim was O(seq^2 * head_dim^2).
     seq, n_heads, head_dim = q.shape
     n_kv = k.shape[1]
     group = n_heads // n_kv
     out = np.empty_like(q)
+    weight = np.empty(seq, dtype=np.float32)
     for t in range(seq):
         for h in range(n_heads):
             kv_head = h // group
@@ -157,33 +167,30 @@ def attention(
             for p in range(seq):
                 if sliding and abs(t - p) > window:
                     continue
-                score = f32(0)
-                k_row = k[p, kv_head]
-                for d in range(head_dim):
-                    score += q_row[d] * k_row[d]
-                if float(score) > max_score:
-                    max_score = float(score)
+                score = float(_dot(q_row, k[p, kv_head]))
+                weight[p] = f32(score)
+                if score > max_score:
+                    max_score = score
             max_score_f = f32(max_score)
             denom = f32(0)
             for p in range(seq):
                 if sliding and abs(t - p) > window:
+                    weight[p] = f32(0)
                     continue
-                score = f32(0)
-                k_row = k[p, kv_head]
-                for d in range(head_dim):
-                    score += q_row[d] * k_row[d]
-                denom += f32(math.exp(float(score - max_score_f)))
+                coeff = f32(math.exp(float(weight[p] - max_score_f)))
+                weight[p] = coeff
+                denom += coeff
+            inv_denom = f32(1.0) / denom
+            for p in range(seq):
+                if sliding and abs(t - p) > window:
+                    continue
+                weight[p] = f32(weight[p] * inv_denom)
             for d in range(head_dim):
                 total = f32(0)
                 for p in range(seq):
                     if sliding and abs(t - p) > window:
                         continue
-                    score = f32(0)
-                    k_row = k[p, kv_head]
-                    for inner in range(head_dim):
-                        score += q_row[inner] * k_row[inner]
-                    weight = f32(math.exp(float(score - max_score_f))) / denom
-                    total += weight * v[p, kv_head, d]
+                    total += weight[p] * v[p, kv_head, d]
                 out[t, h, d] = total
     return out
 

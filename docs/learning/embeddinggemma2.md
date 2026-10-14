@@ -43,6 +43,16 @@ Nothing below was applied. Use it when a profile of `embed()` says which kernel 
 - **Occupancy and fusion.** One `embed()` should stay one command buffer. Fusing the GELU gate is the first candidate only if the unfused FFN shows up as the hot span. Norm fusion waits until you are sure the RMSNorm you are fusing is this one, including the unscaled `v_norm`.
 - **Quantization tradeoffs.** int8 then int4, per output row, float32 accumulate. A group size other than the whole row is not in the LiteRT description. Publish cosine; do not assume int4 holds 0.999.
 
+## Attention softmax
+
+The first version recomputed `Q·K` and `exp` inside the loop over the head dimension. Softmax does not depend on V, so that repeated the same length-`L` weight vector `d` times: `O(L²·d²)` instead of `O(L²·d)`. `attention` now stores one score per key, turns that vector into softmax weights once, and then mixes V. On the tiny fixture the cosine against the frozen `expected.f32` is still 1. Max absolute error is 1.78814e-7 and 1.93715e-7, up from 0, because `exp` is no longer repeated per output dim.
+
+**Arithmetic intensity.** The wasted work was arithmetic, not a memory round trip: each extra dot reread K that was already in registers or L1. On a GPU the same mistake also blows bandwidth, because K is reloaded from device memory per output channel.
+
+What to read: the three passes in `attention` in `infer/src/embedder.cc`. The GPU form that does not materialize an `L×L` matrix is online softmax (Milakov and Gimelshein) and FlashAttention.
+
+What to try: on Metal, keep one query block's softmax weights in threadgroup memory and read V coalesced. Do not allocate the full attention matrix. Re-check cosine against this CPU path before trusting a fused kernel.
+
 ## Phase B and later
 
 Filled in on the phase branch that lands the work.

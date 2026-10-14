@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace tinyinfer {
 namespace {
@@ -168,6 +169,10 @@ void attention(
     int64_t head_dim,
     bool sliding,
     int64_t window) {
+    // Softmax weights depend on Q and K, not on V. One vector per query head,
+    // then a mix over V, is O(seq^2 * head_dim). Recomputing Q·K inside the
+    // head-dim loop was O(seq^2 * head_dim^2).
+    std::vector<float> weight(static_cast<size_t>(seq));
     const int64_t group = n_heads / n_kv;
     for (int64_t t = 0; t < seq; ++t) {
         for (int64_t h = 0; h < n_heads; ++h) {
@@ -182,6 +187,7 @@ void attention(
                 }
                 const float* k_row = k + (p * n_kv + kv_head) * head_dim;
                 const float score = dot_product(q_row, k_row, head_dim) * kAttentionScale;
+                weight[static_cast<size_t>(p)] = score;
                 if (score > max_score) {
                     max_score = score;
                 }
@@ -190,11 +196,19 @@ void attention(
             float denom = 0.0f;
             for (int64_t p = 0; p < seq; ++p) {
                 if (!sliding_keeps(t, p, sliding, window)) {
+                    weight[static_cast<size_t>(p)] = 0.0f;
                     continue;
                 }
-                const float* k_row = k + (p * n_kv + kv_head) * head_dim;
-                const float score = dot_product(q_row, k_row, head_dim) * kAttentionScale;
-                denom += static_cast<float>(std::exp(static_cast<double>(score - max_score)));
+                const float coeff = static_cast<float>(
+                    std::exp(static_cast<double>(weight[static_cast<size_t>(p)] - max_score)));
+                weight[static_cast<size_t>(p)] = coeff;
+                denom += coeff;
+            }
+            const float inv_denom = 1.0f / denom;
+            for (int64_t p = 0; p < seq; ++p) {
+                if (sliding_keeps(t, p, sliding, window)) {
+                    weight[static_cast<size_t>(p)] *= inv_denom;
+                }
             }
 
             for (int64_t d = 0; d < head_dim; ++d) {
@@ -203,12 +217,8 @@ void attention(
                     if (!sliding_keeps(t, p, sliding, window)) {
                         continue;
                     }
-                    const float* k_row = k + (p * n_kv + kv_head) * head_dim;
                     const float* v_row = v + (p * n_kv + kv_head) * head_dim;
-                    const float score = dot_product(q_row, k_row, head_dim) * kAttentionScale;
-                    const float weight =
-                        static_cast<float>(std::exp(static_cast<double>(score - max_score))) / denom;
-                    sum += weight * v_row[d];
+                    sum += weight[static_cast<size_t>(p)] * v_row[d];
                 }
                 out_row[d] = sum;
             }
