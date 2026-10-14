@@ -98,32 +98,32 @@ Not opened. No profile picked a hot kernel.
 
 ## Phase D — benchmark
 
-Rerun at 2026-10-14T08:54:05Z after softmax-once attention and the quant range that includes 0. Release (`-O3 -DNDEBUG`, Clang 18.1.3) `bench_embedder` on this Linux host: 4 vCPUs, KVM, `Intel(R) Xeon(R) Processor`, MemTotal 16387416 kB. The model is `tests/data/embeddinggemma2_tiny` (2 layers, hidden 8, embedding dim 6), loaded with `max_seq_len` 64. Batch is 1. Each cell is one warmup `embed()` and 500 timed calls. p50 and p95 use `llround(p * (n - 1))` on the sorted samples. sequences/s is `1000 / p50`. tokens/s multiplies that by the timed sequence length. The raw log is [embeddinggemma2-cpu-bench.log](embeddinggemma2-cpu-bench.log). The 2026-10-13 numbers are not this run.
+Rerun at 2026-10-14T09:02:31Z after the attention score buffer moved into the workspace arena. The 2026-10-14T08:54:05Z run on this host, before that buffer, recorded workspace bytes 32088. Release (`-O3 -DNDEBUG`, Clang 18.1.3) `bench_embedder` on this Linux host: 4 vCPUs, KVM, `Intel(R) Xeon(R) Processor`, MemTotal 16387416 kB. The model is `tests/data/embeddinggemma2_tiny` (2 layers, hidden 8, embedding dim 6), loaded with `max_seq_len` 64. Batch is 1. Each cell is one warmup `embed()` and 500 timed calls. p50 and p95 use `llround(p * (n - 1))` on the sorted samples. sequences/s is `1000 / p50`. tokens/s multiplies that by the timed sequence length. The raw log is [embeddinggemma2-cpu-bench.log](embeddinggemma2-cpu-bench.log). The 2026-10-13 numbers are not this run. Cosines match the 08:54:05Z run at the printed precision. Latencies and workspace bytes are this run.
 
 This is not `google/embeddinggemma-2` and it is not the 0.999 gate.
 
 | Case | Quant | Seq | p50 ms | p95 ms | seq/s | tok/s | Cosine vs f32 | Cosine vs expected.f32 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| fixture0 | f32 | 5 | 0.007041 | 0.009341 | 142025.28 | 710126.402 | 1 | 1 |
-| fixture1 | f32 | 3 | 0.004186 | 0.004273 | 238891.543 | 716674.63 | 1 | 1 |
-| pattern1 | f32 | 1 | 0.001872 | 0.001914 | 534188.034 | 534188.034 | 1 | na |
-| pattern8 | f32 | 8 | 0.011529 | 0.01781 | 86737.7917 | 693902.333 | 1 | na |
-| pattern32 | f32 | 32 | 0.065728 | 0.071954 | 15214.2162 | 486854.917 | 1 | na |
-| pattern64 | f32 | 64 | 0.198939 | 0.206345 | 5026.66647 | 321706.654 | 1 | na |
-| fixture0 | int8 | 5 | 0.010052 | 0.013318 | 99482.69 | 497413.45 | 0.999840198 | 0.999840197 |
-| fixture1 | int8 | 3 | 0.006165 | 0.006251 | 162206.002 | 486618.005 | 0.999858186 | 0.999858182 |
-| pattern1 | int8 | 1 | 0.002804 | 0.002881 | 356633.381 | 356633.381 | 0.99996401 | na |
-| pattern8 | int8 | 8 | 0.016031 | 0.016325 | 62379.1404 | 499033.123 | 0.995833747 | na |
-| pattern32 | int8 | 32 | 0.082298 | 0.085549 | 12150.9636 | 388830.834 | 0.999960579 | na |
-| pattern64 | int8 | 64 | 0.22919 | 0.238866 | 4363.19211 | 279244.295 | 0.999925832 | na |
-| fixture0 | int4 | 5 | 0.016784 | 0.016952 | 59580.5529 | 297902.765 | 0.920493791 | 0.920493775 |
-| fixture1 | int4 | 3 | 0.010252 | 0.010333 | 97541.943 | 292625.829 | 0.820283185 | 0.82028335 |
-| pattern1 | int4 | 1 | 0.00409 | 0.004192 | 244498.778 | 244498.778 | 0.996864239 | na |
-| pattern8 | int4 | 8 | 0.026697 | 0.03493 | 37457.3922 | 299659.138 | 0.876785306 | na |
-| pattern32 | int4 | 32 | 0.124466 | 0.139499 | 8034.32263 | 257098.324 | 0.619388609 | na |
-| pattern64 | int4 | 64 | 0.314508 | 0.323393 | 3179.56936 | 203492.439 | 0.798002994 | na |
+| fixture0 | f32 | 5 | 0.007272 | 0.007325 | 137513.751 | 687568.757 | 1 | 1 |
+| fixture1 | f32 | 3 | 0.004282 | 0.004326 | 233535.731 | 700607.193 | 1 | 1 |
+| pattern1 | f32 | 1 | 0.001872 | 0.002127 | 534188.034 | 534188.034 | 1 | na |
+| pattern8 | f32 | 8 | 0.011749 | 0.011809 | 85113.6267 | 680909.014 | 1 | na |
+| pattern32 | f32 | 32 | 0.066086 | 0.071371 | 15131.798 | 484217.535 | 1 | na |
+| pattern64 | f32 | 64 | 0.194069 | 0.210656 | 5152.80648 | 329779.614 | 1 | na |
+| fixture0 | int8 | 5 | 0.010426 | 0.012307 | 95914.061 | 479570.305 | 0.999840198 | 0.999840197 |
+| fixture1 | int8 | 3 | 0.00638 | 0.007357 | 156739.812 | 470219.436 | 0.999858186 | 0.999858182 |
+| pattern1 | int8 | 1 | 0.002862 | 0.002902 | 349406.01 | 349406.01 | 0.99996401 | na |
+| pattern8 | int8 | 8 | 0.016615 | 0.020663 | 60186.5784 | 481492.627 | 0.995833747 | na |
+| pattern32 | int8 | 32 | 0.084722 | 0.095782 | 11803.3096 | 377705.909 | 0.999960579 | na |
+| pattern64 | int8 | 64 | 0.230918 | 0.266125 | 4330.54158 | 277154.661 | 0.999925832 | na |
+| fixture0 | int4 | 5 | 0.016734 | 0.018151 | 59758.5754 | 298792.877 | 0.920493791 | 0.920493775 |
+| fixture1 | int4 | 3 | 0.010224 | 0.012765 | 97809.0767 | 293427.23 | 0.820283185 | 0.82028335 |
+| pattern1 | int4 | 1 | 0.004068 | 0.004111 | 245821.042 | 245821.042 | 0.996864239 | na |
+| pattern8 | int4 | 8 | 0.026515 | 0.028679 | 37714.5012 | 301716.01 | 0.876785306 | na |
+| pattern32 | int4 | 32 | 0.125437 | 0.14184 | 7972.12944 | 255108.142 | 0.619388609 | na |
+| pattern64 | int4 | 64 | 0.312209 | 0.335472 | 3202.98262 | 204990.888 | 0.798002994 | na |
 
-Weight arena bytes: f32 10200, int8 8514, int4 7610. Workspace arena bytes: 32088 for every cell, because the arena is sized to sequence 64. Process VmRSS after the int4 loop was 4448 KiB, VmHWM 4448 KiB. The phase B test's 4760-byte workspace was the same fixture loaded with `max_seq_len` 8.
+Weight arena bytes: f32 10200, int8 8514, int4 7610. Workspace arena bytes: 32408 for every cell, because the arena is sized to sequence 64. Process VmRSS after the int4 loop was 4444 KiB, VmHWM 4444 KiB. f32 RSS was 4416 KiB (VmHWM 4436 KiB) and int8 RSS was 4444 KiB (VmHWM 4444 KiB). The phase B test at `max_seq_len` 8 printed workspace bytes 4856.
 
 ### How to read the CPU figures
 
@@ -133,7 +133,7 @@ int8 and int4 are slower than f32 here. The matrices are a few kilobytes, so the
 
 **Memory hierarchy.** Workspace bytes do not shrink when the timed sequence is shorter than 64. RSS here is the whole process, including code. It is not a model-footprint budget.
 
-Pattern tokens are `1 + (i % 19)` on the tiny checkpoint. `na` means there is no frozen `expected.f32` for that length. The int4 cosine of 0.619388609 at sequence 32 is this fixture against its own float32 output. It is not the official 0.99 rule. Sequence 64 f32 p50 fell from 0.747896 ms to 0.198939 ms on this rerun because softmax is no longer repeated per head dimension. That is still this tiny model, not a GPU.
+Pattern tokens are `1 + (i % 19)` on the tiny checkpoint. `na` means there is no frozen `expected.f32` for that length. The int4 cosine of 0.619388609 at sequence 32 is this fixture against its own float32 output. It is not the official 0.99 rule. Sequence 64 f32 p50 was 0.747896 ms before softmax was computed once, 0.198939 ms on the 08:54:05Z run, and 0.194069 ms on this 09:02:31Z run. That is still this tiny model, not a GPU.
 
 ### Rows left unmeasured
 
