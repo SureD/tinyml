@@ -69,8 +69,14 @@ public:
         return {DeviceType::cpu, 0};
     }
 
+    // Non-zero caps the workspace arena so later tensor allocs fail.
+    size_t workspace_byte_limit = 0;
+
     Status alloc_arena(MemoryArena& arena, size_t bytes, MemoryKind kind) override {
         calls.push_back("alloc_arena");
+        if (kind == MemoryKind::workspace && workspace_byte_limit != 0) {
+            bytes = workspace_byte_limit;
+        }
         bind_arena(arena, reinterpret_cast<void*>(0x1000), bytes, kind);
         return Status::success();
     }
@@ -1508,6 +1514,59 @@ void test_engine_flow_with_fake_backend() {
     EXPECT_TRUE(saw_matmul_argmax);
 }
 
+void test_engine_reports_failed_arena_alloc() {
+    FakeBackend backend;
+    const LlamaConfig config = LlamaConfig::demo();
+    Result<LlamaInferEngine> engine = LlamaInferEngine::create(backend, config, 8);
+    EXPECT_TRUE(engine.status);
+
+    const TokenId prompt[] = {1, 2};
+    TokenId next = 0;
+    EXPECT_TRUE(engine.value.prefill(prompt, next));
+    EXPECT_EQ(engine.value.seq_len(), 2u);
+    EXPECT_TRUE(engine.value.reset());
+    EXPECT_EQ(engine.value.seq_len(), 0u);
+
+    LlamaInferEngine live = std::move(engine.value);
+    const Status moved_from_reset = engine.value.reset();
+    EXPECT_EQ(moved_from_reset.code, Status::invalid_argument);
+    EXPECT_TRUE(std::strcmp(moved_from_reset.message, "arena is not allocated") == 0);
+    EXPECT_EQ(engine.value.seq_len(), 0u);
+    EXPECT_TRUE(live.prefill(prompt, next));
+
+    FakeBackend tiny_workspace;
+    tiny_workspace.workspace_byte_limit = 64;
+    Result<LlamaInferEngine> tiny = LlamaInferEngine::create(tiny_workspace, config, 8);
+    EXPECT_TRUE(tiny.status);
+    const size_t calls_after_create = tiny_workspace.calls.size();
+
+    const Status prefill_status = tiny.value.prefill(prompt, next);
+    EXPECT_EQ(prefill_status.code, Status::invalid_argument);
+    EXPECT_TRUE(std::strcmp(prefill_status.message, "arena capacity exceeded") == 0);
+    EXPECT_EQ(tiny.value.seq_len(), 0u);
+
+    const Status decode_status = tiny.value.decode_one(3, next);
+    EXPECT_EQ(decode_status.code, Status::invalid_argument);
+    EXPECT_TRUE(std::strcmp(decode_status.message, "arena capacity exceeded") == 0);
+    EXPECT_EQ(tiny.value.seq_len(), 0u);
+
+    TokenId output[4] = {};
+    uint32_t output_count = 99;
+    const Status generate_status = tiny.value.generate(
+        prompt,
+        output,
+        GenerateConfig{1, 2, false},
+        output_count);
+    EXPECT_EQ(generate_status.code, Status::invalid_argument);
+    EXPECT_TRUE(std::strcmp(generate_status.message, "arena capacity exceeded") == 0);
+
+    bool saw_embedding = false;
+    for (size_t i = calls_after_create; i < tiny_workspace.calls.size(); ++i) {
+        saw_embedding = saw_embedding || tiny_workspace.calls[i] == "embedding";
+    }
+    EXPECT_TRUE(!saw_embedding);
+}
+
 void test_model_loader_safetensors_with_fake_backend() {
     FakeBackend backend;
     LlamaConfig config;
@@ -1610,6 +1669,7 @@ int main() {
     test_cpu_backend_attention();
     test_metal_backend_correctness();
     test_engine_flow_with_fake_backend();
+    test_engine_reports_failed_arena_alloc();
     test_model_loader_safetensors_with_fake_backend();
     test_model_loader_rejects_bad_safetensors();
 
