@@ -1,6 +1,6 @@
 # TinyInfer Architecture
 
-TinyInfer is a dedicated LLaMA-style inference engine. It is not a generic ML graph framework. The first target is to make the TinyLlama inference path readable, testable, and easy to port to optimized Metal kernels.
+TinyInfer is a dedicated LLaMA-style inference engine. It is not a generic ML graph framework. It runs the TinyLlama inference path on a CPU f32 reference backend and, on Apple platforms where the Metal framework is available, on Metal f32 kernels.
 
 ## Core Objects
 
@@ -34,15 +34,20 @@ There is no public memory planning function and no individual tensor free. `Tens
 
 The model is specialized; the backend is flexible. This keeps the code simple without locking the runtime to one implementation of tensor math.
 
-`LlamaInferEngine` should read like the model equation:
+`LlamaInferEngine::run_layers` is the inference stream:
 
-1. Embed token ids.
-2. For each layer, run RMSNorm, QKV projection, RoPE, attention, output projection, RMSNorm, SwiGLU MLP, and residual updates.
-3. Run final RMSNorm and LM head.
-4. During prefill, write all prompt positions into the KV cache.
-5. During decode, append one KV position and select the next token greedily.
+1. Look up token ids in the embedding table (`embedding_out`).
+2. RMSNorm that hidden state with layer 0 `input_layernorm`. This first norm has no residual add.
+3. For each layer, project Q, K, and V, apply RoPE, and run causal grouped-query attention. Attention writes this step's K and V into the KV cache. The output projection follows.
+4. Fuse each residual add with the following RMSNorm (`add_rms_norm_out`). After attention, the projected attention output is added to the incoming hidden state and normalized with `post_attention_layernorm`. The MLP is SwiGLU. On every layer except the last, the MLP output is then added to that attention residual and normalized with the next layer's `input_layernorm`.
+5. On the last layer, only the last token is updated. The fused op adds the attention residual, writes final RMSNorm into that same row, and `matmul_argmax` against the untied LM head returns the greedy next token.
+6. Prefill starts at position 0 and writes every prompt position. Decode appends one position.
 
-The current CPU backend provides f32 reference kernels for matmul, RMSNorm, RoPE, attention, SwiGLU, argmax, and KV writes. The engine still needs complete embedding lookup, residual adds, model loading, and end-to-end checkpoint parity work.
+`add_rms_norm_out` stores `residual_out = residual_out + residual`, then writes `norm_out = rms_norm(residual_out, weight)`. The CPU backend does both in one row loop. Metal runs `add_rms_norm_f32` when one row fits in threadgroup memory. If it does not, Metal calls `add_inplace` and then `rms_norm_out`. The layer loop does not call `add_inplace` itself.
+
+CPU and Metal implement the f32 operators this stream uses: embedding, matmul, RMSNorm, fused residual RMSNorm, RoPE, KV cache writes, attention, SwiGLU, and matmul-argmax. Metal matmul dispatches `matvec_f32` when M is 1. For other M at most 16 it uses `small_m_gemm_tiled_f32` when K is a multiple of 128 and `small_m_gemm_f32` otherwise. Larger M uses `matmul_f32`. `matmul_argmax` runs `matvec_argmax_partial_f32` and then `argmax_reduce_pairs_f32`. `create_metal_backend()` returns unimplemented when the Metal framework is not available.
+
+`load_llama_from_hf_dir` and `load_llama_from_hf_files` load one Hugging Face LLaMA checkpoint. They read `config.json` and a single `model.safetensors`, check tensor names and shapes against the engine's f32 weight views, convert F32 or BF16 values to f32, and copy them into the weight arena. BF16 expands by shifting each 16-bit value into the high half of an f32. Any other dtype is rejected. Unexpected tensor names are rejected, except keys that end in `.self_attn.rotary_emb.inv_freq`. When those config fields are present, `model_type` must be `llama`, `hidden_act` must be `silu`, `attention_bias` and `tie_word_embeddings` must be false, `pretraining_tp` must be 1, and `rope_scaling` must be null or absent. Missing or null `rms_norm_eps` and `rope_theta` default to `1e-5` and `10000.0`.
 
 ## Why This Shape
 
@@ -57,7 +62,7 @@ The public API does not expose `Stream` in v1. A single backend-owned execution 
 ## Out Of Scope For v1
 
 - Tokenizer integration
-- Hugging Face checkpoint loading
+- Sharded safetensors and checkpoint dtypes other than F32 and BF16
 - Quantization
 - Batch size greater than 1
 - Continuous batching
@@ -65,4 +70,3 @@ The public API does not expose `Stream` in v1. A single backend-owned execution 
 - Lazy graph scheduling
 - Public stream/event dependency management
 - Hidden system allocation in the decode hot path
-- CPU/Metal parity kernels beyond the API skeleton
