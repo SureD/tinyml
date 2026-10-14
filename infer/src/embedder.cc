@@ -136,10 +136,16 @@ void quantize_matrix(
             min_v = std::min(min_v, src[col]);
             max_v = std::max(max_v, src[col]);
         }
+        // A same-sign row puts round(qmin - min/scale) outside [qmin, qmax].
+        // Clamping that zero point while leaving scale = (max-min)/(qmax-qmin)
+        // clips the far end: a row in [1, 2] dequantized to about [1, 1].
+        // Including 0 makes the integer grid cover [0, max] or [min, 0].
+        min_v = std::min(min_v, 0.0f);
+        max_v = std::max(max_v, 0.0f);
         int zero_point = 0;
         float row_scale = 0.0f;
         if (max_v == min_v) {
-            // (q - zero) * scale with q = 1 and zero = 0 reproduces the constant.
+            // Only an all-zero row reaches here. q = 1, zero = 0, scale = 0.
             row_scale = max_v;
             zero_point = 0;
             for (int64_t col = 0; col < cols; ++col) {
@@ -491,6 +497,18 @@ size_t workspace_elems(const EmbeddingGemma2Config& config, uint32_t max_seq_len
 }
 
 }  // namespace
+
+// Test hook. Dequantizes one packed row with the same scale and zero the GEMM uses.
+void dequantized_row_for_test(const float* weight, int64_t cols, int bits, float* out) {
+    std::vector<int8_t> packed;
+    std::vector<float> scale;
+    std::vector<int8_t> zero;
+    quantize_matrix(weight, 1, cols, bits, packed, scale, zero);
+    for (int64_t col = 0; col < cols; ++col) {
+        const int q = unpack_q(packed.data(), col, bits);
+        out[col] = static_cast<float>(q - static_cast<int>(zero[0])) * scale[0];
+    }
+}
 
 uint32_t EmbeddingGemma2Config::q_dim(uint32_t layer) const {
     return n_heads * layers[layer].head_dim;

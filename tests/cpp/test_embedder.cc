@@ -1,11 +1,16 @@
 #include "tinyinfer/embedder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+namespace tinyinfer {
+void dequantized_row_for_test(const float* weight, int64_t cols, int bits, float* out);
+}
 
 using namespace tinyinfer;
 
@@ -360,15 +365,57 @@ void test_quantize_one(
                   << " cosine_vs_reference=" << vs_ref
                   << " max_abs_vs_f32=" << max_abs_f32
                   << "\n";
-        // Measured on this Linux machine against the tiny fixture, 2026-10-13.
-        // int8: 0.998763 and 0.995469. int4: 0.907365 and 0.846225.
-        // These are not the official 32-text gates.
-        const double cosine_floor = quant == EmbeddingGemma2Quant::int8 ? 0.995 : 0.846;
-        const double abs_ceil = quant == EmbeddingGemma2Quant::int8 ? 0.06 : 0.38;
+        // Measured on this Linux machine against the tiny fixture, 2026-10-14,
+        // after the quant range includes 0. int8: 0.99984 and 0.999858.
+        // int4: 0.920494 and 0.820283. Not the official 32-text gates.
+        const double cosine_floor = quant == EmbeddingGemma2Quant::int8 ? 0.9998 : 0.820;
+        const double abs_ceil = quant == EmbeddingGemma2Quant::int8 ? 0.014 : 0.39;
         EXPECT_TRUE(vs_f32 >= cosine_floor);
         EXPECT_TRUE(vs_ref >= cosine_floor);
         EXPECT_TRUE(max_abs_f32 <= abs_ceil);
         offset += width;
+    }
+}
+
+float row_error(const float* got, const float* want, int n) {
+    float error = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        error = std::max(error, std::fabs(got[i] - want[i]));
+    }
+    return error;
+}
+
+void test_same_sign_quant_rows() {
+    const float positive[] = {1.0f, 2.0f};
+    const float negative[] = {-2.0f, -1.0f};
+    const float zeros[] = {0.0f, 0.0f};
+    const float constant[] = {1.25f, 1.25f};
+    const float mixed[] = {-1.0f, 2.0f};
+    float out[2];
+    const int bits[] = {8, 4};
+    for (int bit : bits) {
+        const float bin = bit == 8 ? (2.0f / 255.0f) : (2.0f / 15.0f);
+        dequantized_row_for_test(positive, 2, bit, out);
+        std::cout << "same-sign +" << bit
+                  << " dequant=" << out[0] << "," << out[1] << "\n";
+        EXPECT_TRUE(row_error(out, positive, 2) <= bin);
+        EXPECT_TRUE(out[1] > out[0] + 0.5f);
+
+        dequantized_row_for_test(negative, 2, bit, out);
+        std::cout << "same-sign -" << bit
+                  << " dequant=" << out[0] << "," << out[1] << "\n";
+        EXPECT_TRUE(row_error(out, negative, 2) <= bin);
+        EXPECT_TRUE(out[0] < out[1] - 0.5f);
+
+        dequantized_row_for_test(zeros, 2, bit, out);
+        EXPECT_TRUE(out[0] == 0.0f && out[1] == 0.0f);
+
+        dequantized_row_for_test(constant, 2, bit, out);
+        EXPECT_TRUE(row_error(out, constant, 2) <= 1e-5f);
+
+        const float mixed_bin = bit == 8 ? (3.0f / 255.0f) : (3.0f / 15.0f);
+        dequantized_row_for_test(mixed, 2, bit, out);
+        EXPECT_TRUE(row_error(out, mixed, 2) <= mixed_bin);
     }
 }
 
@@ -427,6 +474,7 @@ int main() {
     test_official_config();
     test_config_rejects();
     test_tiny_reference();
+    test_same_sign_quant_rows();
     test_quantize();
     if (g_failures != 0) {
         std::cerr << g_failures << " failure(s)\n";

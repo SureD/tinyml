@@ -63,11 +63,25 @@ Measured on the tiny fixture (`tests/data/embeddinggemma2_tiny`), both sequences
 
 | Pack | Cosine | Max abs vs f32 | Weight arena bytes |
 | --- | --- | --- | --- |
-| f32 | 1 | 0 | 10200 |
-| int8 | 0.998763, 0.995469 | 0.0362429, 0.0581561 | 10200 → 8514 |
-| int4 | 0.907365, 0.846225 | 0.324352, 0.379931 | 10200 → 7610 |
+| f32 | 1 | 1.78814e-7, 1.93715e-7 vs expected.f32 | 10200 |
+| int8 | 0.99984, 0.999858 | 0.013538, 0.0120243 | 10200 → 8514 |
+| int4 | 0.920494, 0.820283 | 0.303526, 0.389811 | 10200 → 7610 |
 
-The test floors are these measured scores, trimmed: int8 cosine at least 0.995 and max abs at most 0.06; int4 cosine at least 0.846 and max abs at most 0.38. ASan and UBSan were clean for `embedder_tests` and `tinyinfer_tests`.
+The test floors are these measured scores, trimmed: int8 cosine at least 0.9998 and max abs at most 0.014; int4 cosine at least 0.820 and max abs at most 0.39. The int4 second sequence moved down from 0.846225 when the range was widened to include 0. That is this fixture, not the official 0.99 rule.
+
+### Quantization range and the zero point
+
+`scale = (max - min) / (qmax - qmin)` and `zero = round(qmin - min / scale)`. If every value in the row is positive, `min > 0` and that zero point is below `qmin`. The old code clamped the zero point and left the scale alone. The integer grid then covered only a slice of the row, and the large weights clipped. For int8, a row in `[1, 2]` stored both entries as 127 with zero point -128, and dequantized to `[1, 1]`. The all-negative case clamps the other way.
+
+`quantize_matrix` now folds 0 into min and max before the scale. A positive row uses `[0, max]`, so the zero point is `qmin` and the top of the row stays representable. A negative row uses `[min, 0]`. A mixed-sign row already contains 0, so its scale does not change. An all-zero row is still the constant path.
+
+Measured dequant of `[1, 2]` after the change: int8 `0.996078, 2`; int4 `0.933333, 2`. `[-2, -1]`: int8 `-2, -0.996078`; int4 `-2, -0.933333`.
+
+**Quantization tradeoffs.** Including 0 spends codes on the empty side of a same-sign row. int8 on this fixture got closer to float32 (cosine 0.99984 and 0.999858). int4 spent those codes and one sequence fell from 0.846225 to 0.820283. Clipping was the worse error on a single row; the embedding cosine is a separate measurement.
+
+What to read: the zero-point derivation in Jacob et al., "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference" (the affine map `r = scale * (q - zero)`), and `quantize_matrix` in `infer/src/embedder.cc`.
+
+What to try: keep the same-sign row test. On a GPU dequant kernel, use this scale and zero; a symmetric kernel would not match these bytes. Do not invent a group size to win the codes back.
 
 Not measured: cosine on `google/embeddinggemma-2`, the 32-text set, sentence-transformers, RSS, and any GPU.
 
