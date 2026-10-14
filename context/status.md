@@ -6,17 +6,18 @@ Shipped in tree: TinyLlama-1.1B-Chat f32 inference. CPU and Metal kernels, prefi
 
 Not in tree: a tokenizer inside the engine (callers pass token ids), quantization, CUDA, and any embedding model.
 
-EmbeddingGemma 2 (`google/embeddinggemma-2`) is specified in [docs/embeddinggemma2-design.md](../docs/embeddinggemma2-design.md). No embedder sources yet. Implementation waits on review of that file.
+EmbeddingGemma 2 (`google/embeddinggemma-2`) is specified in [docs/embeddinggemma2-design.md](../docs/embeddinggemma2-design.md). The docs-only gate was opened for implementation. Phase A is a CPU text embedder: bfloat16 or float32 weights, float32 compute, batch 1, no KV cache. Head dim, the 5:1 layer list, RMSNorm, RoPE, and the bidirectional mask were taken from `config.json`, the safetensors header, and the transformers text model before the kernels were written. The card's derived head dim of 128 was not used. Metal is not implemented. Official-checkpoint cosine, Apple RSS, and the LiteRT int4 file layout are not measured. Notes: [docs/learning/embeddinggemma2.md](../docs/learning/embeddinggemma2.md).
 
 ## Map
 
 | Path | What it is |
 | --- | --- |
 | `CMakeLists.txt` | CMake 3.20, C++20, static `tinyinfer`, `nlohmann_json`. Metal and Foundation on Apple. Tests: `tinyinfer_tests`, `load_checkpoint_smoke`, `run_token_ids_smoke`, `bench_infer`. |
-| `infer/include/tinyinfer/` | `core.h` (arenas, `TensorView`, `cpu`/`metal`), `backend.h`, `llama.h`, `model_loader.h`. |
-| `infer/src/` | `core.cc`, `cpu_backend.cc`, `llama.cc`, `model_loader.cc`, `metal_backend.mm`. |
+| `infer/include/tinyinfer/` | `core.h` (arenas, `TensorView`, `cpu`/`metal`), `backend.h`, `llama.h`, `model_loader.h`, `embedder.h`. |
+| `infer/src/` | `core.cc`, `cpu_backend.cc`, `llama.cc`, `model_loader.cc`, `metal_backend.mm`, `embedder.cc`, `embedder_loader.cc`. |
 | `reference/` | PyTorch TinyLlama (`tiny_llama.py`, `pyproject.toml`). |
-| `tests/cpp/`, `tests/test_tiny_llama.py` | C++ smokes and the Python reference test. |
+| `tests/cpp/`, `tests/test_tiny_llama.py` | C++ smokes, the embedder reference test, and the Python Llama test. |
+| `reference/embeddinggemma2.py` | Float32 twin of the EmbeddingGemma 2 text forward. |
 | `scripts/` | Token-id smoke, prompt helper, bench cases. |
 | `docs/arch.md` | TinyInfer architecture: arenas, eager execution, Llama equation. |
 | `docs/embeddinggemma2-design.md` | EmbeddingGemma 2 design under review. |

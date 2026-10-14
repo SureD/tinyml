@@ -79,6 +79,13 @@ public:
 
     virtual Status synchronize() = 0;
 
+    // CPU arenas expose their bytes. Metal does not. The embedder uses this
+    // for the checked float32 path and does not call it on Metal.
+    virtual void* host_bytes(const TensorView& view) {
+        (void)view;
+        return nullptr;
+    }
+
 protected:
     friend class MemoryArena;
 

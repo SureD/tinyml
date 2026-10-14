@@ -1,6 +1,6 @@
 # Workflow
 
-Docs only until the user accepts [docs/embeddinggemma2-design.md](../docs/embeddinggemma2-design.md). Implementation starts after that review, not before.
+The user opened implementation of [docs/embeddinggemma2-design.md](../docs/embeddinggemma2-design.md). Phases still land one at a time, and a phase that cannot be checked does not land.
 
 Then four phases, in order. A phase finishes before the next one starts.
 
